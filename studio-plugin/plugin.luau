@@ -22,6 +22,38 @@ local actionHistory = {}  -- Stack of actions that can be undone
 local redoHistory = {}    -- Stack of actions that can be redone
 local MAX_ACTION_HISTORY = 100
 
+-- Helper to serialize values nicely for logging
+local function serializeValue(value)
+	local t = typeof(value)
+	if t == "Vector3" then
+		return string.format("Vector3(%.2f, %.2f, %.2f)", value.X, value.Y, value.Z)
+	elseif t == "Vector2" then
+		return string.format("Vector2(%.2f, %.2f)", value.X, value.Y)
+	elseif t == "Color3" then
+		return string.format("Color3(%.2f, %.2f, %.2f)", value.R, value.G, value.B)
+	elseif t == "BrickColor" then
+		return "BrickColor(" .. value.Name .. ")"
+	elseif t == "UDim2" then
+		return string.format("UDim2(%.2f, %d, %.2f, %d)", value.X.Scale, value.X.Offset, value.Y.Scale, value.Y.Offset)
+	elseif t == "UDim" then
+		return string.format("UDim(%.2f, %d)", value.Scale, value.Offset)
+	elseif t == "CFrame" then
+		return string.format("CFrame(%.1f, %.1f, %.1f)", value.X, value.Y, value.Z)
+	elseif t == "table" then
+		if #value > 0 then
+			local parts = {}
+			for i, v in ipairs(value) do
+				if i > 3 then table.insert(parts, "...") break end
+				table.insert(parts, serializeValue(v))
+			end
+			return "{" .. table.concat(parts, ", ") .. "}"
+		end
+		return "{...}"
+	else
+		return tostring(value)
+	end
+end
+
 -- Helper to log an action for undo tracking
 local function logAction(actionType, target, summary, details)
 	-- Clear redo history when a new action is performed
@@ -79,7 +111,7 @@ local screenGui = plugin:CreateDockWidgetPluginGuiAsync(
 	"MCPServerInterface",
 	DockWidgetPluginGuiInfo.new(Enum.InitialDockState.Float, false, false, 400, 500, 350, 450)
 )
-screenGui.Title = "MCP Server v1.12.0"
+screenGui.Title = "MCP Server v1.12.1"
 
 local mainFrame = Instance.new("Frame")
 mainFrame.Size = UDim2.new(1, 0, 1, 0)
@@ -132,7 +164,7 @@ local versionLabel = Instance.new("TextLabel")
 versionLabel.Size = UDim2.new(1, 0, 0, 16)
 versionLabel.Position = UDim2.new(0, 0, 0, 32)
 versionLabel.BackgroundTransparency = 1
-versionLabel.Text = "AI Integration • v1.12.0"
+versionLabel.Text = "AI Integration • v1.12.1"
 versionLabel.TextColor3 = Color3.fromRGB(191, 219, 254)
 versionLabel.TextScaled = false
 versionLabel.TextSize = 12
@@ -1490,7 +1522,7 @@ handlers.setProperty = function(requestData)
 
 	if success and result ~= false then
 		-- Log for undo tracking
-		logAction("set_property", instancePath, propertyName .. " = " .. tostring(propertyValue), {
+		logAction("set_property", instancePath, propertyName .. " = " .. serializeValue(propertyValue), {
 			propertyName = propertyName,
 			newValue = propertyValue
 		})

@@ -111,7 +111,7 @@ local screenGui = plugin:CreateDockWidgetPluginGuiAsync(
 	"MCPServerInterface",
 	DockWidgetPluginGuiInfo.new(Enum.InitialDockState.Float, false, false, 400, 500, 350, 450)
 )
-screenGui.Title = "MCP Server v1.12.1"
+screenGui.Title = "MCP Server v1.12.2"
 
 local mainFrame = Instance.new("Frame")
 mainFrame.Size = UDim2.new(1, 0, 1, 0)
@@ -164,7 +164,7 @@ local versionLabel = Instance.new("TextLabel")
 versionLabel.Size = UDim2.new(1, 0, 0, 16)
 versionLabel.Position = UDim2.new(0, 0, 0, 32)
 versionLabel.BackgroundTransparency = 1
-versionLabel.Text = "AI Integration • v1.12.1"
+versionLabel.Text = "AI Integration • v1.12.2"
 versionLabel.TextColor3 = Color3.fromRGB(191, 219, 254)
 versionLabel.TextScaled = false
 versionLabel.TextSize = 12
@@ -2837,83 +2837,25 @@ local function countOccurrences(source, searchStr)
 	return count
 end
 
--- Helper: Simple Lua syntax validation (checks for balanced blocks)
+-- Helper: Real Lua syntax validation using loadstring (same as validate_script)
 local function validateLuaSyntax(source)
-	local errors = {}
+	local success, result = pcall(function()
+		local fn, err = loadstring(source)
+		if err then
+			return { valid = false, error = err }
+		end
+		return { valid = true }
+	end)
 
-	-- Check for balanced keywords
-	local blockStarters = { "function", "if", "for", "while", "do", "repeat" }
-	local openBlocks = 0
-	local repeatBlocks = 0
-
-	-- Simple pattern-based checking for common errors
-	for line in string.gmatch(source .. "\n", "([^\n]*)\n") do
-		-- Count block starters
-		if string.match(line, "^%s*function%s") or string.match(line, "=%s*function%s*%(") or string.match(line, "^%s*local%s+function%s") then
-			openBlocks = openBlocks + 1
-		end
-		if string.match(line, "^%s*if%s") and not string.match(line, "%sthen%s+.+%send%s*$") then
-			openBlocks = openBlocks + 1
-		end
-		if string.match(line, "^%s*for%s") and string.match(line, "%sdo%s*$") then
-			openBlocks = openBlocks + 1
-		end
-		if string.match(line, "^%s*while%s") and string.match(line, "%sdo%s*$") then
-			openBlocks = openBlocks + 1
-		end
-		if string.match(line, "^%s*repeat%s*$") then
-			repeatBlocks = repeatBlocks + 1
-		end
-
-		-- Count block enders
-		if string.match(line, "^%s*end%s*$") or string.match(line, "^%s*end[%)%],;%s]") or string.match(line, "%send%s*$") then
-			if not string.match(line, "^%s*%-%-") then -- Not a comment
-				openBlocks = openBlocks - 1
-			end
-		end
-		if string.match(line, "^%s*until%s") then
-			repeatBlocks = repeatBlocks - 1
-		end
+	if not success then
+		return false, { "Failed to validate: " .. tostring(result) }
 	end
 
-	if openBlocks > 0 then
-		table.insert(errors, "Missing " .. openBlocks .. " 'end' statement(s) - check your function/if/for/while blocks")
-	elseif openBlocks < 0 then
-		table.insert(errors, "Extra " .. math.abs(openBlocks) .. " 'end' statement(s) - you have more 'end' keywords than block openers")
+	if result.error then
+		return false, { result.error }
 	end
 
-	if repeatBlocks > 0 then
-		table.insert(errors, "Missing " .. repeatBlocks .. " 'until' statement(s) for repeat blocks")
-	elseif repeatBlocks < 0 then
-		table.insert(errors, "Extra " .. math.abs(repeatBlocks) .. " 'until' statement(s)")
-	end
-
-	-- Check for unclosed strings (simple check)
-	local inString = false
-	local stringChar = nil
-	local lineNum = 0
-	for line in string.gmatch(source .. "\n", "([^\n]*)\n") do
-		lineNum = lineNum + 1
-		-- Skip long strings and comments for now
-		if not string.match(line, "%[%[") and not string.match(line, "%-%-") then
-			for i = 1, #line do
-				local char = string.sub(line, i, i)
-				if not inString then
-					if char == '"' or char == "'" then
-						inString = true
-						stringChar = char
-					end
-				else
-					if char == stringChar and string.sub(line, i-1, i-1) ~= "\\" then
-						inString = false
-						stringChar = nil
-					end
-				end
-			end
-		end
-	end
-
-	return #errors == 0, errors
+	return true, {}
 end
 
 -- edit_script: String-based editing like Claude Code's Edit tool

@@ -488,6 +488,114 @@ export class RobloxStudioTools {
     };
   }
 
+  // ============================================
+  // CLAUDE CODE-STYLE SCRIPT EDITING TOOLS
+  // ============================================
+
+  /**
+   * edit_script - String-based script editing like Claude Code's Edit tool
+   * Find exact text and replace it - no line numbers needed!
+   */
+  async editScript(instancePath: string, oldString: string, newString: string, replaceAll: boolean = false, validateAfter: boolean = true) {
+    if (!instancePath) {
+      throw new Error('Instance path is required for edit_script');
+    }
+    if (typeof oldString !== 'string') {
+      throw new Error('old_string is required for edit_script');
+    }
+    if (typeof newString !== 'string') {
+      throw new Error('new_string is required for edit_script');
+    }
+    if (oldString === newString) {
+      throw new Error('old_string and new_string must be different');
+    }
+    const response = await this.client.request('/api/edit-script', {
+      instancePath,
+      oldString,
+      newString,
+      replaceAll,
+      validateAfter
+    });
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify(response, null, 2)
+        }
+      ]
+    };
+  }
+
+  /**
+   * search_script - Search for patterns within a script (like grep)
+   */
+  async searchScript(instancePath: string, pattern: string, useRegex: boolean = false, contextLines: number = 0) {
+    if (!instancePath || !pattern) {
+      throw new Error('Instance path and pattern are required for search_script');
+    }
+    const response = await this.client.request('/api/search-script', {
+      instancePath,
+      pattern,
+      useRegex,
+      contextLines
+    });
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify(response, null, 2)
+        }
+      ]
+    };
+  }
+
+  /**
+   * get_script_function - Extract a specific function from a script by name
+   */
+  async getScriptFunction(instancePath: string, functionName: string) {
+    if (!instancePath || !functionName) {
+      throw new Error('Instance path and function name are required for get_script_function');
+    }
+    const response = await this.client.request('/api/get-script-function', {
+      instancePath,
+      functionName
+    });
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify(response, null, 2)
+        }
+      ]
+    };
+  }
+
+  /**
+   * find_and_replace_in_scripts - Find and replace across multiple scripts
+   */
+  async findAndReplaceInScripts(paths: string[], oldString: string, newString: string, validateAfter: boolean = true) {
+    if (!paths || paths.length === 0) {
+      throw new Error('Paths array is required for find_and_replace_in_scripts');
+    }
+    if (typeof oldString !== 'string' || typeof newString !== 'string') {
+      throw new Error('old_string and new_string are required');
+    }
+    const response = await this.client.request('/api/find-and-replace-in-scripts', {
+      paths,
+      oldString,
+      newString,
+      validateAfter
+    });
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify(response, null, 2)
+        }
+      ]
+    };
+  }
+
   // Attribute Tools
   async getAttribute(instancePath: string, attributeName: string) {
     if (!instancePath || !attributeName) {

@@ -1,6 +1,6 @@
 # Roblox Studio MCP Server
 
-MCP server for AI-powered Roblox Studio integration. 24 specialized tools for exploring projects, analyzing scripts, and performing bulk operations.
+MCP server for AI-powered Roblox Studio integration. 28 specialized tools for exploring projects, analyzing scripts, and performing bulk operations. **Now with Claude Code-style script editing!**
 
 https://devforum.roblox.com/t/v180-roblox-studio-mcp-speed-up-your-workflow-by-letting-ai-read-paths-and-properties/3707071
 
@@ -182,6 +182,34 @@ graph TB
 ### Undo/Redo Tools (NEW in v1.10.0)
 - `undo` - Undo the last MCP operation in Studio's history
 - `redo` - Redo a previously undone operation
+
+### Claude Code-Style Script Editing (NEW in v1.12.0) ⭐
+String-based script editing that works just like Claude Code's Edit tool - no more line number guessing!
+
+- `edit_script` - **RECOMMENDED**: Find exact text and replace it, no line numbers needed. Auto-validates syntax and rejects broken code.
+- `search_script` - Search for patterns within scripts (like grep), with optional context lines
+- `get_script_function` - Extract a specific function by name with line numbers
+- `find_and_replace_in_scripts` - Batch find & replace across multiple scripts
+
+```typescript
+// Example: Safe string-based editing
+edit_script({
+  instancePath: "game.ServerScriptService.Main",
+  old_string: "function onPlayerJoin()\n\tprint('hi')\nend",
+  new_string: "function onPlayerJoin(player)\n\tprint('Welcome', player.Name)\nend"
+})
+// If old_string doesn't match exactly → ERROR (safe failure)
+// If syntax is broken → ERROR (edit rejected, original preserved)
+// If it matches → clean replacement ✓
+```
+
+**Why this is better:**
+| Line-based (old) | String-based (v1.12.0) |
+|---|---|
+| "Edit lines 45-52" 🤞 | "Find this exact code" ✓ |
+| Line numbers shift after edits | Matches the actual content |
+| Can break `end` statements | Validates syntax before applying |
+| Requires counting lines | Just copy the text to replace |
 
 > **Note:** All mutation tools (set_property, create_object, delete_object, etc.) are now automatically wrapped in ChangeHistoryService recordings, making every AI change undoable via Ctrl+Z in Studio or the `undo` tool.
 

@@ -37,7 +37,7 @@ class RobloxStudioMCPServer {
     this.server = new Server(
       {
         name: 'rbxstudio-mcp',
-        version: '1.11.0',
+        version: '1.12.0',
       },
       {
         capabilities: {
@@ -715,6 +715,115 @@ class RobloxStudioMCPServer {
               required: ['instancePath', 'startLine', 'endLine']
             }
           },
+          // ============================================
+          // CLAUDE CODE-STYLE SCRIPT EDITING TOOLS
+          // ============================================
+          {
+            name: 'edit_script',
+            description: 'RECOMMENDED: String-based script editing like Claude Code\'s Edit tool. Find exact text and replace it - no line numbers needed! This is the safest and most reliable way to edit scripts. The edit will FAIL safely if old_string is not found or appears multiple times (unless replace_all is true). Always validates syntax after editing.',
+            inputSchema: {
+              type: 'object',
+              properties: {
+                instancePath: {
+                  type: 'string',
+                  description: 'Roblox instance path to the script (e.g., "game.ServerScriptService.MainScript")'
+                },
+                old_string: {
+                  type: 'string',
+                  description: 'The exact text to find and replace (must match exactly, including whitespace/indentation)'
+                },
+                new_string: {
+                  type: 'string',
+                  description: 'The text to replace it with (must be different from old_string)'
+                },
+                replace_all: {
+                  type: 'boolean',
+                  description: 'If true, replace ALL occurrences of old_string. If false (default), fails if old_string appears more than once.',
+                  default: false
+                },
+                validate_after: {
+                  type: 'boolean',
+                  description: 'If true (default), validates the script syntax after editing and reverts if invalid.',
+                  default: true
+                }
+              },
+              required: ['instancePath', 'old_string', 'new_string']
+            }
+          },
+          {
+            name: 'search_script',
+            description: 'Search for patterns within a script source code (like grep). Returns matching lines with line numbers and optional context.',
+            inputSchema: {
+              type: 'object',
+              properties: {
+                instancePath: {
+                  type: 'string',
+                  description: 'Roblox instance path to the script (e.g., "game.ServerScriptService.MainScript")'
+                },
+                pattern: {
+                  type: 'string',
+                  description: 'Search pattern (literal string or regex if use_regex is true)'
+                },
+                use_regex: {
+                  type: 'boolean',
+                  description: 'If true, treat pattern as a Lua regex pattern. Default false (literal match).',
+                  default: false
+                },
+                context_lines: {
+                  type: 'number',
+                  description: 'Number of lines to show before and after each match (like grep -C). Default 0.',
+                  default: 0
+                }
+              },
+              required: ['instancePath', 'pattern']
+            }
+          },
+          {
+            name: 'get_script_function',
+            description: 'Extract a specific function from a script by name. Returns the function source code with start/end line numbers. Perfect for editing just one function without affecting the rest of the script.',
+            inputSchema: {
+              type: 'object',
+              properties: {
+                instancePath: {
+                  type: 'string',
+                  description: 'Roblox instance path to the script (e.g., "game.ServerScriptService.MainScript")'
+                },
+                function_name: {
+                  type: 'string',
+                  description: 'Name of the function to extract (e.g., "onPlayerJoin", "handleDamage")'
+                }
+              },
+              required: ['instancePath', 'function_name']
+            }
+          },
+          {
+            name: 'find_and_replace_in_scripts',
+            description: 'Find and replace text across multiple scripts at once. Like edit_script but for batch operations. Validates all scripts after editing.',
+            inputSchema: {
+              type: 'object',
+              properties: {
+                paths: {
+                  type: 'array',
+                  items: { type: 'string' },
+                  description: 'Array of script paths to search and replace in'
+                },
+                old_string: {
+                  type: 'string',
+                  description: 'The exact text to find and replace'
+                },
+                new_string: {
+                  type: 'string',
+                  description: 'The text to replace it with'
+                },
+                validate_after: {
+                  type: 'boolean',
+                  description: 'If true (default), validates syntax after each edit.',
+                  default: true
+                }
+              },
+              required: ['paths', 'old_string', 'new_string']
+            }
+          },
           // Attribute Tools (for Roblox instance attributes)
           {
             name: 'get_attribute',
@@ -1083,13 +1192,42 @@ class RobloxStudioMCPServer {
           case 'set_script_source':
             return await this.tools.setScriptSource((args as any)?.instancePath as string, (args as any)?.source as string);
 
-          // Partial Script Editing Tools
+          // Partial Script Editing Tools (line-based - legacy)
           case 'edit_script_lines':
             return await this.tools.editScriptLines((args as any)?.instancePath as string, (args as any)?.startLine as number, (args as any)?.endLine as number, (args as any)?.newContent as string);
           case 'insert_script_lines':
             return await this.tools.insertScriptLines((args as any)?.instancePath as string, (args as any)?.afterLine as number, (args as any)?.newContent as string);
           case 'delete_script_lines':
             return await this.tools.deleteScriptLines((args as any)?.instancePath as string, (args as any)?.startLine as number, (args as any)?.endLine as number);
+
+          // Claude Code-Style Script Editing Tools (RECOMMENDED)
+          case 'edit_script':
+            return await this.tools.editScript(
+              (args as any)?.instancePath as string,
+              (args as any)?.old_string as string,
+              (args as any)?.new_string as string,
+              (args as any)?.replace_all ?? false,
+              (args as any)?.validate_after ?? true
+            );
+          case 'search_script':
+            return await this.tools.searchScript(
+              (args as any)?.instancePath as string,
+              (args as any)?.pattern as string,
+              (args as any)?.use_regex ?? false,
+              (args as any)?.context_lines ?? 0
+            );
+          case 'get_script_function':
+            return await this.tools.getScriptFunction(
+              (args as any)?.instancePath as string,
+              (args as any)?.function_name as string
+            );
+          case 'find_and_replace_in_scripts':
+            return await this.tools.findAndReplaceInScripts(
+              (args as any)?.paths as string[],
+              (args as any)?.old_string as string,
+              (args as any)?.new_string as string,
+              (args as any)?.validate_after ?? true
+            );
 
           // Attribute Tools
           case 'get_attribute':

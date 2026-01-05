@@ -17,6 +17,30 @@ end)
 local outputBuffer = {}
 local MAX_OUTPUT_BUFFER = 1000
 
+-- Track action history for enhanced undo/redo
+local actionHistory = {}  -- Stack of actions that can be undone
+local redoHistory = {}    -- Stack of actions that can be redone
+local MAX_ACTION_HISTORY = 100
+
+-- Helper to log an action for undo tracking
+local function logAction(actionType, target, summary, details)
+	-- Clear redo history when a new action is performed
+	redoHistory = {}
+
+	table.insert(actionHistory, {
+		action = actionType,
+		target = target,
+		summary = summary,
+		details = details or {},
+		timestamp = os.time()
+	})
+
+	-- Keep history from growing too large
+	if #actionHistory > MAX_ACTION_HISTORY then
+		table.remove(actionHistory, 1)
+	end
+end
+
 -- Connect to LogService to capture output
 LogService.MessageOut:Connect(function(message, messageType)
 	table.insert(outputBuffer, {
@@ -55,7 +79,7 @@ local screenGui = plugin:CreateDockWidgetPluginGuiAsync(
 	"MCPServerInterface",
 	DockWidgetPluginGuiInfo.new(Enum.InitialDockState.Float, false, false, 400, 500, 350, 450)
 )
-screenGui.Title = "MCP Server v1.11.0"
+screenGui.Title = "MCP Server v1.12.0"
 
 local mainFrame = Instance.new("Frame")
 mainFrame.Size = UDim2.new(1, 0, 1, 0)
@@ -108,7 +132,7 @@ local versionLabel = Instance.new("TextLabel")
 versionLabel.Size = UDim2.new(1, 0, 0, 16)
 versionLabel.Position = UDim2.new(0, 0, 0, 32)
 versionLabel.BackgroundTransparency = 1
-versionLabel.Text = "AI Integration • v1.11.0"
+versionLabel.Text = "AI Integration • v1.12.0"
 versionLabel.TextColor3 = Color3.fromRGB(191, 219, 254)
 versionLabel.TextScaled = false
 versionLabel.TextSize = 12
@@ -1465,6 +1489,11 @@ handlers.setProperty = function(requestData)
 	end)
 
 	if success and result ~= false then
+		-- Log for undo tracking
+		logAction("set_property", instancePath, propertyName .. " = " .. tostring(propertyValue), {
+			propertyName = propertyName,
+			newValue = propertyValue
+		})
 		return {
 			success = true,
 			instancePath = instancePath,
@@ -1515,11 +1544,17 @@ handlers.createObject = function(requestData)
 	end)
 
 	if success and newInstance then
+		local newPath = getInstancePath(newInstance)
+		-- Log for undo tracking
+		logAction("create_object", newPath, "Created " .. className .. " '" .. newInstance.Name .. "'", {
+			className = className,
+			parent = parentPath
+		})
 		return {
 			success = true,
 			className = className,
 			parent = parentPath,
-			instancePath = getInstancePath(newInstance),
+			instancePath = newPath,
 			name = newInstance.Name,
 			message = "Object created successfully",
 		}
@@ -1548,15 +1583,21 @@ handlers.deleteObject = function(requestData)
 		return { error = "Cannot delete the game instance" }
 	end
 
+	local name = instance.Name
+	local className = instance.ClassName
+
 	local success, result = pcall(function()
-		local name = instance.Name
-		local className = instance.ClassName
 		instance:Destroy()
 		ChangeHistoryService:SetWaypoint("Delete " .. className .. " (" .. name .. ")")
 		return true
 	end)
 
 	if success then
+		-- Log for undo tracking
+		logAction("delete_object", instancePath, "Deleted " .. className .. " '" .. name .. "'", {
+			className = className,
+			name = name
+		})
 		return {
 			success = true,
 			instancePath = instancePath,
@@ -2459,6 +2500,10 @@ handlers.setScriptSource = function(requestData)
 	end)
 
 	if directSuccess then
+		-- Log for undo tracking
+		logAction("set_script_source", instancePath, "Script source replaced (" .. directResult.newSourceLength .. " chars)", {
+			method = "direct"
+		})
 		return directResult
 	end
 
@@ -2494,6 +2539,10 @@ handlers.setScriptSource = function(requestData)
 	end)
 
 	if replaceSuccess then
+		-- Log for undo tracking
+		logAction("set_script_source", replaceResult.instancePath, "Script replaced entirely", {
+			method = "replace"
+		})
 		return replaceResult
 	else
 		return {
@@ -2734,6 +2783,509 @@ handlers.deleteScriptLines = function(requestData)
 	else
 		return { error = "Failed to delete script lines: " .. tostring(result) }
 	end
+end
+
+-- ============================================
+-- CLAUDE CODE-STYLE SCRIPT EDITING TOOLS
+-- ============================================
+
+-- Helper: Count occurrences of a substring
+local function countOccurrences(source, searchStr)
+	local count = 0
+	local start = 1
+	while true do
+		local pos = string.find(source, searchStr, start, true) -- plain search
+		if pos then
+			count = count + 1
+			start = pos + 1
+		else
+			break
+		end
+	end
+	return count
+end
+
+-- Helper: Simple Lua syntax validation (checks for balanced blocks)
+local function validateLuaSyntax(source)
+	local errors = {}
+
+	-- Check for balanced keywords
+	local blockStarters = { "function", "if", "for", "while", "do", "repeat" }
+	local openBlocks = 0
+	local repeatBlocks = 0
+
+	-- Simple pattern-based checking for common errors
+	for line in string.gmatch(source .. "\n", "([^\n]*)\n") do
+		-- Count block starters
+		if string.match(line, "^%s*function%s") or string.match(line, "=%s*function%s*%(") or string.match(line, "^%s*local%s+function%s") then
+			openBlocks = openBlocks + 1
+		end
+		if string.match(line, "^%s*if%s") and not string.match(line, "%sthen%s+.+%send%s*$") then
+			openBlocks = openBlocks + 1
+		end
+		if string.match(line, "^%s*for%s") and string.match(line, "%sdo%s*$") then
+			openBlocks = openBlocks + 1
+		end
+		if string.match(line, "^%s*while%s") and string.match(line, "%sdo%s*$") then
+			openBlocks = openBlocks + 1
+		end
+		if string.match(line, "^%s*repeat%s*$") then
+			repeatBlocks = repeatBlocks + 1
+		end
+
+		-- Count block enders
+		if string.match(line, "^%s*end%s*$") or string.match(line, "^%s*end[%)%],;%s]") or string.match(line, "%send%s*$") then
+			if not string.match(line, "^%s*%-%-") then -- Not a comment
+				openBlocks = openBlocks - 1
+			end
+		end
+		if string.match(line, "^%s*until%s") then
+			repeatBlocks = repeatBlocks - 1
+		end
+	end
+
+	if openBlocks > 0 then
+		table.insert(errors, "Missing " .. openBlocks .. " 'end' statement(s) - check your function/if/for/while blocks")
+	elseif openBlocks < 0 then
+		table.insert(errors, "Extra " .. math.abs(openBlocks) .. " 'end' statement(s) - you have more 'end' keywords than block openers")
+	end
+
+	if repeatBlocks > 0 then
+		table.insert(errors, "Missing " .. repeatBlocks .. " 'until' statement(s) for repeat blocks")
+	elseif repeatBlocks < 0 then
+		table.insert(errors, "Extra " .. math.abs(repeatBlocks) .. " 'until' statement(s)")
+	end
+
+	-- Check for unclosed strings (simple check)
+	local inString = false
+	local stringChar = nil
+	local lineNum = 0
+	for line in string.gmatch(source .. "\n", "([^\n]*)\n") do
+		lineNum = lineNum + 1
+		-- Skip long strings and comments for now
+		if not string.match(line, "%[%[") and not string.match(line, "%-%-") then
+			for i = 1, #line do
+				local char = string.sub(line, i, i)
+				if not inString then
+					if char == '"' or char == "'" then
+						inString = true
+						stringChar = char
+					end
+				else
+					if char == stringChar and string.sub(line, i-1, i-1) ~= "\\" then
+						inString = false
+						stringChar = nil
+					end
+				end
+			end
+		end
+	end
+
+	return #errors == 0, errors
+end
+
+-- edit_script: String-based editing like Claude Code's Edit tool
+handlers.editScript = function(requestData)
+	local instancePath = requestData.instancePath
+	local oldString = requestData.oldString
+	local newString = requestData.newString
+	local replaceAll = requestData.replaceAll or false
+	local validateAfter = requestData.validateAfter
+	if validateAfter == nil then validateAfter = true end
+
+	if not instancePath then
+		return { error = "Instance path is required" }
+	end
+	if not oldString or oldString == "" then
+		return { error = "old_string is required and cannot be empty" }
+	end
+	if newString == nil then
+		return { error = "new_string is required" }
+	end
+	if oldString == newString then
+		return { error = "old_string and new_string must be different" }
+	end
+
+	local instance = getInstanceByPath(instancePath)
+	if not instance then
+		return { error = "Instance not found: " .. instancePath }
+	end
+
+	if not instance:IsA("LuaSourceContainer") then
+		return { error = "Instance is not a script: " .. instance.ClassName }
+	end
+
+	local success, result = pcall(function()
+		local source = instance.Source
+
+		-- Normalize escape sequences that may have been double-escaped
+		local searchStr = oldString:gsub("\\n", "\n"):gsub("\\t", "\t"):gsub("\\r", "\r"):gsub("\\\\", "\\")
+		local replaceStr = newString:gsub("\\n", "\n"):gsub("\\t", "\t"):gsub("\\r", "\r"):gsub("\\\\", "\\")
+
+		-- Count occurrences
+		local occurrences = countOccurrences(source, searchStr)
+
+		if occurrences == 0 then
+			return {
+				success = false,
+				error = "old_string not found in script. Make sure the text matches exactly, including whitespace and indentation.",
+				hint = "Tip: Use get_script_source first to see the exact content, then copy the text precisely."
+			}
+		end
+
+		if occurrences > 1 and not replaceAll then
+			return {
+				success = false,
+				error = "old_string appears " .. occurrences .. " times in the script. Either provide more context to make it unique, or set replace_all=true to replace all occurrences.",
+				occurrences = occurrences
+			}
+		end
+
+		-- Perform the replacement
+		local newSource
+		if replaceAll then
+			newSource = string.gsub(source, searchStr:gsub("([^%w])", "%%%1"), replaceStr) -- Escape pattern chars
+		else
+			-- Replace just the first occurrence
+			local pos = string.find(source, searchStr, 1, true)
+			newSource = string.sub(source, 1, pos - 1) .. replaceStr .. string.sub(source, pos + #searchStr)
+		end
+
+		-- Validate syntax if requested
+		if validateAfter then
+			local isValid, syntaxErrors = validateLuaSyntax(newSource)
+			if not isValid then
+				return {
+					success = false,
+					error = "Edit would create invalid Lua syntax",
+					syntaxErrors = syntaxErrors,
+					hint = "The edit was NOT applied. Fix the syntax issues in new_string and try again."
+				}
+			end
+		end
+
+		-- Apply the change
+		ScriptEditorService:UpdateSourceAsync(instance, function(oldContent)
+			return newSource
+		end)
+
+		ChangeHistoryService:SetWaypoint("Edit script: " .. instance.Name)
+
+		-- Prepare summary for logging
+		local shortOld = #searchStr > 30 and (string.sub(searchStr, 1, 30) .. "...") or searchStr
+		local shortNew = #replaceStr > 30 and (string.sub(replaceStr, 1, 30) .. "...") or replaceStr
+
+		return {
+			success = true,
+			instancePath = instancePath,
+			replacements = replaceAll and occurrences or 1,
+			oldLength = #source,
+			newLength = #newSource,
+			validated = validateAfter,
+			message = replaceAll
+				and ("Replaced " .. occurrences .. " occurrence(s) successfully")
+				or "Edit applied successfully",
+			_logSummary = shortOld:gsub("\n", "\\n") .. " → " .. shortNew:gsub("\n", "\\n")
+		}
+	end)
+
+	if success then
+		if result.success then
+			-- Log for undo tracking
+			logAction("edit_script", instancePath, result._logSummary or "Script edited", {
+				replacements = result.replacements
+			})
+			result._logSummary = nil  -- Remove internal field
+		end
+		return result
+	else
+		return { error = "Failed to edit script: " .. tostring(result) }
+	end
+end
+
+-- search_script: Search for patterns within a script (like grep)
+handlers.searchScript = function(requestData)
+	local instancePath = requestData.instancePath
+	local pattern = requestData.pattern
+	local useRegex = requestData.useRegex or false
+	local contextLines = requestData.contextLines or 0
+
+	if not instancePath or not pattern then
+		return { error = "Instance path and pattern are required" }
+	end
+
+	local instance = getInstanceByPath(instancePath)
+	if not instance then
+		return { error = "Instance not found: " .. instancePath }
+	end
+
+	if not instance:IsA("LuaSourceContainer") then
+		return { error = "Instance is not a script: " .. instance.ClassName }
+	end
+
+	local success, result = pcall(function()
+		local source = instance.Source
+		local lines, _ = splitLines(source)
+		local matches = {}
+
+		for lineNum, line in ipairs(lines) do
+			local found = false
+			if useRegex then
+				found = string.match(line, pattern) ~= nil
+			else
+				found = string.find(line, pattern, 1, true) ~= nil
+			end
+
+			if found then
+				local match = {
+					lineNumber = lineNum,
+					content = line,
+					context = {}
+				}
+
+				-- Add context lines
+				if contextLines > 0 then
+					for i = math.max(1, lineNum - contextLines), lineNum - 1 do
+						table.insert(match.context, { lineNumber = i, content = lines[i], type = "before" })
+					end
+					for i = lineNum + 1, math.min(#lines, lineNum + contextLines) do
+						table.insert(match.context, { lineNumber = i, content = lines[i], type = "after" })
+					end
+				end
+
+				table.insert(matches, match)
+			end
+		end
+
+		return {
+			instancePath = instancePath,
+			pattern = pattern,
+			useRegex = useRegex,
+			matches = matches,
+			matchCount = #matches,
+			totalLines = #lines
+		}
+	end)
+
+	if success then
+		return result
+	else
+		return { error = "Failed to search script: " .. tostring(result) }
+	end
+end
+
+-- get_script_function: Extract a specific function by name
+handlers.getScriptFunction = function(requestData)
+	local instancePath = requestData.instancePath
+	local functionName = requestData.functionName
+
+	if not instancePath or not functionName then
+		return { error = "Instance path and function name are required" }
+	end
+
+	local instance = getInstanceByPath(instancePath)
+	if not instance then
+		return { error = "Instance not found: " .. instancePath }
+	end
+
+	if not instance:IsA("LuaSourceContainer") then
+		return { error = "Instance is not a script: " .. instance.ClassName }
+	end
+
+	local success, result = pcall(function()
+		local source = instance.Source
+		local lines, _ = splitLines(source)
+
+		local functionStart = nil
+		local functionEnd = nil
+		local depth = 0
+		local inFunction = false
+
+		-- Patterns to match function definitions
+		local patterns = {
+			"^%s*function%s+" .. functionName .. "%s*%(", -- function name(
+			"^%s*local%s+function%s+" .. functionName .. "%s*%(", -- local function name(
+			functionName .. "%s*=%s*function%s*%(", -- name = function(
+			"local%s+" .. functionName .. "%s*=%s*function%s*%(" -- local name = function(
+		}
+
+		for lineNum, line in ipairs(lines) do
+			-- Check if this line starts the function we're looking for
+			if not inFunction then
+				for _, pat in ipairs(patterns) do
+					if string.match(line, pat) then
+						functionStart = lineNum
+						inFunction = true
+						depth = 1
+						-- Check if function also ends on this line (one-liner)
+						if string.match(line, "%send%s*$") or string.match(line, "%send%s*[%)%];,]") then
+							functionEnd = lineNum
+							inFunction = false
+						end
+						break
+					end
+				end
+			else
+				-- We're inside the function, track depth
+				-- Count block openers
+				if string.match(line, "^%s*function%s") or string.match(line, "=%s*function%s*%(") then
+					depth = depth + 1
+				end
+				if string.match(line, "^%s*if%s") and string.match(line, "%sthen%s*$") then
+					depth = depth + 1
+				end
+				if string.match(line, "^%s*for%s") and string.match(line, "%sdo%s*$") then
+					depth = depth + 1
+				end
+				if string.match(line, "^%s*while%s") and string.match(line, "%sdo%s*$") then
+					depth = depth + 1
+				end
+				if string.match(line, "^%s*do%s*$") then
+					depth = depth + 1
+				end
+
+				-- Count block closers
+				if string.match(line, "^%s*end%s*$") or string.match(line, "^%s*end[%)%],;%s]") or string.match(line, "%send%s*$") then
+					depth = depth - 1
+					if depth == 0 then
+						functionEnd = lineNum
+						break
+					end
+				end
+			end
+		end
+
+		if not functionStart then
+			return {
+				success = false,
+				error = "Function '" .. functionName .. "' not found in script",
+				hint = "Check the function name spelling. Use search_script to find available functions."
+			}
+		end
+
+		if not functionEnd then
+			return {
+				success = false,
+				error = "Could not find the end of function '" .. functionName .. "' - the function may be malformed",
+				startLine = functionStart
+			}
+		end
+
+		-- Extract the function source
+		local functionLines = {}
+		for i = functionStart, functionEnd do
+			table.insert(functionLines, lines[i])
+		end
+
+		local functionSource = table.concat(functionLines, "\n")
+
+		-- Create numbered version
+		local numberedLines = {}
+		for i = functionStart, functionEnd do
+			table.insert(numberedLines, string.format("%4d: %s", i, lines[i]))
+		end
+		local numberedSource = table.concat(numberedLines, "\n")
+
+		return {
+			success = true,
+			instancePath = instancePath,
+			functionName = functionName,
+			startLine = functionStart,
+			endLine = functionEnd,
+			lineCount = functionEnd - functionStart + 1,
+			source = functionSource,
+			numberedSource = numberedSource
+		}
+	end)
+
+	if success then
+		return result
+	else
+		return { error = "Failed to get function: " .. tostring(result) }
+	end
+end
+
+-- find_and_replace_in_scripts: Batch replace across multiple scripts
+handlers.findAndReplaceInScripts = function(requestData)
+	local paths = requestData.paths
+	local oldString = requestData.oldString
+	local newString = requestData.newString
+	local validateAfter = requestData.validateAfter
+	if validateAfter == nil then validateAfter = true end
+
+	if not paths or #paths == 0 then
+		return { error = "Paths array is required" }
+	end
+	if not oldString or oldString == "" then
+		return { error = "old_string is required" }
+	end
+	if newString == nil then
+		return { error = "new_string is required" }
+	end
+
+	local results = {}
+	local successCount = 0
+	local failCount = 0
+	local skippedCount = 0
+
+	for _, path in ipairs(paths) do
+		local instance = getInstanceByPath(path)
+		if not instance then
+			table.insert(results, { path = path, success = false, error = "Instance not found" })
+			failCount = failCount + 1
+		elseif not instance:IsA("LuaSourceContainer") then
+			table.insert(results, { path = path, success = false, error = "Not a script" })
+			failCount = failCount + 1
+		else
+			local source = instance.Source
+			local searchStr = oldString:gsub("\\n", "\n"):gsub("\\t", "\t"):gsub("\\r", "\r"):gsub("\\\\", "\\")
+			local replaceStr = newString:gsub("\\n", "\n"):gsub("\\t", "\t"):gsub("\\r", "\r"):gsub("\\\\", "\\")
+
+			local occurrences = countOccurrences(source, searchStr)
+
+			if occurrences == 0 then
+				table.insert(results, { path = path, success = true, skipped = true, reason = "Pattern not found" })
+				skippedCount = skippedCount + 1
+			else
+				local newSource = string.gsub(source, searchStr:gsub("([^%w])", "%%%1"), replaceStr)
+
+				if validateAfter then
+					local isValid, syntaxErrors = validateLuaSyntax(newSource)
+					if not isValid then
+						table.insert(results, { path = path, success = false, error = "Would create invalid syntax", syntaxErrors = syntaxErrors })
+						failCount = failCount + 1
+					else
+						pcall(function()
+							ScriptEditorService:UpdateSourceAsync(instance, function() return newSource end)
+						end)
+						table.insert(results, { path = path, success = true, replacements = occurrences })
+						successCount = successCount + 1
+					end
+				else
+					pcall(function()
+						ScriptEditorService:UpdateSourceAsync(instance, function() return newSource end)
+					end)
+					table.insert(results, { path = path, success = true, replacements = occurrences })
+					successCount = successCount + 1
+				end
+			end
+		end
+	end
+
+	if successCount > 0 then
+		ChangeHistoryService:SetWaypoint("Batch replace in " .. successCount .. " scripts")
+	end
+
+	return {
+		success = failCount == 0,
+		results = results,
+		summary = {
+			total = #paths,
+			successful = successCount,
+			failed = failCount,
+			skipped = skippedCount
+		}
+	}
 end
 
 -- Attribute Tools: Get a single attribute
@@ -3412,15 +3964,31 @@ handlers.validateScript = function(requestData)
 end
 
 -- ============================================
--- UNDO/REDO HANDLERS
+-- UNDO/REDO HANDLERS (Enhanced with action tracking)
 -- ============================================
 
 handlers.undo = function(requestData)
 	local success, result = pcall(function()
+		-- Pop the last action from history
+		local lastAction = nil
+		if #actionHistory > 0 then
+			lastAction = table.remove(actionHistory)
+			-- Move it to redo history
+			table.insert(redoHistory, lastAction)
+		end
+
 		ChangeHistoryService:Undo()
+
 		return {
 			success = true,
-			message = "Undo executed"
+			undone = lastAction and (lastAction.action .. " → " .. lastAction.target .. " (" .. lastAction.summary .. ")") or "Unknown action (possibly manual change)",
+			action = lastAction and lastAction.action or nil,
+			target = lastAction and lastAction.target or nil,
+			summary = lastAction and lastAction.summary or nil,
+			details = lastAction and lastAction.details or nil,
+			remaining_undos = #actionHistory,
+			available_redos = #redoHistory,
+			message = lastAction and ("Undone: " .. lastAction.summary) or "Undo executed"
 		}
 	end)
 
@@ -3429,17 +3997,35 @@ handlers.undo = function(requestData)
 	else
 		return {
 			success = false,
-			error = "Failed to undo: " .. tostring(result)
+			error = "Failed to undo: " .. tostring(result),
+			remaining_undos = #actionHistory,
+			available_redos = #redoHistory
 		}
 	end
 end
 
 handlers.redo = function(requestData)
 	local success, result = pcall(function()
+		-- Pop the last undone action from redo history
+		local redoneAction = nil
+		if #redoHistory > 0 then
+			redoneAction = table.remove(redoHistory)
+			-- Move it back to action history
+			table.insert(actionHistory, redoneAction)
+		end
+
 		ChangeHistoryService:Redo()
+
 		return {
 			success = true,
-			message = "Redo executed"
+			redone = redoneAction and (redoneAction.action .. " → " .. redoneAction.target .. " (" .. redoneAction.summary .. ")") or "Unknown action",
+			action = redoneAction and redoneAction.action or nil,
+			target = redoneAction and redoneAction.target or nil,
+			summary = redoneAction and redoneAction.summary or nil,
+			details = redoneAction and redoneAction.details or nil,
+			remaining_undos = #actionHistory,
+			available_redos = #redoHistory,
+			message = redoneAction and ("Redone: " .. redoneAction.summary) or "Redo executed"
 		}
 	end)
 
@@ -3448,7 +4034,9 @@ handlers.redo = function(requestData)
 	else
 		return {
 			success = false,
-			error = "Failed to redo: " .. tostring(result)
+			error = "Failed to redo: " .. tostring(result),
+			remaining_undos = #actionHistory,
+			available_redos = #redoHistory
 		}
 	end
 end
@@ -3559,6 +4147,11 @@ endpointHandlers = {
 	["/api/edit-script-lines"] = handlers.editScriptLines,
 	["/api/insert-script-lines"] = handlers.insertScriptLines,
 	["/api/delete-script-lines"] = handlers.deleteScriptLines,
+	-- Claude Code-style script editing tools
+	["/api/edit-script"] = handlers.editScript,
+	["/api/search-script"] = handlers.searchScript,
+	["/api/get-script-function"] = handlers.getScriptFunction,
+	["/api/find-and-replace-in-scripts"] = handlers.findAndReplaceInScripts,
 	["/api/get-attribute"] = handlers.getAttribute,
 	["/api/set-attribute"] = handlers.setAttribute,
 	["/api/get-attributes"] = handlers.getAttributes,
@@ -3573,6 +4166,8 @@ endpointHandlers = {
 	["/api/move-instance"] = handlers.moveInstance,
 	["/api/validate-script"] = handlers.validateScript,
 	["/api/insert-asset"] = handlers.insertAsset,
+	["/api/undo"] = handlers.undo,
+	["/api/redo"] = handlers.redo,
 }
 
 local function updateUIState()

@@ -5,6 +5,30 @@ local RunService = game:GetService("RunService")
 local ChangeHistoryService = game:GetService("ChangeHistoryService")
 local ScriptEditorService = game:GetService("ScriptEditorService")
 local CollectionService = game:GetService("CollectionService")
+local LogService = game:GetService("LogService")
+
+-- StudioTestService for play/stop control (may not be available in all contexts)
+local StudioTestService = nil
+pcall(function()
+	StudioTestService = game:GetService("TestService")
+end)
+
+-- Track output log for get_output
+local outputBuffer = {}
+local MAX_OUTPUT_BUFFER = 1000
+
+-- Connect to LogService to capture output
+LogService.MessageOut:Connect(function(message, messageType)
+	table.insert(outputBuffer, {
+		message = message,
+		messageType = messageType.Name,
+		timestamp = os.time()
+	})
+	-- Keep buffer from growing too large
+	if #outputBuffer > MAX_OUTPUT_BUFFER then
+		table.remove(outputBuffer, 1)
+	end
+end)
 
 local toolbar = plugin:CreateToolbar("MCP Integration")
 local button =
@@ -31,7 +55,7 @@ local screenGui = plugin:CreateDockWidgetPluginGuiAsync(
 	"MCPServerInterface",
 	DockWidgetPluginGuiInfo.new(Enum.InitialDockState.Float, false, false, 400, 500, 350, 450)
 )
-screenGui.Title = "MCP Server v1.8.0"
+screenGui.Title = "MCP Server v1.9.0"
 
 local mainFrame = Instance.new("Frame")
 mainFrame.Size = UDim2.new(1, 0, 1, 0)
@@ -84,7 +108,7 @@ local versionLabel = Instance.new("TextLabel")
 versionLabel.Size = UDim2.new(1, 0, 0, 16)
 versionLabel.Position = UDim2.new(0, 0, 0, 32)
 versionLabel.BackgroundTransparency = 1
-versionLabel.Text = "AI Integration • v1.7.2"
+versionLabel.Text = "AI Integration • v1.9.0"
 versionLabel.TextColor3 = Color3.fromRGB(191, 219, 254)
 versionLabel.TextScaled = false
 versionLabel.TextSize = 12
@@ -771,6 +795,17 @@ processRequest = function(request)
 	-- Selection endpoints
 	elseif endpoint == "/api/get-selection" then
 		return handlers.getSelection(data)
+	-- Output capture endpoint
+	elseif endpoint == "/api/get-output" then
+		return handlers.getOutput(data)
+	-- Instance manipulation endpoints
+	elseif endpoint == "/api/clone-instance" then
+		return handlers.cloneInstance(data)
+	elseif endpoint == "/api/move-instance" then
+		return handlers.moveInstance(data)
+	-- Script validation endpoint
+	elseif endpoint == "/api/validate-script" then
+		return handlers.validateScript(data)
 	else
 		return { error = "Unknown endpoint: " .. tostring(endpoint) }
 	end
@@ -3082,6 +3117,321 @@ handlers.getSelection = function(requestData)
 		selection = selectedObjects,
 		count = #selection,
 		message = #selection .. " object(s) selected"
+	}
+end
+
+-- ============================================
+-- OUTPUT CAPTURE HANDLER
+-- ============================================
+
+handlers.getOutput = function(requestData)
+	local limit = requestData.limit or 100 -- Default to last 100 messages
+	local since = requestData.since -- Optional timestamp filter
+	local messageTypes = requestData.messageTypes -- Optional filter: {"MessageOutput", "MessageInfo", "MessageWarning", "MessageError"}
+	local clear = requestData.clear -- Optional: clear buffer after reading
+
+	-- Also get historical log from LogService
+	local success, historyResult = pcall(function()
+		return LogService:GetLogHistory()
+	end)
+
+	local combinedOutput = {}
+
+	-- Add from our buffer first
+	for i = math.max(1, #outputBuffer - limit + 1), #outputBuffer do
+		local entry = outputBuffer[i]
+		if entry then
+			-- Apply timestamp filter
+			if not since or entry.timestamp >= since then
+				-- Apply message type filter
+				if not messageTypes or table.find(messageTypes, entry.messageType) then
+					table.insert(combinedOutput, entry)
+				end
+			end
+		end
+	end
+
+	-- If we have history from LogService and buffer is small, supplement with history
+	if success and historyResult and #combinedOutput < limit then
+		for _, logEntry in ipairs(historyResult) do
+			if #combinedOutput >= limit then break end
+			local entry = {
+				message = logEntry.message,
+				messageType = tostring(logEntry.messageType),
+				timestamp = logEntry.timestamp or 0
+			}
+			-- Check if not already in our buffer (simple dedup by message)
+			local isDuplicate = false
+			for _, existing in ipairs(combinedOutput) do
+				if existing.message == entry.message then
+					isDuplicate = true
+					break
+				end
+			end
+			if not isDuplicate then
+				if not since or entry.timestamp >= since then
+					if not messageTypes or table.find(messageTypes, entry.messageType) then
+						table.insert(combinedOutput, entry)
+					end
+				end
+			end
+		end
+	end
+
+	-- Clear buffer if requested
+	if clear then
+		outputBuffer = {}
+	end
+
+	return {
+		success = true,
+		output = combinedOutput,
+		count = #combinedOutput,
+		bufferSize = #outputBuffer,
+		timestamp = os.time()
+	}
+end
+
+-- ============================================
+-- INSTANCE MANIPULATION HANDLERS (clone, move)
+-- ============================================
+
+handlers.cloneInstance = function(requestData)
+	local sourcePath = requestData.sourcePath
+	local targetParent = requestData.targetParent
+	local newName = requestData.newName -- Optional new name for the clone
+
+	if not sourcePath then
+		return { success = false, error = "sourcePath is required" }
+	end
+	if not targetParent then
+		return { success = false, error = "targetParent is required" }
+	end
+
+	local sourceInstance = getInstanceByPath(sourcePath)
+	if not sourceInstance then
+		return { success = false, error = "Source instance not found: " .. sourcePath }
+	end
+
+	local parentInstance = getInstanceByPath(targetParent)
+	if not parentInstance then
+		return { success = false, error = "Target parent not found: " .. targetParent }
+	end
+
+	local success, result = pcall(function()
+		ChangeHistoryService:SetWaypoint("Before MCP Clone")
+
+		local clone = sourceInstance:Clone()
+		if newName then
+			clone.Name = newName
+		end
+		clone.Parent = parentInstance
+
+		ChangeHistoryService:SetWaypoint("After MCP Clone")
+
+		return {
+			success = true,
+			clonedInstance = {
+				name = clone.Name,
+				className = clone.ClassName,
+				path = getInstancePath(clone),
+				parent = getInstancePath(parentInstance)
+			},
+			message = "Successfully cloned " .. sourceInstance.Name .. " to " .. parentInstance.Name
+		}
+	end)
+
+	if success then
+		return result
+	else
+		return {
+			success = false,
+			error = "Failed to clone instance: " .. tostring(result)
+		}
+	end
+end
+
+handlers.moveInstance = function(requestData)
+	local instancePath = requestData.instancePath
+	local newParent = requestData.newParent
+
+	if not instancePath then
+		return { success = false, error = "instancePath is required" }
+	end
+	if not newParent then
+		return { success = false, error = "newParent is required" }
+	end
+
+	local instance = getInstanceByPath(instancePath)
+	if not instance then
+		return { success = false, error = "Instance not found: " .. instancePath }
+	end
+
+	local parentInstance = getInstanceByPath(newParent)
+	if not parentInstance then
+		return { success = false, error = "New parent not found: " .. newParent }
+	end
+
+	local oldParent = instance.Parent
+	local oldPath = getInstancePath(instance)
+
+	local success, result = pcall(function()
+		ChangeHistoryService:SetWaypoint("Before MCP Move")
+
+		instance.Parent = parentInstance
+
+		ChangeHistoryService:SetWaypoint("After MCP Move")
+
+		return {
+			success = true,
+			movedInstance = {
+				name = instance.Name,
+				className = instance.ClassName,
+				newPath = getInstancePath(instance),
+				oldPath = oldPath,
+				oldParent = oldParent and oldParent.Name or nil,
+				newParent = parentInstance.Name
+			},
+			message = "Successfully moved " .. instance.Name .. " to " .. parentInstance.Name
+		}
+	end)
+
+	if success then
+		return result
+	else
+		return {
+			success = false,
+			error = "Failed to move instance: " .. tostring(result)
+		}
+	end
+end
+
+-- ============================================
+-- SCRIPT VALIDATION HANDLER
+-- ============================================
+
+handlers.validateScript = function(requestData)
+	local instancePath = requestData.instancePath
+	local source = requestData.source -- Optional: validate this source instead of script's current source
+
+	local scriptInstance = nil
+	local sourceToValidate = source
+
+	if instancePath then
+		scriptInstance = getInstanceByPath(instancePath)
+		if not scriptInstance then
+			return { success = false, error = "Script not found: " .. instancePath }
+		end
+		if not scriptInstance:IsA("LuaSourceContainer") then
+			return { success = false, error = "Instance is not a script: " .. instancePath }
+		end
+		if not sourceToValidate then
+			sourceToValidate = scriptInstance.Source
+		end
+	end
+
+	if not sourceToValidate then
+		return { success = false, error = "Either instancePath or source is required" }
+	end
+
+	-- Use ScriptEditorService for syntax analysis
+	local success, analysisResult = pcall(function()
+		-- Try to use ScriptAnalyzer if available
+		local ScriptAnalyzer = game:FindService("ScriptAnalyzer")
+		if ScriptAnalyzer then
+			local diagnostics = ScriptAnalyzer:Analyze(sourceToValidate)
+			return diagnostics
+		end
+		return nil
+	end)
+
+	-- Fallback: Basic Lua syntax check using loadstring
+	local syntaxErrors = {}
+	local hasError = false
+
+	local loadSuccess, loadResult = pcall(function()
+		-- Try to compile the source (won't execute, just parse)
+		local fn, err = loadstring(sourceToValidate)
+		if err then
+			return { error = err }
+		end
+		return { valid = true }
+	end)
+
+	if loadSuccess and loadResult.error then
+		hasError = true
+		-- Parse the error message for line number
+		local lineNum, errorMsg = loadResult.error:match(':(%d+): (.+)')
+		table.insert(syntaxErrors, {
+			line = tonumber(lineNum) or 0,
+			message = errorMsg or loadResult.error,
+			severity = "Error"
+		})
+	elseif not loadSuccess then
+		hasError = true
+		table.insert(syntaxErrors, {
+			line = 0,
+			message = tostring(loadResult),
+			severity = "Error"
+		})
+	end
+
+	-- Additional checks for common Luau patterns that loadstring might miss
+	local lines = {}
+	for line in sourceToValidate:gmatch("[^\r\n]+") do
+		table.insert(lines, line)
+	end
+
+	local warnings = {}
+
+	-- Check for some common issues
+	for i, line in ipairs(lines) do
+		-- Check for undefined global access patterns (basic heuristic)
+		if line:match("^%s*[%a_][%w_]*%s*=") and not line:match("local") then
+			local varName = line:match("^%s*([%a_][%w_]*)%s*=")
+			if varName and not _G[varName] and varName ~= "script" then
+				table.insert(warnings, {
+					line = i,
+					message = "Implicit global variable: " .. varName .. " (consider using 'local')",
+					severity = "Warning"
+				})
+			end
+		end
+
+		-- Check for deprecated patterns
+		if line:match("wait%(") then
+			table.insert(warnings, {
+				line = i,
+				message = "Consider using task.wait() instead of wait() (deprecated)",
+				severity = "Info"
+			})
+		end
+		if line:match("spawn%(") then
+			table.insert(warnings, {
+				line = i,
+				message = "Consider using task.spawn() instead of spawn() (deprecated)",
+				severity = "Info"
+			})
+		end
+		if line:match("delay%(") then
+			table.insert(warnings, {
+				line = i,
+				message = "Consider using task.delay() instead of delay() (deprecated)",
+				severity = "Info"
+			})
+		end
+	end
+
+	return {
+		success = true,
+		isValid = not hasError,
+		errors = syntaxErrors,
+		warnings = warnings,
+		lineCount = #lines,
+		scriptPath = instancePath,
+		message = hasError
+			and (#syntaxErrors .. " error(s) found")
+			or ("Script is valid" .. (#warnings > 0 and " with " .. #warnings .. " warning(s)" or ""))
 	}
 end
 

@@ -1,6 +1,6 @@
 # Roblox Studio MCP Server
 
-MCP server for AI-powered Roblox Studio integration. 18 specialized tools for exploring projects, analyzing scripts, and performing bulk operations.
+MCP server for AI-powered Roblox Studio integration. 22 specialized tools for exploring projects, analyzing scripts, and performing bulk operations.
 
 https://devforum.roblox.com/t/v180-roblox-studio-mcp-speed-up-your-workflow-by-letting-ai-read-paths-and-properties/3707071
 
@@ -83,12 +83,15 @@ graph TB
         STUDIO["Roblox Studio<br/>APIs & Data"]
     end
     
-    subgraph TOOLS ["18 AI Tools"]
+    subgraph TOOLS ["22 AI Tools"]
         FILE["File System<br/>Trees, Search"]
         CONTEXT["Studio Context<br/>Services, Objects"]
         PROPS["Properties<br/>Get, Set, Mass Ops"]
         CREATE["Object Creation<br/>Single, Mass, Properties"]
         PROJECT["Project Analysis<br/>Smart Structure"]
+        OUTPUT["Output Capture<br/>Logs, Errors"]
+        INSTMANIP["Instance Ops<br/>Clone, Move"]
+        VALIDATE["Script Validation<br/>Syntax Check"]
     end
     
     AI -->|stdio| MCP
@@ -103,10 +106,13 @@ graph TB
     MCP -->|Tool Result| AI
     
     MCP -.->|Exposes| FILE
-    MCP -.->|Exposes| CONTEXT  
+    MCP -.->|Exposes| CONTEXT
     MCP -.->|Exposes| PROPS
     MCP -.->|Exposes| CREATE
     MCP -.->|Exposes| PROJECT
+    MCP -.->|Exposes| OUTPUT
+    MCP -.->|Exposes| INSTMANIP
+    MCP -.->|Exposes| VALIDATE
     
     classDef aiStyle fill:#1e40af,stroke:#3b82f6,stroke-width:2px,color:#ffffff
     classDef mcpStyle fill:#7c3aed,stroke:#8b5cf6,stroke-width:2px,color:#ffffff
@@ -120,16 +126,16 @@ graph TB
     class HTTP,QUEUE httpStyle
     class PLUGIN pluginStyle
     class STUDIO studioStyle
-    class FILE,CONTEXT,PROPS,CREATE,PROJECT toolStyle
+    class FILE,CONTEXT,PROPS,CREATE,PROJECT,OUTPUT,INSTMANIP,VALIDATE toolStyle
 ```
 
 ### Key Components:
-- MCP Server (Node.js/TypeScript) - Exposes 18 tools via stdio
+- MCP Server (Node.js/TypeScript) - Exposes 22 tools via stdio
 - HTTP Bridge - Request/response queue on localhost:3002
 - Studio Plugin (Luau) - Polls server and executes API calls
 - Smart Caching - Efficient data transfer
 
-## 18 AI Tools
+## 22 AI Tools
 
 ### File System Tools
 - `get_file_tree` - Complete project hierarchy with scripts, models, folders
@@ -160,6 +166,16 @@ graph TB
 
 ### Project Analysis Tools
 - `get_project_structure` - Smart hierarchy with depth control (recommended: 5-10)
+
+### Output Capture Tool (NEW in v1.9.0)
+- `get_output` - Read Output window content (print, warn, error messages)
+
+### Instance Manipulation Tools (NEW in v1.9.0)
+- `clone_instance` - Clone/copy an instance to a new parent (deep copy)
+- `move_instance` - Move an instance to a new parent location
+
+### Script Validation Tool (NEW in v1.9.0)
+- `validate_script` - Validate Lua/Luau syntax without running, includes deprecation warnings
 
 > Note: Previous tools removed: `get_file_content`, `get_file_properties`, `get_selection`, `get_dependencies`, `validate_references`. Use Rojo/Argon workflows instead.
 
@@ -264,17 +280,25 @@ get_project_structure()
 // Explore weapons folder
 get_project_structure("game.ServerStorage.Weapons", maxDepth=2)
 
-// Find all Sound objects  
+// Find all Sound objects
 search_by_property("ClassName", "Sound")
-
-// Check script dependencies
-get_dependencies("game.ServerScriptService.MainScript")
-
-// Find broken references
-validate_references()
 
 // Get UI component details
 get_instance_properties("game.StarterGui.MainMenu.SettingsFrame")
+
+// === NEW in v1.9.0 ===
+
+// Clone an object to a different location
+clone_instance("game.Workspace.walkietalkie", "game.ReplicatedStorage")
+
+// Move a tool to StarterPack
+move_instance("game.Workspace.Sword", "game.StarterPack")
+
+// Validate a script before running
+validate_script("game.ServerScriptService.MainScript")
+
+// Monitor game output after testing
+get_output({ limit: 50, messageTypes: ["MessageError", "MessageWarning"] })
 ```
 
 ## Configuration

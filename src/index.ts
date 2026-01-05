@@ -37,7 +37,7 @@ class RobloxStudioMCPServer {
     this.server = new Server(
       {
         name: 'robloxstudio-mcp',
-        version: '1.8.0',
+        version: '1.9.0',
       },
       {
         capabilities: {
@@ -863,6 +863,100 @@ class RobloxStudioMCPServer {
               type: 'object',
               properties: {}
             }
+          },
+          // ============================================
+          // OUTPUT CAPTURE TOOL
+          // ============================================
+          {
+            name: 'get_output',
+            description: 'Read the Output window content from Roblox Studio. Captures print(), warn(), and error() messages. Use after play_solo to debug scripts.',
+            inputSchema: {
+              type: 'object',
+              properties: {
+                limit: {
+                  type: 'number',
+                  description: 'Maximum number of messages to return (default: 100)',
+                  default: 100
+                },
+                since: {
+                  type: 'number',
+                  description: 'Only return messages after this Unix timestamp'
+                },
+                messageTypes: {
+                  type: 'array',
+                  items: { type: 'string' },
+                  description: 'Filter by message type: MessageOutput, MessageInfo, MessageWarning, MessageError'
+                },
+                clear: {
+                  type: 'boolean',
+                  description: 'Clear the output buffer after reading (default: false)',
+                  default: false
+                }
+              }
+            }
+          },
+          // ============================================
+          // INSTANCE MANIPULATION TOOLS
+          // ============================================
+          {
+            name: 'clone_instance',
+            description: 'Clone (copy) a Roblox instance to a new parent location. Creates a deep copy including all children and properties.',
+            inputSchema: {
+              type: 'object',
+              properties: {
+                sourcePath: {
+                  type: 'string',
+                  description: 'Path to the instance to clone (e.g., "game.Workspace.walkietalkie")'
+                },
+                targetParent: {
+                  type: 'string',
+                  description: 'Path to the new parent (e.g., "game.ReplicatedStorage")'
+                },
+                newName: {
+                  type: 'string',
+                  description: 'Optional new name for the cloned instance'
+                }
+              },
+              required: ['sourcePath', 'targetParent']
+            }
+          },
+          {
+            name: 'move_instance',
+            description: 'Move a Roblox instance to a new parent location. Changes the Parent property.',
+            inputSchema: {
+              type: 'object',
+              properties: {
+                instancePath: {
+                  type: 'string',
+                  description: 'Path to the instance to move (e.g., "game.Workspace.Tool")'
+                },
+                newParent: {
+                  type: 'string',
+                  description: 'Path to the new parent (e.g., "game.StarterPack")'
+                }
+              },
+              required: ['instancePath', 'newParent']
+            }
+          },
+          // ============================================
+          // SCRIPT VALIDATION TOOL
+          // ============================================
+          {
+            name: 'validate_script',
+            description: 'Validate Lua/Luau script syntax without running it. Returns syntax errors and warnings for deprecated patterns (wait, spawn, delay). Can validate either an existing script or raw source code.',
+            inputSchema: {
+              type: 'object',
+              properties: {
+                instancePath: {
+                  type: 'string',
+                  description: 'Path to the script to validate (e.g., "game.ServerScriptService.MainScript")'
+                },
+                source: {
+                  type: 'string',
+                  description: 'Raw Lua source code to validate (alternative to instancePath)'
+                }
+              }
+            }
           }
         ]
       };
@@ -974,6 +1068,35 @@ class RobloxStudioMCPServer {
           // Selection Tools
           case 'get_selection':
             return await this.tools.getSelection();
+
+          // Output Capture Tool
+          case 'get_output':
+            return await this.tools.getOutput(
+              (args as any)?.limit,
+              (args as any)?.since,
+              (args as any)?.messageTypes,
+              (args as any)?.clear
+            );
+
+          // Instance Manipulation Tools
+          case 'clone_instance':
+            return await this.tools.cloneInstance(
+              (args as any)?.sourcePath as string,
+              (args as any)?.targetParent as string,
+              (args as any)?.newName
+            );
+          case 'move_instance':
+            return await this.tools.moveInstance(
+              (args as any)?.instancePath as string,
+              (args as any)?.newParent as string
+            );
+
+          // Script Validation Tool
+          case 'validate_script':
+            return await this.tools.validateScript(
+              (args as any)?.instancePath,
+              (args as any)?.source
+            );
 
           default:
             throw new McpError(

@@ -621,4 +621,88 @@ export class RobloxStudioTools {
       ]
     };
   }
+
+  // ============================================
+  // OUTPUT CAPTURE TOOL
+  // ============================================
+
+  async getOutput(limit?: number, since?: number, messageTypes?: string[], clear?: boolean) {
+    const response = await this.client.request('/api/get-output', {
+      limit,
+      since,
+      messageTypes,
+      clear
+    });
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify(response, null, 2)
+        }
+      ]
+    };
+  }
+
+  // ============================================
+  // INSTANCE MANIPULATION TOOLS (clone, move)
+  // ============================================
+
+  async cloneInstance(sourcePath: string, targetParent: string, newName?: string) {
+    if (!sourcePath || !targetParent) {
+      throw new Error('Source path and target parent are required for clone_instance');
+    }
+    const response = await this.client.request('/api/clone-instance', {
+      sourcePath,
+      targetParent,
+      newName
+    });
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify(response, null, 2)
+        }
+      ]
+    };
+  }
+
+  async moveInstance(instancePath: string, newParent: string) {
+    if (!instancePath || !newParent) {
+      throw new Error('Instance path and new parent are required for move_instance');
+    }
+    const response = await this.client.request('/api/move-instance', {
+      instancePath,
+      newParent
+    });
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify(response, null, 2)
+        }
+      ]
+    };
+  }
+
+  // ============================================
+  // SCRIPT VALIDATION TOOL
+  // ============================================
+
+  async validateScript(instancePath?: string, source?: string) {
+    if (!instancePath && !source) {
+      throw new Error('Either instance path or source code is required for validate_script');
+    }
+    const response = await this.client.request('/api/validate-script', {
+      instancePath,
+      source
+    });
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify(response, null, 2)
+        }
+      ]
+    };
+  }
 }

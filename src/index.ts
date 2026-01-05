@@ -36,8 +36,8 @@ class RobloxStudioMCPServer {
   constructor() {
     this.server = new Server(
       {
-        name: 'robloxstudio-mcp',
-        version: '1.9.0',
+        name: 'rbxstudio-mcp',
+        version: '1.10.0',
       },
       {
         capabilities: {
@@ -957,6 +957,25 @@ class RobloxStudioMCPServer {
                 }
               }
             }
+          },
+          // ============================================
+          // UNDO/REDO TOOLS
+          // ============================================
+          {
+            name: 'undo',
+            description: 'Undo the last change made in Roblox Studio. All MCP mutations are automatically recorded for undo support. Use this to revert mistakes.',
+            inputSchema: {
+              type: 'object',
+              properties: {}
+            }
+          },
+          {
+            name: 'redo',
+            description: 'Redo a previously undone change in Roblox Studio.',
+            inputSchema: {
+              type: 'object',
+              properties: {}
+            }
           }
         ]
       };
@@ -1097,6 +1116,12 @@ class RobloxStudioMCPServer {
               (args as any)?.instancePath,
               (args as any)?.source
             );
+
+          // Undo/Redo Tools
+          case 'undo':
+            return await this.tools.undo();
+          case 'redo':
+            return await this.tools.redo();
 
           default:
             throw new McpError(

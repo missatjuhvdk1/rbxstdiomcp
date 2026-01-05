@@ -55,7 +55,7 @@ local screenGui = plugin:CreateDockWidgetPluginGuiAsync(
 	"MCPServerInterface",
 	DockWidgetPluginGuiInfo.new(Enum.InitialDockState.Float, false, false, 400, 500, 350, 450)
 )
-screenGui.Title = "MCP Server v1.9.0"
+screenGui.Title = "MCP Server v1.10.0"
 
 local mainFrame = Instance.new("Frame")
 mainFrame.Size = UDim2.new(1, 0, 1, 0)
@@ -108,7 +108,7 @@ local versionLabel = Instance.new("TextLabel")
 versionLabel.Size = UDim2.new(1, 0, 0, 16)
 versionLabel.Position = UDim2.new(0, 0, 0, 32)
 versionLabel.BackgroundTransparency = 1
-versionLabel.Text = "AI Integration • v1.9.0"
+versionLabel.Text = "AI Integration • v1.10.0"
 versionLabel.TextColor3 = Color3.fromRGB(191, 219, 254)
 versionLabel.TextScaled = false
 versionLabel.TextSize = 12
@@ -717,97 +717,112 @@ sendResponse = function(requestId, responseData)
 	end)
 end
 
+-- Endpoints that modify data (need undo recording)
+local mutationEndpoints = {
+	["/api/set-property"] = "Set Property",
+	["/api/mass-set-property"] = "Mass Set Property",
+	["/api/create-object"] = "Create Object",
+	["/api/mass-create-objects"] = "Mass Create Objects",
+	["/api/mass-create-objects-with-properties"] = "Mass Create Objects",
+	["/api/delete-object"] = "Delete Object",
+	["/api/smart-duplicate"] = "Smart Duplicate",
+	["/api/mass-duplicate"] = "Mass Duplicate",
+	["/api/set-calculated-property"] = "Set Calculated Property",
+	["/api/set-relative-property"] = "Set Relative Property",
+	["/api/set-script-source"] = "Set Script Source",
+	["/api/edit-script-lines"] = "Edit Script Lines",
+	["/api/insert-script-lines"] = "Insert Script Lines",
+	["/api/delete-script-lines"] = "Delete Script Lines",
+	["/api/set-attribute"] = "Set Attribute",
+	["/api/delete-attribute"] = "Delete Attribute",
+	["/api/add-tag"] = "Add Tag",
+	["/api/remove-tag"] = "Remove Tag",
+	["/api/clone-instance"] = "Clone Instance",
+	["/api/move-instance"] = "Move Instance",
+}
+
+-- Endpoint to handler mapping
+local endpointHandlers = {
+	["/api/file-tree"] = handlers.getFileTree,
+	["/api/search-files"] = handlers.searchFiles,
+	["/api/place-info"] = handlers.getPlaceInfo,
+	["/api/services"] = handlers.getServices,
+	["/api/search-objects"] = handlers.searchObjects,
+	["/api/instance-properties"] = handlers.getInstanceProperties,
+	["/api/instance-children"] = handlers.getInstanceChildren,
+	["/api/search-by-property"] = handlers.searchByProperty,
+	["/api/class-info"] = handlers.getClassInfo,
+	["/api/project-structure"] = handlers.getProjectStructure,
+	["/api/set-property"] = handlers.setProperty,
+	["/api/mass-set-property"] = handlers.massSetProperty,
+	["/api/mass-get-property"] = handlers.massGetProperty,
+	["/api/create-object"] = handlers.createObject,
+	["/api/mass-create-objects"] = handlers.massCreateObjects,
+	["/api/mass-create-objects-with-properties"] = handlers.massCreateObjectsWithProperties,
+	["/api/delete-object"] = handlers.deleteObject,
+	["/api/smart-duplicate"] = handlers.smartDuplicate,
+	["/api/mass-duplicate"] = handlers.massDuplicate,
+	["/api/set-calculated-property"] = handlers.setCalculatedProperty,
+	["/api/set-relative-property"] = handlers.setRelativeProperty,
+	["/api/get-script-source"] = handlers.getScriptSource,
+	["/api/set-script-source"] = handlers.setScriptSource,
+	["/api/edit-script-lines"] = handlers.editScriptLines,
+	["/api/insert-script-lines"] = handlers.insertScriptLines,
+	["/api/delete-script-lines"] = handlers.deleteScriptLines,
+	["/api/get-attribute"] = handlers.getAttribute,
+	["/api/set-attribute"] = handlers.setAttribute,
+	["/api/get-attributes"] = handlers.getAttributes,
+	["/api/delete-attribute"] = handlers.deleteAttribute,
+	["/api/get-tags"] = handlers.getTags,
+	["/api/add-tag"] = handlers.addTag,
+	["/api/remove-tag"] = handlers.removeTag,
+	["/api/get-tagged"] = handlers.getTagged,
+	["/api/get-selection"] = handlers.getSelection,
+	["/api/get-output"] = handlers.getOutput,
+	["/api/clone-instance"] = handlers.cloneInstance,
+	["/api/move-instance"] = handlers.moveInstance,
+	["/api/validate-script"] = handlers.validateScript,
+}
+
 processRequest = function(request)
 	local endpoint = request.endpoint
 	local data = request.data or {}
 
-	if endpoint == "/api/file-tree" then
-		return handlers.getFileTree(data)
-	elseif endpoint == "/api/search-files" then
-		return handlers.searchFiles(data)
-	elseif endpoint == "/api/place-info" then
-		return handlers.getPlaceInfo(data)
-	elseif endpoint == "/api/services" then
-		return handlers.getServices(data)
-	elseif endpoint == "/api/search-objects" then
-		return handlers.searchObjects(data)
-	elseif endpoint == "/api/instance-properties" then
-		return handlers.getInstanceProperties(data)
-	elseif endpoint == "/api/instance-children" then
-		return handlers.getInstanceChildren(data)
-	elseif endpoint == "/api/search-by-property" then
-		return handlers.searchByProperty(data)
-	elseif endpoint == "/api/class-info" then
-		return handlers.getClassInfo(data)
-	elseif endpoint == "/api/project-structure" then
-		return handlers.getProjectStructure(data)
-	elseif endpoint == "/api/set-property" then
-		return handlers.setProperty(data)
-	elseif endpoint == "/api/mass-set-property" then
-		return handlers.massSetProperty(data)
-	elseif endpoint == "/api/mass-get-property" then
-		return handlers.massGetProperty(data)
-	elseif endpoint == "/api/create-object" then
-		return handlers.createObject(data)
-	elseif endpoint == "/api/mass-create-objects" then
-		return handlers.massCreateObjects(data)
-	elseif endpoint == "/api/mass-create-objects-with-properties" then
-		return handlers.massCreateObjectsWithProperties(data)
-	elseif endpoint == "/api/delete-object" then
-		return handlers.deleteObject(data)
-	elseif endpoint == "/api/smart-duplicate" then
-		return handlers.smartDuplicate(data)
-	elseif endpoint == "/api/mass-duplicate" then
-		return handlers.massDuplicate(data)
-	elseif endpoint == "/api/set-calculated-property" then
-		return handlers.setCalculatedProperty(data)
-	elseif endpoint == "/api/set-relative-property" then
-		return handlers.setRelativeProperty(data)
-	elseif endpoint == "/api/get-script-source" then
-		return handlers.getScriptSource(data)
-	elseif endpoint == "/api/set-script-source" then
-		return handlers.setScriptSource(data)
-	-- Partial script editing endpoints
-	elseif endpoint == "/api/edit-script-lines" then
-		return handlers.editScriptLines(data)
-	elseif endpoint == "/api/insert-script-lines" then
-		return handlers.insertScriptLines(data)
-	elseif endpoint == "/api/delete-script-lines" then
-		return handlers.deleteScriptLines(data)
-	-- Attribute endpoints
-	elseif endpoint == "/api/get-attribute" then
-		return handlers.getAttribute(data)
-	elseif endpoint == "/api/set-attribute" then
-		return handlers.setAttribute(data)
-	elseif endpoint == "/api/get-attributes" then
-		return handlers.getAttributes(data)
-	elseif endpoint == "/api/delete-attribute" then
-		return handlers.deleteAttribute(data)
-	-- Tag endpoints
-	elseif endpoint == "/api/get-tags" then
-		return handlers.getTags(data)
-	elseif endpoint == "/api/add-tag" then
-		return handlers.addTag(data)
-	elseif endpoint == "/api/remove-tag" then
-		return handlers.removeTag(data)
-	elseif endpoint == "/api/get-tagged" then
-		return handlers.getTagged(data)
-	-- Selection endpoints
-	elseif endpoint == "/api/get-selection" then
-		return handlers.getSelection(data)
-	-- Output capture endpoint
-	elseif endpoint == "/api/get-output" then
-		return handlers.getOutput(data)
-	-- Instance manipulation endpoints
-	elseif endpoint == "/api/clone-instance" then
-		return handlers.cloneInstance(data)
-	elseif endpoint == "/api/move-instance" then
-		return handlers.moveInstance(data)
-	-- Script validation endpoint
-	elseif endpoint == "/api/validate-script" then
-		return handlers.validateScript(data)
-	else
+	-- Handle undo/redo specially (no recording needed)
+	if endpoint == "/api/undo" then
+		return handlers.undo(data)
+	elseif endpoint == "/api/redo" then
+		return handlers.redo(data)
+	end
+
+	local handler = endpointHandlers[endpoint]
+	if not handler then
 		return { error = "Unknown endpoint: " .. tostring(endpoint) }
+	end
+
+	-- Check if this is a mutation endpoint
+	local recordingName = mutationEndpoints[endpoint]
+	if recordingName then
+		-- Wrap in ChangeHistoryService recording for proper undo
+		local recording = ChangeHistoryService:TryBeginRecording("MCP: " .. recordingName)
+		local success, result = pcall(handler, data)
+
+		if recording then
+			if success and not (result and result.error) then
+				ChangeHistoryService:FinishRecording(recording, Enum.FinishRecordingOperation.Commit)
+			else
+				ChangeHistoryService:FinishRecording(recording, Enum.FinishRecordingOperation.Cancel)
+			end
+		end
+
+		if success then
+			return result
+		else
+			return { error = "Handler error: " .. tostring(result) }
+		end
+	else
+		-- Read-only endpoint, no recording needed
+		return handler(data)
 	end
 end
 
@@ -3433,6 +3448,48 @@ handlers.validateScript = function(requestData)
 			and (#syntaxErrors .. " error(s) found")
 			or ("Script is valid" .. (#warnings > 0 and " with " .. #warnings .. " warning(s)" or ""))
 	}
+end
+
+-- ============================================
+-- UNDO/REDO HANDLERS
+-- ============================================
+
+handlers.undo = function(requestData)
+	local success, result = pcall(function()
+		ChangeHistoryService:Undo()
+		return {
+			success = true,
+			message = "Undo executed"
+		}
+	end)
+
+	if success then
+		return result
+	else
+		return {
+			success = false,
+			error = "Failed to undo: " .. tostring(result)
+		}
+	end
+end
+
+handlers.redo = function(requestData)
+	local success, result = pcall(function()
+		ChangeHistoryService:Redo()
+		return {
+			success = true,
+			message = "Redo executed"
+		}
+	end)
+
+	if success then
+		return result
+	else
+		return {
+			success = false,
+			error = "Failed to redo: " .. tostring(result)
+		}
+	end
 end
 
 local function updateUIState()

@@ -37,7 +37,7 @@ class RobloxStudioMCPServer {
     this.server = new Server(
       {
         name: 'rbxstudio-mcp',
-        version: '1.10.1',
+        version: '1.11.0',
       },
       {
         capabilities: {
@@ -976,6 +976,33 @@ class RobloxStudioMCPServer {
               type: 'object',
               properties: {}
             }
+          },
+          // ============================================
+          // ASSET INSERTION TOOL (Creator Store)
+          // ============================================
+          {
+            name: 'insert_asset',
+            description: 'Download and insert a Creator Store asset (model, package, etc.) into Roblox Studio for reference. Uses game:GetObjects() which works with any free/public asset. Perfect for loading reference code, example implementations, or asset libraries that the AI can then read and analyze using get_instance_children and get_script_source.',
+            inputSchema: {
+              type: 'object',
+              properties: {
+                assetId: {
+                  type: 'number',
+                  description: 'The Creator Store asset ID (the number from the asset URL, e.g., 104116977416770)'
+                },
+                folderName: {
+                  type: 'string',
+                  description: 'Name of the folder to create/use for storing assets (default: "AIReferences")',
+                  default: 'AIReferences'
+                },
+                targetParent: {
+                  type: 'string',
+                  description: 'Parent path where the folder should be created (default: "game.Workspace"). Use "game.ReplicatedStorage" or "game.ServerStorage" to keep assets out of the visible workspace.',
+                  default: 'game.Workspace'
+                }
+              },
+              required: ['assetId']
+            }
           }
         ]
       };
@@ -1122,6 +1149,14 @@ class RobloxStudioMCPServer {
             return await this.tools.undo();
           case 'redo':
             return await this.tools.redo();
+
+          // Asset Insertion Tool
+          case 'insert_asset':
+            return await this.tools.insertAsset(
+              (args as any)?.assetId as number,
+              (args as any)?.folderName,
+              (args as any)?.targetParent
+            );
 
           default:
             throw new McpError(

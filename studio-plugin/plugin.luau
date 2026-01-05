@@ -55,7 +55,7 @@ local screenGui = plugin:CreateDockWidgetPluginGuiAsync(
 	"MCPServerInterface",
 	DockWidgetPluginGuiInfo.new(Enum.InitialDockState.Float, false, false, 400, 500, 350, 450)
 )
-screenGui.Title = "MCP Server v1.10.1"
+screenGui.Title = "MCP Server v1.11.0"
 
 local mainFrame = Instance.new("Frame")
 mainFrame.Size = UDim2.new(1, 0, 1, 0)
@@ -108,7 +108,7 @@ local versionLabel = Instance.new("TextLabel")
 versionLabel.Size = UDim2.new(1, 0, 0, 16)
 versionLabel.Position = UDim2.new(0, 0, 0, 32)
 versionLabel.BackgroundTransparency = 1
-versionLabel.Text = "AI Integration • v1.10.1"
+versionLabel.Text = "AI Integration • v1.11.0"
 versionLabel.TextColor3 = Color3.fromRGB(191, 219, 254)
 versionLabel.TextScaled = false
 versionLabel.TextSize = 12
@@ -739,6 +739,7 @@ local mutationEndpoints = {
 	["/api/remove-tag"] = "Remove Tag",
 	["/api/clone-instance"] = "Clone Instance",
 	["/api/move-instance"] = "Move Instance",
+	["/api/insert-asset"] = "Insert Asset",
 }
 
 -- Endpoint to handler mapping (populated after handlers are defined below)
@@ -3452,6 +3453,84 @@ handlers.redo = function(requestData)
 	end
 end
 
+-- ============================================
+-- INSERT ASSET HANDLER (Creator Store)
+-- ============================================
+
+handlers.insertAsset = function(requestData)
+	local assetId = requestData.assetId
+	local folderName = requestData.folderName or "AIReferences"
+	local targetParent = requestData.targetParent or "game.Workspace"
+
+	if not assetId then
+		return { error = "Asset ID is required" }
+	end
+
+	-- Convert to number if string
+	assetId = tonumber(assetId)
+	if not assetId then
+		return { error = "Asset ID must be a valid number" }
+	end
+
+	local success, result = pcall(function()
+		-- Get or create the reference folder
+		local parentInstance = getInstanceByPath(targetParent)
+		if not parentInstance then
+			parentInstance = game.Workspace
+		end
+
+		local folder = parentInstance:FindFirstChild(folderName)
+		if not folder then
+			folder = Instance.new("Folder")
+			folder.Name = folderName
+			folder.Parent = parentInstance
+		end
+
+		-- Use game:GetObjects to load the asset (works with any free asset in plugins)
+		local assetUrl = "rbxassetid://" .. tostring(assetId)
+		local objects = game:GetObjects(assetUrl)
+
+		if not objects or #objects == 0 then
+			return {
+				success = false,
+				error = "Failed to load asset - it may be private, unavailable, or not a model asset"
+			}
+		end
+
+		-- Parent all loaded objects to the folder
+		local insertedPaths = {}
+		for i, obj in ipairs(objects) do
+			-- Name the object with the asset ID for easy identification
+			if #objects == 1 then
+				obj.Name = "Asset_" .. tostring(assetId)
+			else
+				obj.Name = "Asset_" .. tostring(assetId) .. "_" .. tostring(i)
+			end
+			obj.Parent = folder
+			table.insert(insertedPaths, getInstancePath(obj))
+		end
+
+		return {
+			success = true,
+			assetId = assetId,
+			folderPath = getInstancePath(folder),
+			insertedObjects = insertedPaths,
+			objectCount = #objects,
+			message = "Successfully loaded " .. #objects .. " object(s) from asset " .. tostring(assetId)
+		}
+	end)
+
+	if success then
+		return result
+	else
+		return {
+			success = false,
+			error = "Failed to insert asset: " .. tostring(result),
+			assetId = assetId
+		}
+	end
+end
+
 -- Now that all handlers are defined, populate the endpoint mapping table
 endpointHandlers = {
 	["/api/file-tree"] = handlers.getFileTree,
@@ -3493,6 +3572,7 @@ endpointHandlers = {
 	["/api/clone-instance"] = handlers.cloneInstance,
 	["/api/move-instance"] = handlers.moveInstance,
 	["/api/validate-script"] = handlers.validateScript,
+	["/api/insert-asset"] = handlers.insertAsset,
 }
 
 local function updateUIState()

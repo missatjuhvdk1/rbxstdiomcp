@@ -733,4 +733,27 @@ export class RobloxStudioTools {
       ]
     };
   }
+
+  // ============================================
+  // ASSET INSERTION TOOL (Creator Store)
+  // ============================================
+
+  async insertAsset(assetId: number, folderName?: string, targetParent?: string) {
+    if (!assetId) {
+      throw new Error('Asset ID is required for insert_asset');
+    }
+    const response = await this.client.request('/api/insert-asset', {
+      assetId,
+      folderName,
+      targetParent
+    });
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify(response, null, 2)
+        }
+      ]
+    };
+  }
 }

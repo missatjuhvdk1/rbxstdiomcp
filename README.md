@@ -1,6 +1,6 @@
 # Roblox Studio MCP Server
 
-MCP server for AI-powered Roblox Studio integration. 22 specialized tools for exploring projects, analyzing scripts, and performing bulk operations.
+MCP server for AI-powered Roblox Studio integration. 24 specialized tools for exploring projects, analyzing scripts, and performing bulk operations.
 
 https://devforum.roblox.com/t/v180-roblox-studio-mcp-speed-up-your-workflow-by-letting-ai-read-paths-and-properties/3707071
 
@@ -12,16 +12,16 @@ https://devforum.roblox.com/t/v180-roblox-studio-mcp-speed-up-your-workflow-by-l
 
 **For Claude Code users:**
 ```bash
-claude mcp add robloxstudio -- npx -y robloxstudio-mcp
+claude mcp add rbxstudio -- npx -y rbxstudio-mcp
 ```
 
 **For other MCP clients (Claude Desktop, etc.):**
 ```json
 {
   "mcpServers": {
-    "robloxstudio-mcp": {
+    "rbxstudio-mcp": {
       "command": "npx",
-      "args": ["-y", "robloxstudio-mcp"],
+      "args": ["-y", "rbxstudio-mcp"],
       "description": "Advanced Roblox Studio integration for AI assistants"
     }
   }
@@ -30,7 +30,7 @@ claude mcp add robloxstudio -- npx -y robloxstudio-mcp
 
 **Install NPM Package**
 ```bash
-npm i robloxstudio-mcp
+npm i rbxstudio-mcp
 ```
 
 <details>
@@ -40,9 +40,9 @@ If you encounter issues, you may need to run it through `cmd`. Update your confi
 ```json
 {
   "mcpServers": {
-    "robloxstudio-mcp": {
+    "rbxstudio-mcp": {
       "command": "cmd",
-      "args": ["/c", "npx", "-y", "robloxstudio-mcp@latest"]
+      "args": ["/c", "npx", "-y", "rbxstudio-mcp@latest"]
     }
   }
 }
@@ -83,7 +83,7 @@ graph TB
         STUDIO["Roblox Studio<br/>APIs & Data"]
     end
     
-    subgraph TOOLS ["22 AI Tools"]
+    subgraph TOOLS ["24 AI Tools"]
         FILE["File System<br/>Trees, Search"]
         CONTEXT["Studio Context<br/>Services, Objects"]
         PROPS["Properties<br/>Get, Set, Mass Ops"]
@@ -92,6 +92,7 @@ graph TB
         OUTPUT["Output Capture<br/>Logs, Errors"]
         INSTMANIP["Instance Ops<br/>Clone, Move"]
         VALIDATE["Script Validation<br/>Syntax Check"]
+        UNDO["Undo/Redo<br/>History Control"]
     end
     
     AI -->|stdio| MCP
@@ -113,6 +114,7 @@ graph TB
     MCP -.->|Exposes| OUTPUT
     MCP -.->|Exposes| INSTMANIP
     MCP -.->|Exposes| VALIDATE
+    MCP -.->|Exposes| UNDO
     
     classDef aiStyle fill:#1e40af,stroke:#3b82f6,stroke-width:2px,color:#ffffff
     classDef mcpStyle fill:#7c3aed,stroke:#8b5cf6,stroke-width:2px,color:#ffffff
@@ -126,16 +128,16 @@ graph TB
     class HTTP,QUEUE httpStyle
     class PLUGIN pluginStyle
     class STUDIO studioStyle
-    class FILE,CONTEXT,PROPS,CREATE,PROJECT,OUTPUT,INSTMANIP,VALIDATE toolStyle
+    class FILE,CONTEXT,PROPS,CREATE,PROJECT,OUTPUT,INSTMANIP,VALIDATE,UNDO toolStyle
 ```
 
 ### Key Components:
-- MCP Server (Node.js/TypeScript) - Exposes 22 tools via stdio
+- MCP Server (Node.js/TypeScript) - Exposes 24 tools via stdio
 - HTTP Bridge - Request/response queue on localhost:3002
 - Studio Plugin (Luau) - Polls server and executes API calls
 - Smart Caching - Efficient data transfer
 
-## 22 AI Tools
+## 24 AI Tools
 
 ### File System Tools
 - `get_file_tree` - Complete project hierarchy with scripts, models, folders
@@ -176,6 +178,12 @@ graph TB
 
 ### Script Validation Tool (NEW in v1.9.0)
 - `validate_script` - Validate Lua/Luau syntax without running, includes deprecation warnings
+
+### Undo/Redo Tools (NEW in v1.10.0)
+- `undo` - Undo the last MCP operation in Studio's history
+- `redo` - Redo a previously undone operation
+
+> **Note:** All mutation tools (set_property, create_object, delete_object, etc.) are now automatically wrapped in ChangeHistoryService recordings, making every AI change undoable via Ctrl+Z in Studio or the `undo` tool.
 
 > Note: Previous tools removed: `get_file_content`, `get_file_properties`, `get_selection`, `get_dependencies`, `validate_references`. Use Rojo/Argon workflows instead.
 
@@ -299,6 +307,14 @@ validate_script("game.ServerScriptService.MainScript")
 
 // Monitor game output after testing
 get_output({ limit: 50, messageTypes: ["MessageError", "MessageWarning"] })
+
+// === NEW in v1.10.0 ===
+
+// Undo the last MCP operation
+undo()
+
+// Redo a previously undone operation
+redo()
 ```
 
 ## Configuration

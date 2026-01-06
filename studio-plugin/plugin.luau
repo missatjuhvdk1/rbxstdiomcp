@@ -4119,8 +4119,8 @@ handlers.playSolo = function(requestData)
 			-- Use the new StudioTestService API for proper Play Solo mode
 			-- Run in background task so we don't block the HTTP response
 			activePlayTestTask = task.spawn(function()
-				-- ExecutePlayModeAsync requires a non-nil argument (can be empty table)
-				local testResult = studioTestService:ExecutePlayModeAsync({})
+				-- ExecutePlayModeAsync(args: Variant?) - per official docs, pass a string identifier
+				local testResult = studioTestService:ExecutePlayModeAsync("MCP_PlayTest")
 				activePlayTestTask = nil
 			end)
 

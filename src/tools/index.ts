@@ -1053,4 +1053,23 @@ export class RobloxStudioTools {
       ]
     };
   }
+
+  // ============================================
+  // EXECUTE LUA TOOL
+  // ============================================
+
+  async executeLua(code: string) {
+    if (!code) {
+      throw new Error('Code is required for execute_lua');
+    }
+    const response = await this.client.request('/api/execute-lua', { code });
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify(response, null, 2)
+        }
+      ]
+    };
+  }
 }

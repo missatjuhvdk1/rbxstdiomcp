@@ -111,7 +111,7 @@ local screenGui = plugin:CreateDockWidgetPluginGuiAsync(
 	"MCPServerInterface",
 	DockWidgetPluginGuiInfo.new(Enum.InitialDockState.Float, false, false, 400, 500, 350, 450)
 )
-screenGui.Title = "MCP Server v1.14.0"
+screenGui.Title = "MCP Server v2.0.0"
 
 local mainFrame = Instance.new("Frame")
 mainFrame.Size = UDim2.new(1, 0, 1, 0)
@@ -164,7 +164,7 @@ local versionLabel = Instance.new("TextLabel")
 versionLabel.Size = UDim2.new(1, 0, 0, 16)
 versionLabel.Position = UDim2.new(0, 0, 0, 32)
 versionLabel.BackgroundTransparency = 1
-versionLabel.Text = "AI Integration • v1.14.0"
+versionLabel.Text = "AI Integration • v2.0.0"
 versionLabel.TextColor3 = Color3.fromRGB(191, 219, 254)
 versionLabel.TextScaled = false
 versionLabel.TextSize = 12
@@ -4016,6 +4016,223 @@ handlers.redo = function(requestData)
 end
 
 -- ============================================
+-- EXECUTE LUA HANDLER (Run arbitrary Lua code)
+-- ============================================
+
+handlers.executeLua = function(requestData)
+	local code = requestData.code
+
+	if not code or type(code) ~= "string" then
+		return {
+			success = false,
+			error = "code parameter is required and must be a string"
+		}
+	end
+
+	-- Create a sandboxed environment with access to game services and Roblox types
+	local env = setmetatable({
+		-- Core globals
+		game = game,
+		workspace = workspace,
+		script = nil, -- No script context
+
+		-- Services (commonly used)
+		Players = game:GetService("Players"),
+		Workspace = workspace,
+		ReplicatedStorage = game:GetService("ReplicatedStorage"),
+		ServerStorage = game:GetService("ServerStorage"),
+		ServerScriptService = game:GetService("ServerScriptService"),
+		StarterGui = game:GetService("StarterGui"),
+		StarterPack = game:GetService("StarterPack"),
+		StarterPlayer = game:GetService("StarterPlayer"),
+		Lighting = game:GetService("Lighting"),
+		SoundService = game:GetService("SoundService"),
+		TweenService = game:GetService("TweenService"),
+		RunService = game:GetService("RunService"),
+		UserInputService = game:GetService("UserInputService"),
+		HttpService = game:GetService("HttpService"),
+		CollectionService = game:GetService("CollectionService"),
+		PhysicsService = game:GetService("PhysicsService"),
+		PathfindingService = game:GetService("PathfindingService"),
+		TextService = game:GetService("TextService"),
+		MarketplaceService = game:GetService("MarketplaceService"),
+		TeleportService = game:GetService("TeleportService"),
+		GroupService = game:GetService("GroupService"),
+		BadgeService = game:GetService("BadgeService"),
+		DataStoreService = game:GetService("DataStoreService"),
+		MemoryStoreService = game:GetService("MemoryStoreService"),
+		MessagingService = game:GetService("MessagingService"),
+		PolicyService = game:GetService("PolicyService"),
+		LocalizationService = game:GetService("LocalizationService"),
+		Selection = game:GetService("Selection"),
+		ChangeHistoryService = game:GetService("ChangeHistoryService"),
+		ScriptEditorService = game:GetService("ScriptEditorService"),
+
+		-- Roblox constructors
+		Instance = Instance,
+		Vector3 = Vector3,
+		Vector2 = Vector2,
+		CFrame = CFrame,
+		Color3 = Color3,
+		BrickColor = BrickColor,
+		UDim = UDim,
+		UDim2 = UDim2,
+		Rect = Rect,
+		Ray = Ray,
+		Region3 = Region3,
+		NumberSequence = NumberSequence,
+		NumberSequenceKeypoint = NumberSequenceKeypoint,
+		ColorSequence = ColorSequence,
+		ColorSequenceKeypoint = ColorSequenceKeypoint,
+		NumberRange = NumberRange,
+		TweenInfo = TweenInfo,
+		Font = Font,
+
+		-- Enums
+		Enum = Enum,
+
+		-- Lua globals
+		print = print,
+		warn = warn,
+		error = error,
+		assert = assert,
+		type = type,
+		typeof = typeof,
+		tostring = tostring,
+		tonumber = tonumber,
+		pairs = pairs,
+		ipairs = ipairs,
+		next = next,
+		select = select,
+		unpack = unpack,
+		pcall = pcall,
+		xpcall = xpcall,
+		rawget = rawget,
+		rawset = rawset,
+		rawequal = rawequal,
+		setmetatable = setmetatable,
+		getmetatable = getmetatable,
+		newproxy = newproxy,
+
+		-- Tables
+		table = table,
+		string = string,
+		math = math,
+		os = { time = os.time, date = os.date, difftime = os.difftime, clock = os.clock },
+		coroutine = coroutine,
+		bit32 = bit32,
+		utf8 = utf8,
+		buffer = buffer,
+
+		-- Task library
+		task = task,
+		wait = task.wait,
+		delay = task.delay,
+		spawn = task.spawn,
+		defer = task.defer,
+
+		-- Instance helper from plugin
+		getInstanceByPath = getInstanceByPath,
+
+		-- Allow loadstring for dynamic code (we're already in a plugin context)
+		loadstring = loadstring,
+	}, { __index = _G })
+
+	local success, compileResult = pcall(function()
+		return loadstring(code)
+	end)
+
+	if not success then
+		return {
+			success = false,
+			error = "Failed to compile code: " .. tostring(compileResult)
+		}
+	end
+
+	local fn = compileResult
+	if not fn then
+		return {
+			success = false,
+			error = "Failed to compile code (loadstring returned nil)"
+		}
+	end
+
+	-- Set the environment
+	setfenv(fn, env)
+
+	-- Execute the code
+	local execSuccess, execResult = pcall(fn)
+
+	if not execSuccess then
+		return {
+			success = false,
+			error = "Runtime error: " .. tostring(execResult)
+		}
+	end
+
+	-- Serialize the result
+	local function serializeResult(value, depth)
+		depth = depth or 0
+		if depth > 5 then return "<max depth>" end
+
+		local t = typeof(value)
+
+		if value == nil then
+			return nil
+		elseif t == "string" then
+			return value
+		elseif t == "number" or t == "boolean" then
+			return value
+		elseif t == "Vector3" then
+			return { type = "Vector3", X = value.X, Y = value.Y, Z = value.Z }
+		elseif t == "Vector2" then
+			return { type = "Vector2", X = value.X, Y = value.Y }
+		elseif t == "CFrame" then
+			local components = { value:GetComponents() }
+			return { type = "CFrame", components = components }
+		elseif t == "Color3" then
+			return { type = "Color3", R = value.R, G = value.G, B = value.B }
+		elseif t == "BrickColor" then
+			return { type = "BrickColor", Name = value.Name }
+		elseif t == "UDim2" then
+			return { type = "UDim2", X = { Scale = value.X.Scale, Offset = value.X.Offset }, Y = { Scale = value.Y.Scale, Offset = value.Y.Offset } }
+		elseif t == "UDim" then
+			return { type = "UDim", Scale = value.Scale, Offset = value.Offset }
+		elseif t == "Instance" then
+			return { type = "Instance", ClassName = value.ClassName, Name = value.Name, Path = value:GetFullName() }
+		elseif t == "EnumItem" then
+			return { type = "EnumItem", Name = tostring(value) }
+		elseif t == "table" then
+			local result = {}
+			local count = 0
+			for k, v in pairs(value) do
+				count = count + 1
+				if count > 100 then
+					result["__truncated__"] = true
+					break
+				end
+				local keyStr = type(k) == "string" and k or tostring(k)
+				result[keyStr] = serializeResult(v, depth + 1)
+			end
+			return result
+		elseif t == "function" then
+			return "<function>"
+		elseif t == "thread" then
+			return "<thread>"
+		else
+			return "<" .. t .. ">"
+		end
+	end
+
+	return {
+		success = true,
+		result = serializeResult(execResult),
+		resultType = typeof(execResult),
+		message = "Code executed successfully"
+	}
+end
+
+-- ============================================
 -- INSERT ASSET HANDLER (Creator Store)
 -- ============================================
 
@@ -4431,6 +4648,8 @@ endpointHandlers = {
 	["/api/insert-asset"] = handlers.insertAsset,
 	["/api/undo"] = handlers.undo,
 	["/api/redo"] = handlers.redo,
+	-- Execute Lua
+	["/api/execute-lua"] = handlers.executeLua,
 	-- Playtest control
 	["/api/play-solo"] = handlers.playSolo,
 	["/api/stop-play"] = handlers.stopPlay,

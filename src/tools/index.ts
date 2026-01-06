@@ -1,5 +1,87 @@
 import { StudioHttpClient } from './studio-client.js';
 import { BridgeService } from '../bridge-service.js';
+import * as zlib from 'zlib';
+
+// PNG encoding utilities
+function createPNG(rgbaData: Buffer, width: number, height: number): Buffer {
+  // PNG signature
+  const signature = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
+
+  // IHDR chunk
+  const ihdr = createIHDRChunk(width, height);
+
+  // IDAT chunk (compressed image data)
+  const idat = createIDATChunk(rgbaData, width, height);
+
+  // IEND chunk
+  const iend = createIENDChunk();
+
+  return Buffer.concat([signature, ihdr, idat, iend]);
+}
+
+function createChunk(type: string, data: Buffer): Buffer {
+  const length = Buffer.alloc(4);
+  length.writeUInt32BE(data.length, 0);
+
+  const typeBuffer = Buffer.from(type, 'ascii');
+  const crcData = Buffer.concat([typeBuffer, data]);
+
+  const crc = Buffer.alloc(4);
+  crc.writeUInt32BE(crc32(crcData), 0);
+
+  return Buffer.concat([length, typeBuffer, data, crc]);
+}
+
+function createIHDRChunk(width: number, height: number): Buffer {
+  const data = Buffer.alloc(13);
+  data.writeUInt32BE(width, 0);      // Width
+  data.writeUInt32BE(height, 4);     // Height
+  data.writeUInt8(8, 8);             // Bit depth
+  data.writeUInt8(6, 9);             // Color type (RGBA)
+  data.writeUInt8(0, 10);            // Compression method
+  data.writeUInt8(0, 11);            // Filter method
+  data.writeUInt8(0, 12);            // Interlace method
+
+  return createChunk('IHDR', data);
+}
+
+function createIDATChunk(rgbaData: Buffer, width: number, height: number): Buffer {
+  // Add filter byte (0 = None) at the start of each row
+  const rowSize = width * 4;
+  const filteredData = Buffer.alloc(height * (rowSize + 1));
+
+  for (let y = 0; y < height; y++) {
+    filteredData[y * (rowSize + 1)] = 0; // Filter type: None
+    rgbaData.copy(filteredData, y * (rowSize + 1) + 1, y * rowSize, (y + 1) * rowSize);
+  }
+
+  // Compress with zlib
+  const compressed = zlib.deflateSync(filteredData, { level: 6 });
+
+  return createChunk('IDAT', compressed);
+}
+
+function createIENDChunk(): Buffer {
+  return createChunk('IEND', Buffer.alloc(0));
+}
+
+// CRC32 lookup table
+const crcTable: number[] = [];
+for (let n = 0; n < 256; n++) {
+  let c = n;
+  for (let k = 0; k < 8; k++) {
+    c = (c & 1) ? (0xedb88320 ^ (c >>> 1)) : (c >>> 1);
+  }
+  crcTable[n] = c >>> 0;
+}
+
+function crc32(data: Buffer): number {
+  let crc = 0xffffffff;
+  for (let i = 0; i < data.length; i++) {
+    crc = crcTable[(crc ^ data[i]) & 0xff] ^ (crc >>> 8);
+  }
+  return (crc ^ 0xffffffff) >>> 0;
+}
 
 export class RobloxStudioTools {
   private client: StudioHttpClient;
@@ -855,6 +937,113 @@ export class RobloxStudioTools {
       folderName,
       targetParent
     });
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify(response, null, 2)
+        }
+      ]
+    };
+  }
+
+  // ============================================
+  // PLAYTEST CONTROL TOOLS
+  // ============================================
+
+  async playSolo() {
+    const response = await this.client.request('/api/play-solo', {});
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify(response, null, 2)
+        }
+      ]
+    };
+  }
+
+  async stopPlay() {
+    const response = await this.client.request('/api/stop-play', {});
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify(response, null, 2)
+        }
+      ]
+    };
+  }
+
+  // ============================================
+  // SCREENSHOT TOOL
+  // ============================================
+
+  async captureScreenshot(maxWidth?: number, maxHeight?: number) {
+    const response = await this.client.request('/api/capture-screenshot', {
+      maxWidth: maxWidth || 512,
+      maxHeight: maxHeight || 512,
+      returnBase64: true
+    });
+
+    // If we have base64 RGBA data, convert it to PNG for proper image viewing
+    const responseData = response as any;
+    if (responseData.success && responseData.base64) {
+      try {
+        // Decode base64 RGBA data from Lua
+        const rgbaBuffer = Buffer.from(responseData.base64, 'base64');
+        const width = responseData.width;
+        const height = responseData.height;
+
+        // Validate buffer size matches dimensions
+        const expectedSize = width * height * 4;
+        if (rgbaBuffer.length !== expectedSize) {
+          throw new Error(`Buffer size mismatch: got ${rgbaBuffer.length}, expected ${expectedSize} for ${width}x${height}`);
+        }
+
+        // Convert RGBA to PNG
+        const pngBuffer = createPNG(rgbaBuffer, width, height);
+        const pngBase64 = pngBuffer.toString('base64');
+
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({
+                success: true,
+                message: responseData.message,
+                originalWidth: responseData.originalWidth,
+                originalHeight: responseData.originalHeight,
+                width: width,
+                height: height,
+                format: 'PNG',
+                note: "Screenshot captured and converted to PNG format."
+              }, null, 2)
+            },
+            {
+              type: 'image',
+              data: pngBase64,
+              mimeType: 'image/png'
+            }
+          ]
+        };
+      } catch (err) {
+        // If PNG conversion fails, return error info
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({
+                success: false,
+                error: `PNG conversion failed: ${err instanceof Error ? err.message : String(err)}`,
+                originalResponse: responseData
+              }, null, 2)
+            }
+          ]
+        };
+      }
+    }
+
     return {
       content: [
         {

@@ -37,7 +37,7 @@ class RobloxStudioMCPServer {
     this.server = new Server(
       {
         name: 'rbxstudio-mcp',
-        version: '1.12.2',
+        version: '1.14.0',
       },
       {
         capabilities: {
@@ -1112,6 +1112,47 @@ class RobloxStudioMCPServer {
               },
               required: ['assetId']
             }
+          },
+          // ============================================
+          // PLAYTEST CONTROL TOOLS
+          // ============================================
+          {
+            name: 'play_solo',
+            description: 'Start a play test (Play Solo) in Roblox Studio. If already running, automatically stops and restarts. Use get_output after testing to read script output/errors. Use stop_play when done.',
+            inputSchema: {
+              type: 'object',
+              properties: {}
+            }
+          },
+          {
+            name: 'stop_play',
+            description: 'Stop the current play test in Roblox Studio. Note: RunService:Stop() does NOT restore the game to its pre-play state - objects created/modified during play remain changed.',
+            inputSchema: {
+              type: 'object',
+              properties: {}
+            }
+          },
+          // ============================================
+          // SCREENSHOT TOOL
+          // ============================================
+          {
+            name: 'capture_screenshot',
+            description: 'Capture a screenshot of the current Roblox Studio viewport. Returns the image as base64-encoded RGBA pixel data. Use this to "see" what you\'ve built - GUIs, 3D objects, scene layout, etc. The screenshot captures exactly what\'s visible in the Studio viewport.',
+            inputSchema: {
+              type: 'object',
+              properties: {
+                maxWidth: {
+                  type: 'number',
+                  description: 'Maximum width of the returned image (default: 512). Smaller = faster + less data.',
+                  default: 512
+                },
+                maxHeight: {
+                  type: 'number',
+                  description: 'Maximum height of the returned image (default: 512). Smaller = faster + less data.',
+                  default: 512
+                }
+              }
+            }
           }
         ]
       };
@@ -1294,6 +1335,19 @@ class RobloxStudioMCPServer {
               (args as any)?.assetId as number,
               (args as any)?.folderName,
               (args as any)?.targetParent
+            );
+
+          // Playtest Control Tools
+          case 'play_solo':
+            return await this.tools.playSolo();
+          case 'stop_play':
+            return await this.tools.stopPlay();
+
+          // Screenshot Tool
+          case 'capture_screenshot':
+            return await this.tools.captureScreenshot(
+              (args as any)?.maxWidth,
+              (args as any)?.maxHeight
             );
 
           default:

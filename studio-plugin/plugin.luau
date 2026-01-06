@@ -111,7 +111,7 @@ local screenGui = plugin:CreateDockWidgetPluginGuiAsync(
 	"MCPServerInterface",
 	DockWidgetPluginGuiInfo.new(Enum.InitialDockState.Float, false, false, 400, 500, 350, 450)
 )
-screenGui.Title = "MCP Server v1.12.2"
+screenGui.Title = "MCP Server v1.14.0"
 
 local mainFrame = Instance.new("Frame")
 mainFrame.Size = UDim2.new(1, 0, 1, 0)
@@ -164,7 +164,7 @@ local versionLabel = Instance.new("TextLabel")
 versionLabel.Size = UDim2.new(1, 0, 0, 16)
 versionLabel.Position = UDim2.new(0, 0, 0, 32)
 versionLabel.BackgroundTransparency = 1
-versionLabel.Text = "AI Integration • v1.12.2"
+versionLabel.Text = "AI Integration • v1.14.0"
 versionLabel.TextColor3 = Color3.fromRGB(191, 219, 254)
 versionLabel.TextScaled = false
 versionLabel.TextSize = 12
@@ -4093,6 +4093,260 @@ handlers.insertAsset = function(requestData)
 	end
 end
 
+-- ============================================
+-- PLAYTEST CONTROL HANDLERS
+-- ============================================
+
+handlers.playSolo = function(requestData)
+	local success, result = pcall(function()
+		local wasRunning = RunService:IsRunning()
+
+		-- If already running, stop first (user requested smart restart behavior)
+		if wasRunning then
+			RunService:Stop()
+			-- Small delay to let stop complete
+			task.wait(0.1)
+		end
+
+		-- Start the play test
+		RunService:Run()
+
+		return {
+			success = true,
+			wasRunning = wasRunning,
+			message = wasRunning and "Restarted play test (was already running)" or "Started play test",
+			note = "Use get_output to read script output. Use stop_play when done."
+		}
+	end)
+
+	if success then
+		return result
+	else
+		return {
+			success = false,
+			error = "Failed to start play test: " .. tostring(result)
+		}
+	end
+end
+
+handlers.stopPlay = function(requestData)
+	local success, result = pcall(function()
+		local wasRunning = RunService:IsRunning()
+
+		if not wasRunning then
+			return {
+				success = true,
+				wasRunning = false,
+				message = "Play test was not running"
+			}
+		end
+
+		RunService:Stop()
+
+		return {
+			success = true,
+			wasRunning = true,
+			message = "Stopped play test",
+			warning = "Note: RunService:Stop() does NOT restore pre-play state. Objects created/modified during play remain changed."
+		}
+	end)
+
+	if success then
+		return result
+	else
+		return {
+			success = false,
+			error = "Failed to stop play test: " .. tostring(result)
+		}
+	end
+end
+
+-- ============================================
+-- SCREENSHOT HANDLER
+-- ============================================
+
+-- Base64 encoding table
+local b64chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+
+local function base64encode(data)
+	local result = {}
+	local padding = ""
+
+	-- Process in chunks of 3 bytes
+	for i = 1, #data, 3 do
+		local b1 = string.byte(data, i) or 0
+		local b2 = string.byte(data, i + 1) or 0
+		local b3 = string.byte(data, i + 2) or 0
+
+		-- Combine into 24-bit number
+		local n = b1 * 65536 + b2 * 256 + b3
+
+		-- Extract 4 6-bit values
+		local c1 = math.floor(n / 262144) % 64
+		local c2 = math.floor(n / 4096) % 64
+		local c3 = math.floor(n / 64) % 64
+		local c4 = n % 64
+
+		table.insert(result, string.sub(b64chars, c1 + 1, c1 + 1))
+		table.insert(result, string.sub(b64chars, c2 + 1, c2 + 1))
+
+		if i + 1 <= #data then
+			table.insert(result, string.sub(b64chars, c3 + 1, c3 + 1))
+		else
+			table.insert(result, "=")
+		end
+
+		if i + 2 <= #data then
+			table.insert(result, string.sub(b64chars, c4 + 1, c4 + 1))
+		else
+			table.insert(result, "=")
+		end
+	end
+
+	return table.concat(result)
+end
+
+handlers.captureScreenshot = function(requestData)
+	local CaptureService = game:GetService("CaptureService")
+	local AssetService = game:GetService("AssetService")
+
+	-- Parameters
+	local maxWidth = requestData.maxWidth or 512
+	local maxHeight = requestData.maxHeight or 512
+	local returnBase64 = requestData.returnBase64 ~= false -- Default true
+
+	-- Use a BindableEvent to wait for the async callback
+	local captureComplete = Instance.new("BindableEvent")
+	local captureResult = nil
+	local captureError = nil
+
+	local success, err = pcall(function()
+		CaptureService:CaptureScreenshot(function(contentId)
+			if contentId then
+				captureResult = contentId
+			else
+				captureError = "CaptureScreenshot returned nil"
+			end
+			captureComplete:Fire()
+		end)
+	end)
+
+	if not success then
+		captureComplete:Destroy()
+		return {
+			success = false,
+			error = "Failed to call CaptureScreenshot: " .. tostring(err)
+		}
+	end
+
+	-- Wait for callback (with timeout)
+	local timeoutThread = task.delay(5, function()
+		if not captureResult and not captureError then
+			captureError = "Capture timed out after 5 seconds"
+			captureComplete:Fire()
+		end
+	end)
+
+	captureComplete.Event:Wait()
+	task.cancel(timeoutThread)
+	captureComplete:Destroy()
+
+	if captureError then
+		return {
+			success = false,
+			error = captureError
+		}
+	end
+
+	-- Now load into EditableImage
+	local editSuccess, editableImage = pcall(function()
+		return AssetService:CreateEditableImageAsync(Content.fromUri(tostring(captureResult)))
+	end)
+
+	if not editSuccess or not editableImage then
+		return {
+			success = false,
+			error = "Failed to load capture into EditableImage: " .. tostring(editableImage),
+			contentId = tostring(captureResult)
+		}
+	end
+
+	local originalSize = editableImage.Size
+	local resultData = {
+		success = true,
+		originalWidth = originalSize.X,
+		originalHeight = originalSize.Y,
+		contentId = tostring(captureResult),
+		message = "Screenshot captured successfully"
+	}
+
+	-- Resize if needed and return base64
+	if returnBase64 then
+		-- Calculate resize dimensions maintaining aspect ratio
+		local scaleX = maxWidth / originalSize.X
+		local scaleY = maxHeight / originalSize.Y
+		local scale = math.min(scaleX, scaleY, 1) -- Don't upscale
+
+		local newWidth = math.floor(originalSize.X * scale)
+		local newHeight = math.floor(originalSize.Y * scale)
+
+		-- Create resized image
+		local resizedImage
+		if scale < 1 then
+			resizedImage = AssetService:CreateEditableImage({Size = Vector2.new(newWidth, newHeight)})
+			-- Draw the original scaled down
+			resizedImage:DrawImageTransformed(
+				Vector2.new(0, 0), -- position
+				Vector2.new(scale, scale), -- scale
+				0, -- rotation
+				editableImage,
+				{
+					CombineType = Enum.ImageCombineType.Overwrite
+				}
+			)
+		else
+			resizedImage = editableImage
+			newWidth = originalSize.X
+			newHeight = originalSize.Y
+		end
+
+		-- Read pixels
+		local pixelSuccess, pixelBuffer = pcall(function()
+			return resizedImage:ReadPixelsBuffer(Vector2.new(0, 0), Vector2.new(newWidth, newHeight))
+		end)
+
+		if pixelSuccess and pixelBuffer then
+			-- Convert buffer to string for base64 encoding
+			local pixelString = buffer.tostring(pixelBuffer)
+
+			-- Base64 encode (for smaller images only due to size)
+			if #pixelString <= 1024 * 1024 then -- Max 1MB raw
+				local base64Data = base64encode(pixelString)
+				resultData.base64 = base64Data
+				resultData.width = newWidth
+				resultData.height = newHeight
+				resultData.format = "RGBA"
+				resultData.encoding = "base64"
+				resultData.pixelDataSize = #pixelString
+			else
+				resultData.warning = "Image too large for base64 encoding (" .. #pixelString .. " bytes). Use smaller maxWidth/maxHeight."
+				resultData.width = newWidth
+				resultData.height = newHeight
+			end
+		else
+			resultData.warning = "Failed to read pixels: " .. tostring(pixelBuffer)
+		end
+
+		if resizedImage ~= editableImage then
+			resizedImage:Destroy()
+		end
+	end
+
+	editableImage:Destroy()
+
+	return resultData
+end
+
 -- Now that all handlers are defined, populate the endpoint mapping table
 endpointHandlers = {
 	["/api/file-tree"] = handlers.getFileTree,
@@ -4142,6 +4396,11 @@ endpointHandlers = {
 	["/api/insert-asset"] = handlers.insertAsset,
 	["/api/undo"] = handlers.undo,
 	["/api/redo"] = handlers.redo,
+	-- Playtest control
+	["/api/play-solo"] = handlers.playSolo,
+	["/api/stop-play"] = handlers.stopPlay,
+	-- Screenshot
+	["/api/capture-screenshot"] = handlers.captureScreenshot,
 }
 
 local function updateUIState()

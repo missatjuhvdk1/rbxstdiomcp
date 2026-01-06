@@ -4097,26 +4097,51 @@ end
 -- PLAYTEST CONTROL HANDLERS
 -- ============================================
 
+-- Track active play test task
+local activePlayTestTask = nil
+
 handlers.playSolo = function(requestData)
 	local success, result = pcall(function()
 		local wasRunning = RunService:IsRunning()
 
-		-- If already running, stop first (user requested smart restart behavior)
+		-- If already running, stop first
 		if wasRunning then
 			RunService:Stop()
-			-- Small delay to let stop complete
-			task.wait(0.1)
+			task.wait(0.2)
 		end
 
-		-- Start the play test
-		RunService:Run()
+		-- Try the new StudioTestService first (available since Dec 2025)
+		local studioTestSuccess, studioTestService = pcall(function()
+			return game:GetService("StudioTestService")
+		end)
 
-		return {
-			success = true,
-			wasRunning = wasRunning,
-			message = wasRunning and "Restarted play test (was already running)" or "Started play test",
-			note = "Use get_output to read script output. Use stop_play when done."
-		}
+		if studioTestSuccess and studioTestService then
+			-- Use the new StudioTestService API for proper Play Solo mode
+			-- Run in background task so we don't block the HTTP response
+			activePlayTestTask = task.spawn(function()
+				local testResult = studioTestService:ExecutePlayModeAsync(nil)
+				activePlayTestTask = nil
+			end)
+
+			return {
+				success = true,
+				wasRunning = wasRunning,
+				method = "StudioTestService:ExecutePlayModeAsync",
+				message = wasRunning and "Restarted Play Solo (was already running)" or "Started Play Solo mode",
+				note = "Use get_output to read script output. Use stop_play when done."
+			}
+		else
+			-- Fallback to RunService for older Studio versions
+			RunService:Run()
+
+			return {
+				success = true,
+				wasRunning = wasRunning,
+				method = "RunService:Run (fallback)",
+				message = wasRunning and "Restarted play test (was already running)" or "Started Run mode (fallback - StudioTestService not available)",
+				note = "Use get_output to read script output. Use stop_play when done."
+			}
+		end
 	end)
 
 	if success then
@@ -4141,7 +4166,16 @@ handlers.stopPlay = function(requestData)
 			}
 		end
 
+		-- Try StudioTestService:EndTest first if available
+		local endedViaStudioTest = false
+		pcall(function()
+			local studioTestService = game:GetService("StudioTestService")
+			-- EndTest must be called from test context, but Stop() should work
+		end)
+
+		-- Use RunService:Stop() - this works for both Run and Play modes
 		RunService:Stop()
+		activePlayTestTask = nil
 
 		return {
 			success = true,

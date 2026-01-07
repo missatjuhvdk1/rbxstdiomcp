@@ -4384,20 +4384,35 @@ handlers.stopPlay = function(requestData)
 			}
 		end
 
-		-- Try StudioTestService:EndTest first if available
-		local endedViaStudioTest = false
-		pcall(function()
-			local studioTestService = game:GetService("StudioTestService")
-			-- EndTest must be called from test context, but Stop() should work
+		-- Try StudioTestService:EndTest first if available (matches ExecutePlayModeAsync)
+		local studioTestSuccess, studioTestService = pcall(function()
+			return game:GetService("StudioTestService")
 		end)
 
-		-- Use RunService:Stop() - this works for both Run and Play modes
+		if studioTestSuccess and studioTestService then
+			local endSuccess = pcall(function()
+				studioTestService:EndTest()
+			end)
+
+			if endSuccess then
+				activePlayTestTask = nil
+				return {
+					success = true,
+					wasRunning = true,
+					method = "StudioTestService:EndTest",
+					message = "Stopped play test (state restored)"
+				}
+			end
+		end
+
+		-- Fallback to RunService:Stop() if StudioTestService failed
 		RunService:Stop()
 		activePlayTestTask = nil
 
 		return {
 			success = true,
 			wasRunning = true,
+			method = "RunService:Stop",
 			message = "Stopped play test",
 			warning = "Note: RunService:Stop() does NOT restore pre-play state. Objects created/modified during play remain changed."
 		}
@@ -4462,9 +4477,9 @@ handlers.captureScreenshot = function(requestData)
 	local CaptureService = game:GetService("CaptureService")
 	local AssetService = game:GetService("AssetService")
 
-	-- Parameters
-	local maxWidth = requestData.maxWidth or 512
-	local maxHeight = requestData.maxHeight or 512
+	-- Parameters (default 768 to avoid CaptureService bug with <600px)
+	local maxWidth = requestData.maxWidth or 768
+	local maxHeight = requestData.maxHeight or 768
 	local returnBase64 = requestData.returnBase64 ~= false -- Default true
 
 	-- Use a BindableEvent to wait for the async callback
@@ -4724,10 +4739,10 @@ handlers.renderObjectView = function(requestData)
 			}
 		end
 
-		-- Parse resolution
-		local resolution = requestData.resolution or {width = 512, height = 512}
-		local width = resolution.width or 512
-		local height = resolution.height or 512
+		-- Parse resolution (default 768 to avoid CaptureService bug with <600px)
+		local resolution = requestData.resolution or {width = 768, height = 768}
+		local width = resolution.width or 768
+		local height = resolution.height or 768
 
 		-- Clamp resolution for performance
 		width = math.clamp(width, 64, 2048)
@@ -4831,11 +4846,19 @@ handlers.renderObjectView = function(requestData)
 		tempGui.Name = "MCPTempCapture"
 		tempGui.ResetOnSpawn = false
 		tempGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+
+		-- CRITICAL FIX: Scale ViewportFrame to fill most of the screen before capture
+		-- CaptureScreenshot captures the ENTIRE screen, so a small ViewportFrame = tiny object
+		-- By scaling to ~90% of screen, the object fills most of the captured image
+		local screenSize = workspace.CurrentCamera.ViewportSize
+		viewportFrame.Size = UDim2.fromOffset(screenSize.X * 0.9, screenSize.Y * 0.9)
+		viewportFrame.Position = UDim2.fromOffset(screenSize.X * 0.05, screenSize.Y * 0.05)
 		viewportFrame.Parent = tempGui
 		tempGui.Parent = game.CoreGui
 
 		-- Wait a frame for rendering
 		RunService.Heartbeat:Wait()
+		task.wait(0.05) -- Extra wait to ensure viewport renders at new size
 
 		-- Capture screenshot of the viewport
 		local captureComplete = Instance.new("BindableEvent")

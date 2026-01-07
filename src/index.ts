@@ -772,13 +772,13 @@ class RobloxStudioMCPServer {
               properties: {
                 maxWidth: {
                   type: 'number',
-                  description: 'Maximum width of the returned image (default: 512). Smaller = faster + less data.',
-                  default: 512
+                  description: 'Maximum width of the returned image (default: 768). Smaller = faster + less data.',
+                  default: 768
                 },
                 maxHeight: {
                   type: 'number',
-                  description: 'Maximum height of the returned image (default: 512). Smaller = faster + less data.',
-                  default: 512
+                  description: 'Maximum height of the returned image (default: 768). Smaller = faster + less data.',
+                  default: 768
                 }
               }
             }
@@ -832,8 +832,8 @@ Lighting presets: bright (3-point lighting), studio (flat/even), dark (dramatic)
                 resolution: {
                   type: 'object',
                   properties: {
-                    width: { type: 'number', description: 'Image width (64-2048, default: 512)' },
-                    height: { type: 'number', description: 'Image height (64-2048, default: 512)' },
+                    width: { type: 'number', description: 'Image width (64-2048, default: 768)' },
+                    height: { type: 'number', description: 'Image height (64-2048, default: 768)' },
                   },
                   description: 'Render resolution',
                 },

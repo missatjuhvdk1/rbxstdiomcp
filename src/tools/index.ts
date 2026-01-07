@@ -981,8 +981,8 @@ export class RobloxStudioTools {
 
   async captureScreenshot(maxWidth?: number, maxHeight?: number) {
     const response = await this.client.request('/api/capture-screenshot', {
-      maxWidth: maxWidth || 512,
-      maxHeight: maxHeight || 512,
+      maxWidth: maxWidth || 768,
+      maxHeight: maxHeight || 768,
       returnBase64: true
     });
 
@@ -1079,7 +1079,7 @@ export class RobloxStudioTools {
     const response = await this.client.request('/api/render-object-view', {
       instancePath,
       angle: options?.angle || 'iso',
-      resolution: options?.resolution || { width: 512, height: 512 },
+      resolution: options?.resolution || { width: 768, height: 768 },
       lighting: options?.lighting || 'bright',
       background: options?.background || 'transparent',
       autoDistance: options?.autoDistance !== false,

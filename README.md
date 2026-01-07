@@ -1,6 +1,6 @@
 # Roblox Studio MCP Server
 
-MCP server for AI-powered Roblox Studio integration. 28 specialized tools for exploring projects, analyzing scripts, and performing bulk operations. **Now with Claude Code-style script editing!**
+MCP server for AI-powered Roblox Studio integration. 29 specialized tools for exploring projects, analyzing scripts, and performing bulk operations. **Now with Claude Code-style script editing and visual feedback!**
 
 https://devforum.roblox.com/t/v180-roblox-studio-mcp-speed-up-your-workflow-by-letting-ai-read-paths-and-properties/3707071
 
@@ -137,7 +137,7 @@ graph TB
 - Studio Plugin (Luau) - Polls server and executes API calls
 - Smart Caching - Efficient data transfer
 
-## 24 AI Tools
+## 29 AI Tools
 
 ### File System Tools
 - `get_file_tree` - Complete project hierarchy with scripts, models, folders
@@ -210,6 +210,26 @@ edit_script({
 | Line numbers shift after edits | Matches the actual content |
 | Can break `end` statements | Validates syntax before applying |
 | Requires counting lines | Just copy the text to replace |
+
+### Visual Feedback Tools (NEW in v2.2.0) 👁️
+AI can now "see" what it creates! Camera control + screenshot = complete visual feedback loop.
+
+- `focus_camera` - Position Studio camera to focus on any object (like pressing F), with smart auto-distance calculation
+- `capture_screenshot` - Capture Studio viewport as PNG image
+
+```typescript
+// Perfect visual feedback workflow:
+create_object("Part", "game.Workspace", "MyPart")
+focus_camera({instancePath: "game.Workspace.MyPart", angle: "iso"})
+capture_screenshot() // → AI sees what it created! 👀
+```
+
+**Auto-sizing for any object:**
+- Tiny objects (0.1 studs) → Camera backs up to minimum 5 studs
+- Normal objects (10 studs) → Perfect framing at ~10 studs
+- Huge objects (1000 studs) → Auto-calculates distance to fit everything
+
+**Supported angles:** `front`, `back`, `left`, `right`, `top`, `bottom`, `iso` (isometric), `iso_front`, `iso_back`, `low_angle`, `high_angle`, or custom `{pitch, yaw, roll}` angles.
 
 > **Note:** All mutation tools (set_property, create_object, delete_object, etc.) are now automatically wrapped in ChangeHistoryService recordings, making every AI change undoable via Ctrl+Z in Studio or the `undo` tool.
 

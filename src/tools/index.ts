@@ -1157,6 +1157,43 @@ export class RobloxStudioTools {
   }
 
   // ============================================
+  // CAMERA CONTROL SYSTEM
+  // ============================================
+
+  /**
+   * focus_camera - Position Studio camera to focus on an object (like pressing F)
+   * Works with any object size and supports all angle presets
+   */
+  async focusCamera(
+    instancePath: string,
+    options?: {
+      angle?: string | { pitch?: number; yaw?: number; roll?: number };
+      distance?: number;
+      autoDistance?: boolean;
+    }
+  ) {
+    if (!instancePath) {
+      throw new Error('Instance path is required for focus_camera');
+    }
+
+    const response = await this.client.request('/api/focus-camera', {
+      instancePath,
+      angle: options?.angle || 'iso',
+      distance: options?.distance,
+      autoDistance: options?.autoDistance !== false,
+    });
+
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify(response, null, 2),
+        },
+      ],
+    };
+  }
+
+  // ============================================
   // EXECUTE LUA TOOL
   // ============================================
 

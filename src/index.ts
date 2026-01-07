@@ -856,6 +856,64 @@ Lighting presets: bright (3-point lighting), studio (flat/even), dark (dramatic)
             },
           },
           // ============================================
+          // CAMERA CONTROL (Focus Studio camera)
+          // ============================================
+          {
+            name: 'focus_camera',
+            description: `Position the Studio camera to focus on an object (like pressing F in Studio).
+Automatically calculates distance to fit the object in view, works with any object size.
+
+Perfect combo with capture_screenshot:
+1. focus_camera({instancePath: "...", angle: "front"})
+2. capture_screenshot()
+
+Supported angles:
+- Standard views: front, back, left, right, top, bottom
+- Isometric: iso (default), iso_front, iso_back
+- Dramatic: low_angle, high_angle
+- Custom: {pitch: 30, yaw: 45, roll: 0}
+
+Auto-sizing:
+- Tiny objects (0.1 studs): Camera backs up to minimum 5 studs
+- Normal objects (10 studs): Camera positioned perfectly
+- Huge objects (1000 studs): Camera backs up far enough to see everything`,
+            inputSchema: {
+              type: 'object',
+              properties: {
+                instancePath: {
+                  type: 'string',
+                  description: 'Path to the object to focus on (e.g., "game.Workspace.Model1")',
+                },
+                angle: {
+                  description: 'Camera angle - preset string or custom {pitch, yaw, roll}',
+                  oneOf: [
+                    {
+                      type: 'string',
+                      enum: ['front', 'back', 'left', 'right', 'top', 'bottom', 'iso', 'iso_front', 'iso_back', 'low_angle', 'high_angle'],
+                    },
+                    {
+                      type: 'object',
+                      properties: {
+                        pitch: { type: 'number', description: 'Pitch angle in degrees' },
+                        yaw: { type: 'number', description: 'Yaw angle in degrees' },
+                        roll: { type: 'number', description: 'Roll angle in degrees' },
+                      },
+                    },
+                  ],
+                },
+                distance: {
+                  type: 'number',
+                  description: 'Manual camera distance (overrides auto-distance)',
+                },
+                autoDistance: {
+                  type: 'boolean',
+                  description: 'Automatically calculate distance to fit object (default: true)',
+                },
+              },
+              required: ['instancePath'],
+            },
+          },
+          // ============================================
           // EXECUTE LUA TOOL (Run arbitrary Lua code)
           // ============================================
           {
@@ -1045,6 +1103,17 @@ Lighting presets: bright (3-point lighting), studio (flat/even), dark (dramatic)
                 resolution: (args as any)?.resolution,
                 lighting: (args as any)?.lighting,
                 background: (args as any)?.background,
+                autoDistance: (args as any)?.autoDistance,
+              }
+            );
+
+          // Camera Control
+          case 'focus_camera':
+            return await this.tools.focusCamera(
+              (args as any)?.instancePath as string,
+              {
+                angle: (args as any)?.angle,
+                distance: (args as any)?.distance,
                 autoDistance: (args as any)?.autoDistance,
               }
             );

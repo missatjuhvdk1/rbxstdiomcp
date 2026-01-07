@@ -4938,6 +4938,105 @@ handlers.renderObjectView = function(requestData)
 	end
 end
 
+-- ============================================
+-- CAMERA CONTROL SYSTEM
+-- ============================================
+
+-- Focus Studio camera on an object (like pressing F in Studio)
+handlers.focusCamera = function(requestData)
+	local success, result = pcall(function()
+		local instancePath = requestData.instancePath
+		if not instancePath then
+			return {
+				success = false,
+				error = "instancePath is required"
+			}
+		end
+
+		local anglePreset = requestData.angle or "iso"
+		local autoDistance = requestData.autoDistance ~= false
+		local customDistance = requestData.distance
+
+		-- Get target instance
+		local targetInstance = getInstanceByPath(instancePath)
+		if not targetInstance then
+			return {
+				success = false,
+				error = "Instance not found: " .. instancePath
+			}
+		end
+
+		-- Calculate bounding box and center (reuse from ViewportFrame code)
+		local boundingSize, boundingCenter = getModelBoundingBox(targetInstance)
+		local maxDimension = math.max(boundingSize.X, boundingSize.Y, boundingSize.Z)
+
+		-- Get camera offset from presets
+		local cameraOffset
+		if type(anglePreset) == "string" and CameraPresets[anglePreset] then
+			cameraOffset = CameraPresets[anglePreset]
+		elseif type(anglePreset) == "table" then
+			-- Custom angle {pitch, yaw, roll, distance}
+			local pitch = math.rad(anglePreset.pitch or 0)
+			local yaw = math.rad(anglePreset.yaw or 0)
+			local roll = math.rad(anglePreset.roll or 0)
+			cameraOffset = CFrame.new(0, 0, 10) * CFrame.Angles(pitch, yaw, roll)
+		else
+			cameraOffset = CameraPresets.iso
+		end
+
+		-- Calculate distance to fit object in view (like F shortcut)
+		local cameraDistance
+		if customDistance then
+			cameraDistance = customDistance
+		elseif autoDistance then
+			-- FOV of 70 degrees, fit object with some padding
+			local fov = 70
+			cameraDistance = maxDimension / (2 * math.tan(math.rad(fov / 2))) * 1.5
+			cameraDistance = math.max(cameraDistance, 5) -- Minimum 5 studs
+		else
+			cameraDistance = 20 -- Default distance
+		end
+
+		-- Apply distance to camera offset direction
+		local offsetDirection = cameraOffset.Position.Unit
+		local finalCameraPos = boundingCenter + (offsetDirection * cameraDistance)
+
+		-- Set Studio camera (workspace.CurrentCamera)
+		local camera = workspace.CurrentCamera
+		camera.CameraType = Enum.CameraType.Fixed
+		camera.CFrame = CFrame.new(finalCameraPos, boundingCenter) * cameraOffset.Rotation
+		camera.Focus = CFrame.new(boundingCenter)
+
+		return {
+			success = true,
+			object = {
+				name = targetInstance.Name,
+				className = targetInstance.ClassName,
+				boundingBox = {
+					size = {x = boundingSize.X, y = boundingSize.Y, z = boundingSize.Z},
+					center = {x = boundingCenter.X, y = boundingCenter.Y, z = boundingCenter.Z}
+				}
+			},
+			camera = {
+				position = {x = finalCameraPos.X, y = finalCameraPos.Y, z = finalCameraPos.Z},
+				lookAt = {x = boundingCenter.X, y = boundingCenter.Y, z = boundingCenter.Z},
+				distance = cameraDistance,
+				angle = anglePreset
+			},
+			message = "Focused camera on " .. targetInstance.Name .. " from " .. tostring(anglePreset) .. " angle"
+		}
+	end)
+
+	if success then
+		return result
+	else
+		return {
+			success = false,
+			error = "Failed to focus camera: " .. tostring(result)
+		}
+	end
+end
+
 -- Now that all handlers are defined, populate the endpoint mapping table
 endpointHandlers = {
 	["/api/file-tree"] = handlers.getFileTree,
@@ -4996,6 +5095,8 @@ endpointHandlers = {
 	["/api/capture-screenshot"] = handlers.captureScreenshot,
 	-- ViewportFrame rendering
 	["/api/render-object-view"] = handlers.renderObjectView,
+	-- Camera control
+	["/api/focus-camera"] = handlers.focusCamera,
 }
 
 local function updateUIState()

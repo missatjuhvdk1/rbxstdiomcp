@@ -4819,36 +4819,86 @@ handlers.renderObjectView = function(requestData)
 		task.wait(0.1)
 		RunService.Heartbeat:Wait()
 
-		-- Capture to EditableImage using AssetService
+		-- WORKAROUND: ViewportFrame doesn't support direct pixel reading
+		-- We need to temporarily parent it to screen and use CaptureService
+		-- This is a limitation of Roblox's API
+		local StarterGui = game:GetService("StarterGui")
+		local CaptureService = game:GetService("CaptureService")
 		local AssetService = game:GetService("AssetService")
-		local editableImage = AssetService:CreateEditableImage({
-			Size = Vector2.new(width, height)
-		})
 
-		-- Read pixels from viewport
-		local pixelSuccess, pixelBuffer = pcall(function()
-			return viewportFrame:ReadPixelsBuffer(Vector2.new(0, 0), Vector2.new(width, height))
+		-- Create temporary ScreenGui
+		local tempGui = Instance.new("ScreenGui")
+		tempGui.Name = "MCPTempCapture"
+		tempGui.ResetOnSpawn = false
+		tempGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+		viewportFrame.Parent = tempGui
+		tempGui.Parent = game.CoreGui
+
+		-- Wait a frame for rendering
+		RunService.Heartbeat:Wait()
+
+		-- Capture screenshot of the viewport
+		local captureComplete = Instance.new("BindableEvent")
+		local captureResult = nil
+		local captureError = nil
+
+		pcall(function()
+			CaptureService:CaptureScreenshot(function(contentId)
+				if contentId then
+					captureResult = contentId
+				else
+					captureError = "CaptureScreenshot returned nil"
+				end
+				captureComplete:Fire()
+			end)
 		end)
 
-		if not pixelSuccess or not pixelBuffer then
-			viewportFrame:Destroy()
-			editableImage:Destroy()
+		-- Wait with timeout
+		local timeoutThread = task.delay(5, function()
+			if not captureResult and not captureError then
+				captureError = "Capture timed out"
+				captureComplete:Fire()
+			end
+		end)
+
+		captureComplete.Event:Wait()
+		task.cancel(timeoutThread)
+		captureComplete:Destroy()
+		tempGui:Destroy()
+		viewportFrame:Destroy()
+
+		if captureError then
 			return {
 				success = false,
-				error = "Failed to capture viewport pixels: " .. tostring(pixelBuffer)
+				error = "Failed to capture viewport: " .. captureError,
+				note = "ViewportFrame capture requires CaptureService (limitation of Roblox API)"
 			}
 		end
 
-		-- Write pixels to EditableImage
-		editableImage:WritePixelsBuffer(Vector2.new(0, 0), Vector2.new(width, height), pixelBuffer)
+		-- Load captured image
+		local editableImage = AssetService:CreateEditableImageAsync(Content.fromUri(tostring(captureResult)))
+
+		-- Resize if needed
+		local originalSize = editableImage.Size
+		if originalSize.X ~= width or originalSize.Y ~= height then
+			local resizedImage = AssetService:CreateEditableImage({Size = Vector2.new(width, height)})
+			local scaleX = width / originalSize.X
+			local scaleY = height / originalSize.Y
+			resizedImage:DrawImageTransformed(
+				Vector2.new(0, 0),
+				Vector2.new(scaleX, scaleY),
+				0,
+				editableImage,
+				{CombineType = Enum.ImageCombineType.Overwrite}
+			)
+			editableImage:Destroy()
+			editableImage = resizedImage
+		end
 
 		-- Convert to base64 RGBA
 		local rgbaBuffer = editableImage:ReadPixelsBuffer(Vector2.new(0, 0), editableImage.Size)
 		local rgbaString = buffer.tostring(rgbaBuffer)
 		local base64Data = base64encode(rgbaString)
-
-		-- Cleanup
-		viewportFrame:Destroy()
 		editableImage:Destroy()
 
 		return {

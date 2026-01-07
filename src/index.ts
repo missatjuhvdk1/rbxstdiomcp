@@ -784,6 +784,78 @@ class RobloxStudioMCPServer {
             }
           },
           // ============================================
+          // VIEWPORTFRAME RENDERING (Visual feedback)
+          // ============================================
+          {
+            name: 'render_object_view',
+            description: `Render an object as an image from any angle using ViewportFrame. This is the PRIMARY tool for visual feedback - use it whenever you need to "see" what you've created or verify visual appearance.
+
+Works in ANY Studio state (Edit/Play/Run) - no CaptureService limitations!
+Instant rendering with full control over camera, lighting, and background.
+
+Use cases:
+- Verify visual appearance of created objects
+- Generate thumbnails/previews
+- Debug positioning and orientation
+- Iterate on visual designs
+- Show users what their objects look like
+
+Available camera angles: front, back, left, right, top, bottom, iso (isometric), iso_front, iso_back, low_angle, high_angle
+Or provide custom angles with pitch/yaw/roll in degrees.
+
+Lighting presets: bright (3-point lighting), studio (flat/even), dark (dramatic), default (ambient only)`,
+            inputSchema: {
+              type: 'object',
+              properties: {
+                instancePath: {
+                  type: 'string',
+                  description: 'Path to the object to render (e.g., "game.Workspace.Model1")',
+                },
+                angle: {
+                  description: 'Camera angle - use preset string or custom object with pitch/yaw/roll/distance',
+                  oneOf: [
+                    {
+                      type: 'string',
+                      enum: ['front', 'back', 'left', 'right', 'top', 'bottom', 'iso', 'iso_front', 'iso_back', 'low_angle', 'high_angle'],
+                    },
+                    {
+                      type: 'object',
+                      properties: {
+                        pitch: { type: 'number', description: 'Pitch angle in degrees' },
+                        yaw: { type: 'number', description: 'Yaw angle in degrees' },
+                        roll: { type: 'number', description: 'Roll angle in degrees' },
+                        distance: { type: 'number', description: 'Camera distance from object' },
+                      },
+                    },
+                  ],
+                },
+                resolution: {
+                  type: 'object',
+                  properties: {
+                    width: { type: 'number', description: 'Image width (64-2048, default: 512)' },
+                    height: { type: 'number', description: 'Image height (64-2048, default: 512)' },
+                  },
+                  description: 'Render resolution',
+                },
+                lighting: {
+                  type: 'string',
+                  enum: ['default', 'bright', 'studio', 'dark', 'showcase', 'dramatic', 'flat'],
+                  description: 'Lighting preset to use (default: bright)',
+                },
+                background: {
+                  type: 'string',
+                  enum: ['transparent', 'grid', 'solid'],
+                  description: 'Background style (default: transparent)',
+                },
+                autoDistance: {
+                  type: 'boolean',
+                  description: 'Automatically calculate camera distance to fit object (default: true)',
+                },
+              },
+              required: ['instancePath'],
+            },
+          },
+          // ============================================
           // EXECUTE LUA TOOL (Run arbitrary Lua code)
           // ============================================
           {
@@ -962,6 +1034,19 @@ class RobloxStudioMCPServer {
             return await this.tools.captureScreenshot(
               (args as any)?.maxWidth,
               (args as any)?.maxHeight
+            );
+
+          // ViewportFrame Rendering
+          case 'render_object_view':
+            return await this.tools.renderObjectView(
+              (args as any)?.instancePath as string,
+              {
+                angle: (args as any)?.angle,
+                resolution: (args as any)?.resolution,
+                lighting: (args as any)?.lighting,
+                background: (args as any)?.background,
+                autoDistance: (args as any)?.autoDistance,
+              }
             );
 
           // Execute Lua Tool

@@ -1055,6 +1055,108 @@ export class RobloxStudioTools {
   }
 
   // ============================================
+  // VIEWPORTFRAME RENDERING SYSTEM
+  // ============================================
+
+  /**
+   * render_object_view - Render an object from any angle using ViewportFrame
+   * This is the PRIMARY visual feedback tool for AI
+   */
+  async renderObjectView(
+    instancePath: string,
+    options?: {
+      angle?: string | { pitch?: number; yaw?: number; roll?: number; distance?: number };
+      resolution?: { width?: number; height?: number };
+      lighting?: 'default' | 'bright' | 'studio' | 'dark' | 'showcase' | 'dramatic' | 'flat';
+      background?: 'transparent' | 'grid' | 'solid';
+      autoDistance?: boolean;
+    }
+  ) {
+    if (!instancePath) {
+      throw new Error('Instance path is required for render_object_view');
+    }
+
+    const response = await this.client.request('/api/render-object-view', {
+      instancePath,
+      angle: options?.angle || 'iso',
+      resolution: options?.resolution || { width: 512, height: 512 },
+      lighting: options?.lighting || 'bright',
+      background: options?.background || 'transparent',
+      autoDistance: options?.autoDistance !== false,
+    });
+
+    // Convert RGBA to PNG (same as captureScreenshot)
+    const responseData = response as any;
+    if (responseData.success && responseData.base64) {
+      try {
+        const rgbaBuffer = Buffer.from(responseData.base64, 'base64');
+        const width = responseData.width;
+        const height = responseData.height;
+
+        // Validate buffer size
+        const expectedSize = width * height * 4;
+        if (rgbaBuffer.length !== expectedSize) {
+          throw new Error(
+            `Buffer size mismatch: got ${rgbaBuffer.length}, expected ${expectedSize}`
+          );
+        }
+
+        // Convert RGBA to PNG (using existing createPNG utility)
+        const pngBuffer = createPNG(rgbaBuffer, width, height);
+        const pngBase64 = pngBuffer.toString('base64');
+
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify(
+                {
+                  success: true,
+                  message: responseData.message,
+                  viewInfo: responseData.viewInfo,
+                  format: 'PNG',
+                },
+                null,
+                2
+              ),
+            },
+            {
+              type: 'image',
+              data: pngBase64,
+              mimeType: 'image/png',
+            },
+          ],
+        };
+      } catch (err) {
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify(
+                {
+                  success: false,
+                  error: `PNG conversion failed: ${err instanceof Error ? err.message : String(err)}`,
+                },
+                null,
+                2
+              ),
+            },
+          ],
+        };
+      }
+    }
+
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify(response, null, 2),
+        },
+      ],
+    };
+  }
+
+  // ============================================
   // EXECUTE LUA TOOL
   // ============================================
 

@@ -4599,6 +4599,295 @@ handlers.captureScreenshot = function(requestData)
 	return resultData
 end
 
+-- ============================================
+-- VIEWPORTFRAME RENDERING SYSTEM
+-- ============================================
+
+-- Camera angle presets
+local CameraPresets = {
+	-- Standard orthographic views
+	front = CFrame.new(0, 0, 10) * CFrame.Angles(0, 0, 0),
+	back = CFrame.new(0, 0, -10) * CFrame.Angles(0, math.pi, 0),
+	left = CFrame.new(-10, 0, 0) * CFrame.Angles(0, math.pi/2, 0),
+	right = CFrame.new(10, 0, 0) * CFrame.Angles(0, -math.pi/2, 0),
+	top = CFrame.new(0, 10, 0) * CFrame.Angles(-math.pi/2, 0, 0),
+	bottom = CFrame.new(0, -10, 0) * CFrame.Angles(math.pi/2, 0, 0),
+
+	-- Isometric views (popular for thumbnails)
+	iso = CFrame.new(7, 7, 7) * CFrame.Angles(-math.pi/6, math.pi/4, 0),
+	iso_front = CFrame.new(5, 5, 10) * CFrame.Angles(-math.pi/6, 0, 0),
+	iso_back = CFrame.new(-5, 5, -10) * CFrame.Angles(-math.pi/6, math.pi, 0),
+
+	-- Dramatic angles
+	low_angle = CFrame.new(0, -5, 10) * CFrame.Angles(math.pi/6, 0, 0),
+	high_angle = CFrame.new(0, 15, 8) * CFrame.Angles(-math.pi/3, 0, 0),
+}
+
+-- Apply lighting preset to WorldModel
+local function applyLightingPreset(worldModel, preset)
+	-- Remove existing lighting
+	for _, child in ipairs(worldModel:GetChildren()) do
+		if child:IsA("Light") or child:IsA("Sky") or child:IsA("Atmosphere") then
+			child:Destroy()
+		end
+	end
+
+	if preset == "bright" or preset == "showcase" then
+		-- Three-point lighting setup
+		local keyLight = Instance.new("PointLight")
+		keyLight.Brightness = 2
+		keyLight.Range = 60
+		keyLight.Color = Color3.fromRGB(255, 255, 255)
+		keyLight.Parent = worldModel
+
+		local fillLight = Instance.new("PointLight")
+		fillLight.Brightness = 1
+		fillLight.Range = 40
+		fillLight.Color = Color3.fromRGB(200, 220, 255)
+		fillLight.Parent = worldModel
+
+		local rimLight = Instance.new("PointLight")
+		rimLight.Brightness = 1.5
+		rimLight.Range = 50
+		rimLight.Color = Color3.fromRGB(255, 240, 200)
+		rimLight.Parent = worldModel
+
+	elseif preset == "studio" or preset == "flat" then
+		-- Flat, even lighting like in Studio
+		local ambientLight = Instance.new("PointLight")
+		ambientLight.Brightness = 1
+		ambientLight.Range = 100
+		ambientLight.Color = Color3.fromRGB(255, 255, 255)
+		ambientLight.Parent = worldModel
+
+	elseif preset == "dark" or preset == "dramatic" then
+		-- Single directional light
+		local light = Instance.new("PointLight")
+		light.Brightness = 1.5
+		light.Range = 40
+		light.Color = Color3.fromRGB(255, 200, 150)
+		light.Parent = worldModel
+	end
+	-- default: no lights added (ambient only)
+end
+
+-- Calculate bounding box of a model
+local function getModelBoundingBox(model)
+	local parts = {}
+
+	-- Collect all BaseParts
+	for _, child in ipairs(model:GetDescendants()) do
+		if child:IsA("BasePart") then
+			table.insert(parts, child)
+		end
+	end
+
+	if #parts == 0 then
+		-- No parts found, return default
+		return Vector3.new(1, 1, 1), Vector3.new(0, 0, 0)
+	end
+
+	-- Calculate bounding box
+	local minPos = parts[1].Position - parts[1].Size/2
+	local maxPos = parts[1].Position + parts[1].Size/2
+
+	for _, part in ipairs(parts) do
+		local partMin = part.Position - part.Size/2
+		local partMax = part.Position + part.Size/2
+
+		minPos = Vector3.new(
+			math.min(minPos.X, partMin.X),
+			math.min(minPos.Y, partMin.Y),
+			math.min(minPos.Z, partMin.Z)
+		)
+		maxPos = Vector3.new(
+			math.max(maxPos.X, partMax.X),
+			math.max(maxPos.Y, partMax.Y),
+			math.max(maxPos.Z, partMax.Z)
+		)
+	end
+
+	local size = maxPos - minPos
+	local center = (minPos + maxPos) / 2
+
+	return size, center
+end
+
+-- Main handler: Render Object View
+handlers.renderObjectView = function(requestData)
+	local success, result = pcall(function()
+		local instancePath = requestData.instancePath
+		if not instancePath then
+			return {
+				success = false,
+				error = "instancePath is required"
+			}
+		end
+
+		-- Parse resolution
+		local resolution = requestData.resolution or {width = 512, height = 512}
+		local width = resolution.width or 512
+		local height = resolution.height or 512
+
+		-- Clamp resolution for performance
+		width = math.clamp(width, 64, 2048)
+		height = math.clamp(height, 64, 2048)
+
+		local anglePreset = requestData.angle or "iso"
+		local lighting = requestData.lighting or "bright"
+		local background = requestData.background or "transparent"
+		local autoDistance = requestData.autoDistance ~= false
+
+		-- Get target instance
+		local targetInstance = getInstanceByPath(instancePath)
+		if not targetInstance then
+			return {
+				success = false,
+				error = "Instance not found: " .. instancePath
+			}
+		end
+
+		-- Create ViewportFrame (no parent = no GUI overhead)
+		local viewportFrame = Instance.new("ViewportFrame")
+		viewportFrame.Size = UDim2.fromOffset(width, height)
+		viewportFrame.BackgroundTransparency = background == "transparent" and 1 or 0
+		viewportFrame.BackgroundColor3 = background == "grid" and Color3.fromRGB(128, 128, 128) or Color3.fromRGB(255, 255, 255)
+
+		-- Create WorldModel for viewport
+		local worldModel = Instance.new("WorldModel")
+		worldModel.Parent = viewportFrame
+
+		local camera = Instance.new("Camera")
+		camera.Parent = viewportFrame
+		viewportFrame.CurrentCamera = camera
+
+		-- Clone target into WorldModel
+		local clonedInstance = targetInstance:Clone()
+		clonedInstance.Parent = worldModel
+
+		-- Calculate bounding box and center
+		local boundingSize, boundingCenter = getModelBoundingBox(clonedInstance)
+		local maxDimension = math.max(boundingSize.X, boundingSize.Y, boundingSize.Z)
+
+		-- Position camera
+		local cameraOffset
+		if type(anglePreset) == "string" and CameraPresets[anglePreset] then
+			cameraOffset = CameraPresets[anglePreset]
+		elseif type(anglePreset) == "table" then
+			-- Custom angle {pitch, yaw, roll, distance}
+			local pitch = math.rad(anglePreset.pitch or 0)
+			local yaw = math.rad(anglePreset.yaw or 0)
+			local roll = math.rad(anglePreset.roll or 0)
+			local distance = anglePreset.distance or 10
+			cameraOffset = CFrame.new(0, 0, distance) * CFrame.Angles(pitch, yaw, roll)
+		else
+			cameraOffset = CameraPresets.iso
+		end
+
+		-- Auto-calculate distance to fit object
+		local cameraDistance = 10
+		if autoDistance then
+			local fov = 70
+			cameraDistance = maxDimension / (2 * math.tan(math.rad(fov / 2))) * 1.3
+			cameraDistance = math.max(cameraDistance, 1) -- Minimum distance
+		elseif type(anglePreset) == "table" and anglePreset.distance then
+			cameraDistance = anglePreset.distance
+		end
+
+		-- Apply distance to camera offset
+		local offsetDirection = cameraOffset.Position.Unit
+		local finalCameraPos = boundingCenter + (offsetDirection * cameraDistance)
+
+		camera.CFrame = CFrame.new(finalCameraPos, boundingCenter) * cameraOffset.Rotation
+		camera.FieldOfView = 70
+
+		-- Apply lighting
+		applyLightingPreset(worldModel, lighting)
+
+		-- Add grid background if requested
+		if background == "grid" then
+			local gridPart = Instance.new("Part")
+			gridPart.Size = Vector3.new(maxDimension * 5, 0.1, maxDimension * 5)
+			gridPart.Position = boundingCenter - Vector3.new(0, boundingSize.Y/2 + 0.1, 0)
+			gridPart.Anchored = true
+			gridPart.Material = Enum.Material.SmoothPlastic
+			gridPart.Color = Color3.fromRGB(200, 200, 200)
+			gridPart.Parent = worldModel
+		end
+
+		-- Wait for viewport to render
+		task.wait(0.1)
+		RunService.Heartbeat:Wait()
+
+		-- Capture to EditableImage using AssetService
+		local AssetService = game:GetService("AssetService")
+		local editableImage = AssetService:CreateEditableImage({
+			Size = Vector2.new(width, height)
+		})
+
+		-- Read pixels from viewport
+		local pixelSuccess, pixelBuffer = pcall(function()
+			return viewportFrame:ReadPixelsBuffer(Vector2.new(0, 0), Vector2.new(width, height))
+		end)
+
+		if not pixelSuccess or not pixelBuffer then
+			viewportFrame:Destroy()
+			editableImage:Destroy()
+			return {
+				success = false,
+				error = "Failed to capture viewport pixels: " .. tostring(pixelBuffer)
+			}
+		end
+
+		-- Write pixels to EditableImage
+		editableImage:WritePixelsBuffer(Vector2.new(0, 0), Vector2.new(width, height), pixelBuffer)
+
+		-- Convert to base64 RGBA
+		local rgbaBuffer = editableImage:ReadPixelsBuffer(Vector2.new(0, 0), editableImage.Size)
+		local rgbaString = buffer.tostring(rgbaBuffer)
+		local base64Data = base64encode(rgbaString)
+
+		-- Cleanup
+		viewportFrame:Destroy()
+		editableImage:Destroy()
+
+		return {
+			success = true,
+			base64 = base64Data,
+			width = width,
+			height = height,
+			viewInfo = {
+				objectName = targetInstance.Name,
+				objectClass = targetInstance.ClassName,
+				boundingBox = {
+					size = {x = boundingSize.X, y = boundingSize.Y, z = boundingSize.Z},
+					center = {x = boundingCenter.X, y = boundingCenter.Y, z = boundingCenter.Z}
+				},
+				camera = {
+					distance = cameraDistance,
+					position = {x = finalCameraPos.X, y = finalCameraPos.Y, z = finalCameraPos.Z}
+				},
+				settings = {
+					angle = anglePreset,
+					lighting = lighting,
+					background = background,
+					resolution = {width = width, height = height}
+				}
+			},
+			message = "Rendered " .. targetInstance.Name .. " at " .. width .. "x" .. height
+		}
+	end)
+
+	if success then
+		return result
+	else
+		return {
+			success = false,
+			error = "Failed to render object: " .. tostring(result)
+		}
+	end
+end
+
 -- Now that all handlers are defined, populate the endpoint mapping table
 endpointHandlers = {
 	["/api/file-tree"] = handlers.getFileTree,
@@ -4655,6 +4944,8 @@ endpointHandlers = {
 	["/api/stop-play"] = handlers.stopPlay,
 	-- Screenshot
 	["/api/capture-screenshot"] = handlers.captureScreenshot,
+	-- ViewportFrame rendering
+	["/api/render-object-view"] = handlers.renderObjectView,
 }
 
 local function updateUIState()

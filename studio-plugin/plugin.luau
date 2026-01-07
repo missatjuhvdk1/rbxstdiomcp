@@ -4374,23 +4374,16 @@ end
 
 handlers.stopPlay = function(requestData)
 	local success, result = pcall(function()
-		local wasRunning = RunService:IsRunning()
+		-- NOTE: RunService:IsRunning() returns false from plugin context even when play test is running
+		-- So we always try to stop via StudioTestService first
 
-		if not wasRunning then
-			return {
-				success = true,
-				wasRunning = false,
-				message = "Play test was not running"
-			}
-		end
-
-		-- Try StudioTestService:EndTest first if available (matches ExecutePlayModeAsync)
+		-- Try StudioTestService:EndTest first (matches ExecutePlayModeAsync)
 		local studioTestSuccess, studioTestService = pcall(function()
 			return game:GetService("StudioTestService")
 		end)
 
 		if studioTestSuccess and studioTestService then
-			local endSuccess = pcall(function()
+			local endSuccess, endError = pcall(function()
 				studioTestService:EndTest()
 			end)
 
@@ -4398,20 +4391,28 @@ handlers.stopPlay = function(requestData)
 				activePlayTestTask = nil
 				return {
 					success = true,
-					wasRunning = true,
 					method = "StudioTestService:EndTest",
-					message = "Stopped play test (state restored)"
+					message = "Stopped play test"
+				}
+			else
+				-- EndTest failed, try RunService:Stop as fallback
+				RunService:Stop()
+				activePlayTestTask = nil
+				return {
+					success = true,
+					method = "RunService:Stop (fallback)",
+					message = "Stopped play test",
+					warning = "EndTest failed: " .. tostring(endError) .. ". Used RunService:Stop() which does NOT restore pre-play state."
 				}
 			end
 		end
 
-		-- Fallback to RunService:Stop() if StudioTestService failed
+		-- No StudioTestService, use RunService:Stop
 		RunService:Stop()
 		activePlayTestTask = nil
 
 		return {
 			success = true,
-			wasRunning = true,
 			method = "RunService:Stop",
 			message = "Stopped play test",
 			warning = "Note: RunService:Stop() does NOT restore pre-play state. Objects created/modified during play remain changed."

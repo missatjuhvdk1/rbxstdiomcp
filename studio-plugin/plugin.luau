@@ -7,11 +7,231 @@ local ScriptEditorService = game:GetService("ScriptEditorService")
 local CollectionService = game:GetService("CollectionService")
 local LogService = game:GetService("LogService")
 
--- StudioTestService for play/stop control (may not be available in all contexts)
+-- StudioTestService for play/stop control (may not be available in all contexts).
+-- NOTE: The previous version of this file mistakenly fetched "TestService" here
+-- — that's a different (legacy) service. The actual API for ExecutePlayModeAsync
+-- and EndTest lives on "StudioTestService". The playSolo handler also re-fetches
+-- this defensively so an older Studio doesn't blow up at plugin load time.
 local StudioTestService = nil
 pcall(function()
-	StudioTestService = game:GetService("TestService")
+	StudioTestService = game:GetService("StudioTestService")
 end)
+
+-- ============================================================================
+-- TEST SESSION COMPANION
+--
+-- StudioTestService:EndTest() can only be called from the Server DataModel of
+-- a running test. The plugin lives in the Edit DataModel, so it cannot call
+-- EndTest itself. To work around this we inject a small Script into
+-- ServerScriptService BEFORE calling ExecutePlayModeAsync. When the test
+-- starts, that Script runs in the Server DataModel and:
+--   1. Streams LogService.MessageOut to the bridge (/test-session/log)
+--   2. Polls the bridge (/test-session/poll) for an "end" command
+--   3. On "end", calls StudioTestService:EndTest() — which terminates the
+--      yielding ExecutePlayModeAsync call back in the plugin.
+--
+-- Cleanup strategy:
+--   - Tagged with TEST_COMPANION_TAG so we can find orphans
+--   - Swept on plugin activate, on every playSolo start, and after the test
+--     ends (whether via stop_play, natural end, or user clicking Stop)
+-- ============================================================================
+local TEST_COMPANION_NAME = "_MCPTestCompanion"
+local TEST_COMPANION_TAG = "_MCPTestCompanion"
+
+-- The companion script source. Two placeholders are substituted at injection
+-- time: __MCP_SERVER_URL__ and __MCP_SESSION_ID__. We use distinctive
+-- placeholders (not %%...%% or {{...}}) to avoid collisions with Lua's own
+-- pattern syntax during gsub.
+local COMPANION_SCRIPT_TEMPLATE = [[-- _MCPTestCompanion (auto-generated, safe to delete)
+-- Runs in the Server DataModel of a Studio test session started by the MCP
+-- plugin. Pipes output back to the local MCP bridge and listens for an "end"
+-- command to terminate the test cleanly via StudioTestService:EndTest().
+
+local HttpService = game:GetService("HttpService")
+local LogService = game:GetService("LogService")
+local StudioTestService
+do
+	local ok, svc = pcall(function() return game:GetService("StudioTestService") end)
+	if ok then StudioTestService = svc end
+end
+
+local SERVER_URL = "__MCP_SERVER_URL__"
+local SESSION_ID = "__MCP_SESSION_ID__"
+local POLL_INTERVAL = 0.4
+local LOG_FLUSH_INTERVAL = 0.25
+local MAX_BUFFER = 5000
+local MAX_CONSECUTIVE_FAILURES = 30 -- ~12s of failed polls before we give up
+
+local outputBuffer = {}
+local stopRequested = false
+local consecutiveFailures = 0
+
+local function postJSON(path, body)
+	local ok, response = pcall(function()
+		return HttpService:RequestAsync({
+			Url = SERVER_URL .. path,
+			Method = "POST",
+			Headers = { ["Content-Type"] = "application/json" },
+			Body = HttpService:JSONEncode(body),
+		})
+	end)
+	if ok and response and response.Success then
+		consecutiveFailures = 0
+		return true, response
+	else
+		consecutiveFailures += 1
+		return false, nil
+	end
+end
+
+LogService.MessageOut:Connect(function(message, messageType)
+	if #outputBuffer >= MAX_BUFFER then
+		-- Drop oldest to keep buffer bounded; we'd rather lose stale output
+		-- than balloon memory in a long-running test.
+		table.remove(outputBuffer, 1)
+	end
+	table.insert(outputBuffer, {
+		message = tostring(message),
+		messageType = messageType.Name,
+		timestamp = os.time(),
+	})
+end)
+
+-- Log flusher
+task.spawn(function()
+	while not stopRequested do
+		if #outputBuffer > 0 then
+			local toSend = outputBuffer
+			outputBuffer = {}
+			local ok = postJSON("/test-session/log", {
+				sessionId = SESSION_ID,
+				messages = toSend,
+			})
+			if not ok then
+				-- Re-queue (capped) so we don't lose log lines on a transient
+				-- bridge hiccup. Newer entries take priority since they're
+				-- usually what the AI wants to see.
+				for i = 1, math.min(#toSend, MAX_BUFFER - #outputBuffer) do
+					table.insert(outputBuffer, toSend[i])
+				end
+			end
+		end
+		task.wait(LOG_FLUSH_INTERVAL)
+	end
+end)
+
+-- Command poller
+task.spawn(function()
+	while not stopRequested and consecutiveFailures < MAX_CONSECUTIVE_FAILURES do
+		local ok, response = postJSON("/test-session/poll", { sessionId = SESSION_ID })
+		if ok and response and response.Body then
+			local decodeOk, body = pcall(function()
+				return HttpService:JSONDecode(response.Body)
+			end)
+			if decodeOk and body then
+				-- Bridge tells us the session is over (e.g. user clicked Stop
+				-- in Studio, or the plugin was reloaded). Stop polling.
+				if body.ended then
+					stopRequested = true
+					break
+				end
+				if body.command and body.command.cmd == "end" then
+					stopRequested = true
+					-- Final flush of any pending output before we tear down.
+					if #outputBuffer > 0 then
+						local final = outputBuffer
+						outputBuffer = {}
+						postJSON("/test-session/log", {
+							sessionId = SESSION_ID,
+							messages = final,
+						})
+					end
+					-- Tell the bridge we're acknowledging the stop. This wakes
+					-- any stop_play caller waiting on a confirmation.
+					postJSON("/test-session/ended", {
+						sessionId = SESSION_ID,
+						reason = "mcp_stop",
+					})
+					-- Finally, end the test. This terminates the yielding
+					-- ExecutePlayModeAsync call back in the Edit-side plugin.
+					if StudioTestService then
+						pcall(function()
+							StudioTestService:EndTest(body.command.args or "MCP_Stop")
+						end)
+					end
+					return
+				end
+			end
+		end
+		task.wait(POLL_INTERVAL)
+	end
+end)
+]]
+
+-- gsub-safe replacement (treat replacement as plain string, not a pattern).
+local function plainReplace(haystack, needle, replacement)
+	-- Use string.find with plain=true to avoid pattern interpretation in needle.
+	local result = {}
+	local i = 1
+	while true do
+		local s, e = string.find(haystack, needle, i, true)
+		if not s then
+			table.insert(result, string.sub(haystack, i))
+			break
+		end
+		table.insert(result, string.sub(haystack, i, s - 1))
+		table.insert(result, replacement)
+		i = e + 1
+	end
+	return table.concat(result)
+end
+
+local function cleanupTestCompanions()
+	local count = 0
+	pcall(function()
+		for _, inst in ipairs(CollectionService:GetTagged(TEST_COMPANION_TAG)) do
+			pcall(function() inst:Destroy() end)
+			count += 1
+		end
+	end)
+	-- Belt & suspenders: also remove any name-matching script in
+	-- ServerScriptService in case the tag was somehow stripped.
+	pcall(function()
+		local sss = game:GetService("ServerScriptService")
+		for _, child in ipairs(sss:GetChildren()) do
+			if child.Name == TEST_COMPANION_NAME then
+				pcall(function() child:Destroy() end)
+				count += 1
+			end
+		end
+	end)
+	return count
+end
+
+local function injectTestCompanion(serverUrl, sessionId)
+	-- Always sweep before creating to guarantee at most one companion exists.
+	cleanupTestCompanions()
+
+	local source = COMPANION_SCRIPT_TEMPLATE
+	source = plainReplace(source, "__MCP_SERVER_URL__", serverUrl)
+	source = plainReplace(source, "__MCP_SESSION_ID__", sessionId)
+
+	local script = Instance.new("Script")
+	script.Name = TEST_COMPANION_NAME
+	script.Source = source
+	-- Archivable=false so a stray companion never gets saved into the user's
+	-- place file even if cleanup somehow misses it. The play-test mechanism
+	-- still includes it in the test DataModel because it duplicates the live
+	-- in-memory tree (not the saved file).
+	script.Archivable = false
+	script.Parent = game:GetService("ServerScriptService")
+
+	pcall(function()
+		CollectionService:AddTag(script, TEST_COMPANION_TAG)
+	end)
+
+	return script
+end
 
 -- Track output log for get_output
 local outputBuffer = {}
@@ -4312,121 +4532,113 @@ end
 
 -- ============================================
 -- PLAYTEST CONTROL HANDLERS
+--
+-- play_solo: receives a sessionId from the bridge, injects a companion
+-- Script tagged with TEST_COMPANION_TAG into ServerScriptService, then
+-- spawns ExecutePlayModeAsync in a separate thread so the HTTP response
+-- can return immediately. When the test ends (for any reason), we sweep
+-- the companion and notify the bridge.
+--
+-- stop_play: this handler is kept only for backward compatibility. The
+-- real stop path is the bridge enqueueing an "end" command that the
+-- companion picks up and acts on. Calling this endpoint directly will
+-- always be a no-op telling the caller to use the new path.
 -- ============================================
 
--- Track active play test task
-local activePlayTestTask = nil
-
 handlers.playSolo = function(requestData)
+	local sessionId = requestData and requestData.sessionId
+	if type(sessionId) ~= "string" or sessionId == "" then
+		return {
+			success = false,
+			error = "sessionId required (the bridge generates one and passes it; older clients won't have it).",
+		}
+	end
+
+	-- Validate StudioTestService is available BEFORE we touch anything.
+	local stsOk, sts = pcall(function() return game:GetService("StudioTestService") end)
+	if not stsOk or not sts then
+		return {
+			success = false,
+			error = "StudioTestService unavailable in this Studio version. Update Roblox Studio to use playtest features.",
+		}
+	end
+
+	-- If a previous test was somehow left running (e.g. plugin reloaded
+	-- mid-test, user clicked Stop without us hearing), best-effort it.
+	-- We can't detect Play mode from a plugin reliably, so we just do an
+	-- orphan sweep — if there's no actual test running, the sweep is a
+	-- no-op; if there is one, the user will need to stop it manually
+	-- since EndTest can only be called from the test's Server DataModel.
+	cleanupTestCompanions()
+
 	local success, result = pcall(function()
-		local wasRunning = RunService:IsRunning()
+		local companion = injectTestCompanion(pluginState.serverUrl, sessionId)
 
-		-- If already running, stop first
-		if wasRunning then
-			RunService:Stop()
-			task.wait(0.2)
-		end
-
-		-- Try the new StudioTestService first (available since Dec 2025)
-		local studioTestSuccess, studioTestService = pcall(function()
-			return game:GetService("StudioTestService")
-		end)
-
-		if studioTestSuccess and studioTestService then
-			-- Use the new StudioTestService API for proper Play Solo mode
-			-- Run in background task so we don't block the HTTP response
-			activePlayTestTask = task.spawn(function()
-				-- ExecutePlayModeAsync(args: Variant?) - per official docs, pass a string identifier
-				local testResult = studioTestService:ExecutePlayModeAsync("MCP_PlayTest")
-				activePlayTestTask = nil
+		-- ExecutePlayModeAsync yields until the test ends. Run it on its
+		-- own thread so the HTTP response for play_solo returns now,
+		-- rather than after the test concludes. The plugin's poll loop
+		-- continues to service other requests during the test.
+		task.spawn(function()
+			local execOk, execResult = pcall(function()
+				return sts:ExecutePlayModeAsync(sessionId)
 			end)
 
-			return {
-				success = true,
-				wasRunning = wasRunning,
-				method = "StudioTestService:ExecutePlayModeAsync",
-				message = wasRunning and "Restarted Play Solo (was already running)" or "Started Play Solo mode",
-				note = "Use get_output to read script output. Use stop_play when done."
-			}
-		else
-			-- Fallback to RunService for older Studio versions
-			RunService:Run()
+			-- Test has ended. Always clean up the companion in the Edit
+			-- DataModel (the one in the test DM died with the test).
+			cleanupTestCompanions()
 
-			return {
-				success = true,
-				wasRunning = wasRunning,
-				method = "RunService:Run (fallback)",
-				message = wasRunning and "Restarted play test (was already running)" or "Started Run mode (fallback - StudioTestService not available)",
-				note = "Use get_output to read script output. Use stop_play when done."
-			}
-		end
+			-- Tell the bridge the session is over. The companion may have
+			-- already done this if stop was MCP-driven; the bridge's
+			-- endTestSession is idempotent so a duplicate post is fine.
+			pcall(function()
+				HttpService:RequestAsync({
+					Url = pluginState.serverUrl .. "/test-session/ended",
+					Method = "POST",
+					Headers = { ["Content-Type"] = "application/json" },
+					Body = HttpService:JSONEncode({
+						sessionId = sessionId,
+						reason = execOk and "natural" or "exec_error",
+						value = execOk and execResult or nil,
+						error = (not execOk) and tostring(execResult) or nil,
+					}),
+				})
+			end)
+		end)
+
+		return {
+			success = true,
+			sessionId = sessionId,
+			method = "StudioTestService:ExecutePlayModeAsync",
+			companionPath = getInstancePath(companion),
+			message = "Started Play Solo with MCP companion. Use stop_play to end, get_playtest_output to read logs.",
+		}
 	end)
 
 	if success then
 		return result
 	else
+		-- If injection or task spawn fails, make sure we don't leave a
+		-- companion script behind.
+		pcall(cleanupTestCompanions)
 		return {
 			success = false,
-			error = "Failed to start play test: " .. tostring(result)
+			sessionId = sessionId,
+			error = "Failed to start play test: " .. tostring(result),
 		}
 	end
 end
 
 handlers.stopPlay = function(requestData)
-	local success, result = pcall(function()
-		-- NOTE: RunService:IsRunning() returns false from plugin context even when play test is running
-		-- So we always try to stop via StudioTestService first
-
-		-- Try StudioTestService:EndTest first (matches ExecutePlayModeAsync)
-		local studioTestSuccess, studioTestService = pcall(function()
-			return game:GetService("StudioTestService")
-		end)
-
-		if studioTestSuccess and studioTestService then
-			local endSuccess, endError = pcall(function()
-				studioTestService:EndTest()
-			end)
-
-			if endSuccess then
-				activePlayTestTask = nil
-				return {
-					success = true,
-					method = "StudioTestService:EndTest",
-					message = "Stopped play test"
-				}
-			else
-				-- EndTest failed, try RunService:Stop as fallback
-				RunService:Stop()
-				activePlayTestTask = nil
-				return {
-					success = true,
-					method = "RunService:Stop (fallback)",
-					message = "Stopped play test",
-					warning = "EndTest failed: " .. tostring(endError) .. ". Used RunService:Stop() which does NOT restore pre-play state."
-				}
-			end
-		end
-
-		-- No StudioTestService, use RunService:Stop
-		RunService:Stop()
-		activePlayTestTask = nil
-
-		return {
-			success = true,
-			method = "RunService:Stop",
-			message = "Stopped play test",
-			warning = "Note: RunService:Stop() does NOT restore pre-play state. Objects created/modified during play remain changed."
-		}
-	end)
-
-	if success then
-		return result
-	else
-		return {
-			success = false,
-			error = "Failed to stop play test: " .. tostring(result)
-		}
-	end
+	-- Deprecated path. The MCP `stop_play` tool now talks to the bridge
+	-- directly (which queues a command for the in-test companion to pick
+	-- up). This handler exists only so older bridge versions or direct
+	-- HTTP callers don't crash — it never actually stops a test, since
+	-- EndTest cannot be called from the Edit DataModel.
+	return {
+		success = false,
+		deprecated = true,
+		error = "/api/stop-play is deprecated. The MCP stop_play tool now signals the in-test companion via the bridge — update your MCP server to a version that includes the test-session protocol.",
+	}
 end
 
 -- ============================================
@@ -5200,6 +5412,10 @@ local function activatePlugin()
 	screenGui.Enabled = true
 	updateUIState()
 
+	-- Sweep any orphan test companions left over from a previous Studio
+	-- session that crashed/was force-closed mid-test. Safe no-op otherwise.
+	pcall(cleanupTestCompanions)
+
 	pcall(function()
 		HttpService:RequestAsync({
 			Url = pluginState.serverUrl .. "/ready",
@@ -5248,7 +5464,13 @@ local function deactivatePlugin()
 		pluginState.connection:Disconnect()
 		pluginState.connection = nil
 	end
-	
+
+	-- Don't leave a companion script in the place when the user disables
+	-- the plugin. (If a test is currently running it'll be in the test's
+	-- Server DataModel — that copy dies with the test. We're cleaning the
+	-- Edit-side template so it's not there next time the user saves.)
+	pcall(cleanupTestCompanions)
+
 	pluginState.consecutiveFailures = 0
 	pluginState.currentRetryDelay = 0.5
 end

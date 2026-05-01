@@ -55,3 +55,6 @@ temp/
 # AI-generated content
 banner-prompt.txt
 forum-title.txt
+
+# Local reference docs (sparse-cloned creator-docs for development)
+.refdocs/

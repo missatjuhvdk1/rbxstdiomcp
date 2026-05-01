@@ -301,6 +301,61 @@ export function createHttpServer(tools: RobloxStudioTools, bridge: BridgeService
     }
   });
 
+  // ==========================================================================
+  // Test session endpoints — used by the companion script that runs INSIDE
+  // the Studio test's Server DataModel (not by the Edit-side plugin).
+  //
+  // The companion polls /test-session/poll for commands (like "end"), posts
+  // log batches to /test-session/log, and reports completion to
+  // /test-session/ended. The Edit-side plugin also posts to /ended when its
+  // ExecutePlayModeAsync call returns naturally.
+  // ==========================================================================
+
+  // Companion polls this for commands. Always echoes back the session
+  // status so the companion can self-terminate cleanly when the session
+  // is marked ended (e.g. user clicked Studio's Stop button).
+  app.post('/test-session/poll', (req, res) => {
+    const { sessionId } = req.body || {};
+    if (typeof sessionId !== 'string' || sessionId.length === 0) {
+      res.status(400).json({ error: 'sessionId required' });
+      return;
+    }
+    const result = bridge.popTestCommand(sessionId);
+    res.json({
+      command: result.command,
+      ended: result.ended,
+      sessionMatch: result.sessionMatch,
+    });
+  });
+
+  // Companion streams LogService output here. Body shape:
+  //   { sessionId: string, messages: [{ message, messageType, timestamp }] }
+  app.post('/test-session/log', (req, res) => {
+    const { sessionId, messages } = req.body || {};
+    if (typeof sessionId !== 'string' || sessionId.length === 0) {
+      res.status(400).json({ error: 'sessionId required' });
+      return;
+    }
+    if (!Array.isArray(messages)) {
+      res.status(400).json({ error: 'messages must be an array' });
+      return;
+    }
+    const result = bridge.appendTestOutput(sessionId, messages, 'server');
+    res.json({ accepted: result.accepted, sessionMatch: result.sessionMatch });
+  });
+
+  // Either the companion (after processing an end command) or the Edit-side
+  // plugin (after ExecutePlayModeAsync returns) reports the session ended.
+  // First caller wins; subsequent calls are idempotent.
+  app.post('/test-session/ended', (req, res) => {
+    const { sessionId, reason, value } = req.body || {};
+    if (typeof sessionId !== 'string' || sessionId.length === 0) {
+      res.status(400).json({ error: 'sessionId required' });
+      return;
+    }
+    const ok = bridge.endTestSession(sessionId, String(reason || 'unknown'), value);
+    res.json({ ok });
+  });
 
   // Add methods to control and check server status
   (app as any).isPluginConnected = isPluginConnected;

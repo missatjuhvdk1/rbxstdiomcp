@@ -85,8 +85,10 @@ function crc32(data: Buffer): number {
 
 export class RobloxStudioTools {
   private client: StudioHttpClient;
+  private bridge: BridgeService;
 
   constructor(bridge: BridgeService) {
+    this.bridge = bridge;
     this.client = new StudioHttpClient(bridge);
   }
 
@@ -949,29 +951,143 @@ export class RobloxStudioTools {
 
   // ============================================
   // PLAYTEST CONTROL TOOLS
+  //
+  // play_solo / stop_play / get_playtest_output coordinate three actors:
+  //   1. This MCP server (Node)
+  //   2. The Edit-side plugin (calls ExecutePlayModeAsync, which yields
+  //      until the test ends)
+  //   3. The companion Script injected into the test's Server DataModel
+  //      (the only place EndTest() is allowed to be called from)
+  //
+  // play_solo:    bridge generates sessionId → plugin embeds it in companion
+  //               → companion polls bridge for commands while test runs
+  // stop_play:    bridge enqueues "end" command → companion picks it up
+  //               and calls StudioTestService:EndTest()
+  // get_playtest_output: reads the bridge's buffered log entries that the
+  //               companion streamed up during the test
   // ============================================
 
   async playSolo() {
-    const response = await this.client.request('/api/play-solo', {});
+    // If a session is still marked active (e.g. previous test was force-
+    // killed by the user clicking Stop without us hearing about it, or a
+    // restart was requested), signal stop and wait briefly so the new run
+    // doesn't race the old companion.
+    if (this.bridge.testSession?.status === 'active') {
+      this.bridge.enqueueTestCommand({ cmd: 'end', args: 'MCP_Restart' });
+      await this.bridge.waitForTestEnd(3000);
+    }
+
+    const sessionId = this.bridge.startTestSession();
+    let response: any;
+    try {
+      response = await this.client.request('/api/play-solo', { sessionId });
+    } catch (err) {
+      // The plugin failed to acknowledge — drop our session so we don't
+      // leave it dangling.
+      this.bridge.endTestSession(sessionId, 'plugin_request_failed');
+      throw err;
+    }
+
     return {
       content: [
         {
           type: 'text',
-          text: JSON.stringify(response, null, 2)
-        }
-      ]
+          text: JSON.stringify({
+            ...response,
+            sessionId,
+            note: 'Use get_playtest_output to read logs; stop_play to end.',
+          }, null, 2),
+        },
+      ],
     };
   }
 
   async stopPlay() {
-    const response = await this.client.request('/api/stop-play', {});
-    return {
-      content: [
-        {
+    const session = this.bridge.testSession;
+    if (!session) {
+      return {
+        content: [{
           type: 'text',
-          text: JSON.stringify(response, null, 2)
-        }
-      ]
+          text: JSON.stringify({
+            success: true,
+            alreadyEnded: true,
+            message: 'No play test session is tracked. Nothing to stop.',
+          }, null, 2),
+        }],
+      };
+    }
+    if (session.status === 'ended') {
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            success: true,
+            alreadyEnded: true,
+            sessionId: session.sessionId,
+            endReason: session.endReason,
+            message: `Play test already ended (${session.endReason}).`,
+          }, null, 2),
+        }],
+      };
+    }
+
+    const queued = this.bridge.enqueueTestCommand({ cmd: 'end', args: 'MCP_Stop' });
+    if (!queued) {
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            success: false,
+            error: 'Failed to enqueue stop command (no active session).',
+          }, null, 2),
+        }],
+      };
+    }
+
+    // Companion polls every ~400ms; allow a generous window for HTTP RTT
+    // and EndTest to actually complete. We also accept the case where the
+    // user's companion is dead (HTTP disabled, etc.) — return a clear
+    // signaled-but-unconfirmed state so the AI can fall back to telling
+    // the user to click Stop manually.
+    const ended = await this.bridge.waitForTestEnd(8000);
+    const after = this.bridge.testSession;
+
+    return {
+      content: [{
+        type: 'text',
+        text: JSON.stringify({
+          success: true,
+          confirmed: ended,
+          sessionId: session.sessionId,
+          status: after?.status ?? 'unknown',
+          endReason: after?.endReason ?? null,
+          message: ended
+            ? 'Play test stopped via StudioTestService:EndTest().'
+            : 'Stop signal sent but the in-test companion did not confirm within 8s. The test may still end shortly, or the companion may not be reachable (e.g. HTTP disabled in test). If the test is still running, click Stop in Studio.',
+        }, null, 2),
+      }],
+    };
+  }
+
+  /**
+   * Read output captured during the most recent play test session. Output
+   * is collected by the companion Script via LogService.MessageOut while
+   * the test is running, and remains queryable after the session ends.
+   *
+   * Use the `since` cursor (returned as `nextSinceSeq`) to incrementally
+   * tail logs without re-reading what you've already seen.
+   */
+  async getPlaytestOutput(sinceSeq?: number, limit?: number, messageTypes?: string[]) {
+    const result = this.bridge.getTestOutput({
+      sinceSeq,
+      limit,
+      messageTypes,
+    });
+    return {
+      content: [{
+        type: 'text',
+        text: JSON.stringify(result, null, 2),
+      }],
     };
   }
 

@@ -219,11 +219,19 @@ local function injectTestCompanion(serverUrl, sessionId)
 	local script = Instance.new("Script")
 	script.Name = TEST_COMPANION_NAME
 	script.Source = source
-	-- Archivable=false so a stray companion never gets saved into the user's
-	-- place file even if cleanup somehow misses it. The play-test mechanism
-	-- still includes it in the test DataModel because it duplicates the live
-	-- in-memory tree (not the saved file).
-	script.Archivable = false
+	-- IMPORTANT: Archivable MUST stay true (the default).
+	-- ExecutePlayModeAsync builds the test DataModel by Clone()-ing the Edit
+	-- DataModel, and Instance:Clone() silently returns nil for any instance
+	-- with Archivable=false. We previously set this to false as a "safety"
+	-- against the companion getting saved into the user's place file — but
+	-- the side effect was that the companion never made it into the test
+	-- session at all. No companion → no log streaming and no way to receive
+	-- the "end" command, so stop_play would just time out.
+	--
+	-- We rely on the cleanup sweeps (on plugin activate, before each test,
+	-- after each test) to keep companions out of the saved file. The script
+	-- is also tagged with TEST_COMPANION_TAG so any orphan is easy to find.
+	script.Archivable = true
 	script.Parent = game:GetService("ServerScriptService")
 
 	pcall(function()
@@ -4560,6 +4568,34 @@ handlers.playSolo = function(requestData)
 		return {
 			success = false,
 			error = "StudioTestService unavailable in this Studio version. Update Roblox Studio to use playtest features.",
+		}
+	end
+
+	-- HttpService.HttpEnabled preflight.
+	--
+	-- Plugins (this script) bypass HttpEnabled, but in-game scripts — and
+	-- that includes our injected companion running inside the test
+	-- DataModel — do not. Without HttpEnabled the companion can't reach
+	-- the bridge to stream logs or receive the "end" command, so stop_play
+	-- silently times out from the AI's perspective.
+	--
+	-- We can't fix this for the user: HttpEnabled is gated by
+	-- LocalUserSecurity, which means a plugin literally cannot flip it
+	-- from code. Best we can do is fail fast with an actionable error so
+	-- the AI/user knows exactly what to toggle.
+	local httpEnabledOk, httpEnabled = pcall(function()
+		return HttpService.HttpEnabled
+	end)
+	if httpEnabledOk and httpEnabled == false then
+		return {
+			success = false,
+			error = "HttpService.HttpEnabled is false. The injected test-session companion runs as an in-game script and needs HTTP access to stream logs and receive the stop command. Enable it in Studio: Game Settings → Security → Allow HTTP Requests (or Home → Game Settings → Security). A plugin cannot toggle this setting itself (LocalUserSecurity).",
+			fixSteps = {
+				"Open Game Settings (Home tab → Game Settings, or File → Game Settings)",
+				"Go to the Security section",
+				"Toggle 'Allow HTTP Requests' ON",
+				"Click Save, then call play_solo again",
+			},
 		}
 	end
 

@@ -4847,8 +4847,11 @@ handlers.captureScreenshot = function(requestData)
 		local sx = targetWidth / originalSize.X
 		local sy = targetHeight / originalSize.Y
 		local drawOk, drawErr = pcall(function()
+			-- DrawImageTransformed maps the SOURCE's PivotPoint (default = source
+			-- center) to the destination's `position`. Center-place the scaled
+			-- source so it fills the destination.
 			resizedImage:DrawImageTransformed(
-				Vector2.new(0, 0),
+				Vector2.new(targetWidth / 2, targetHeight / 2),
 				Vector2.new(sx, sy),
 				0,
 				editableImage,

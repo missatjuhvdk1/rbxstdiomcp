@@ -58,3 +58,6 @@ forum-title.txt
 
 # Local reference docs (sparse-cloned creator-docs for development)
 .refdocs/
+
+# npm credentials
+.npmrc

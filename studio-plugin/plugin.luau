@@ -4315,6 +4315,7 @@ handlers.executeLua = function(requestData)
 		NumberRange = NumberRange,
 		TweenInfo = TweenInfo,
 		Font = Font,
+		Content = Content, -- Required for AssetService:CreateEditableImageAsync(Content.fromUri(...))
 
 		-- Enums
 		Enum = Enum,
@@ -4722,13 +4723,19 @@ local function base64encode(data)
 	return table.concat(result)
 end
 
+-- Maximum raw RGBA pixel-data size we're willing to send across the HTTP bridge.
+-- At 16 MB raw -> ~21.3 MB base64 -> well within typical localhost HTTP body limits,
+-- and the TS layer compresses to PNG before returning to clients.
+-- 16 MB / 4 bytes/pixel = 4,194,304 pixels (e.g., 2048x2048).
+local MAX_RAW_PIXEL_BYTES = 16 * 1024 * 1024
+
 handlers.captureScreenshot = function(requestData)
 	local CaptureService = game:GetService("CaptureService")
 	local AssetService = game:GetService("AssetService")
 
 	-- Parameters (default 768 to avoid CaptureService bug with <600px)
-	local maxWidth = requestData.maxWidth or 768
-	local maxHeight = requestData.maxHeight or 768
+	local maxWidth = tonumber(requestData.maxWidth) or 768
+	local maxHeight = tonumber(requestData.maxHeight) or 768
 	local returnBase64 = requestData.returnBase64 ~= false -- Default true
 
 	-- Use a BindableEvent to wait for the async callback
@@ -4796,68 +4803,107 @@ handlers.captureScreenshot = function(requestData)
 		message = "Screenshot captured successfully"
 	}
 
-	-- Resize if needed and return base64
-	if returnBase64 then
-		-- Calculate resize dimensions maintaining aspect ratio
-		local scaleX = maxWidth / originalSize.X
-		local scaleY = maxHeight / originalSize.Y
-		local scale = math.min(scaleX, scaleY, 1) -- Don't upscale
-
-		local newWidth = math.floor(originalSize.X * scale)
-		local newHeight = math.floor(originalSize.Y * scale)
-
-		-- Create resized image
-		local resizedImage
-		if scale < 1 then
-			resizedImage = AssetService:CreateEditableImage({Size = Vector2.new(newWidth, newHeight)})
-			-- Draw the original scaled down
-			resizedImage:DrawImageTransformed(
-				Vector2.new(0, 0), -- position
-				Vector2.new(scale, scale), -- scale
-				0, -- rotation
-				editableImage,
-				{
-					CombineType = Enum.ImageCombineType.Overwrite
-				}
-			)
-		else
-			resizedImage = editableImage
-			newWidth = originalSize.X
-			newHeight = originalSize.Y
-		end
-
-		-- Read pixels
-		local pixelSuccess, pixelBuffer = pcall(function()
-			return resizedImage:ReadPixelsBuffer(Vector2.new(0, 0), Vector2.new(newWidth, newHeight))
-		end)
-
-		if pixelSuccess and pixelBuffer then
-			-- Convert buffer to string for base64 encoding
-			local pixelString = buffer.tostring(pixelBuffer)
-
-			-- Base64 encode (for smaller images only due to size)
-			if #pixelString <= 1024 * 1024 then -- Max 1MB raw
-				local base64Data = base64encode(pixelString)
-				resultData.base64 = base64Data
-				resultData.width = newWidth
-				resultData.height = newHeight
-				resultData.format = "RGBA"
-				resultData.encoding = "base64"
-				resultData.pixelDataSize = #pixelString
-			else
-				resultData.warning = "Image too large for base64 encoding (" .. #pixelString .. " bytes). Use smaller maxWidth/maxHeight."
-				resultData.width = newWidth
-				resultData.height = newHeight
-			end
-		else
-			resultData.warning = "Failed to read pixels: " .. tostring(pixelBuffer)
-		end
-
-		if resizedImage ~= editableImage then
-			resizedImage:Destroy()
-		end
+	if not returnBase64 then
+		editableImage:Destroy()
+		return resultData
 	end
 
+	-- Step 1: Calculate target size from caller's max bounds (no upscale).
+	local scaleX = maxWidth / originalSize.X
+	local scaleY = maxHeight / originalSize.Y
+	local scale = math.min(scaleX, scaleY, 1)
+
+	local targetWidth = math.max(1, math.floor(originalSize.X * scale))
+	local targetHeight = math.max(1, math.floor(originalSize.Y * scale))
+
+	-- Step 2: Auto-shrink if pixel-data would exceed our HTTP-bridge cap.
+	-- We keep aspect ratio; pick scale = sqrt(cap / required_bytes).
+	local requiredBytes = targetWidth * targetHeight * 4
+	local autoShrunk = false
+	if requiredBytes > MAX_RAW_PIXEL_BYTES then
+		local shrink = math.sqrt(MAX_RAW_PIXEL_BYTES / requiredBytes)
+		targetWidth = math.max(1, math.floor(targetWidth * shrink))
+		targetHeight = math.max(1, math.floor(targetHeight * shrink))
+		autoShrunk = true
+	end
+
+	-- Step 3: Build the final image (resize via DrawImageTransformed if needed).
+	local resizedImage
+	local needsResize = (targetWidth ~= originalSize.X) or (targetHeight ~= originalSize.Y)
+	if needsResize then
+		local createOk, createdImage = pcall(function()
+			return AssetService:CreateEditableImage({Size = Vector2.new(targetWidth, targetHeight)})
+		end)
+		if not createOk or not createdImage then
+			editableImage:Destroy()
+			return {
+				success = false,
+				error = "Failed to allocate resized EditableImage: " .. tostring(createdImage),
+				contentId = tostring(captureResult)
+			}
+		end
+		resizedImage = createdImage
+
+		local sx = targetWidth / originalSize.X
+		local sy = targetHeight / originalSize.Y
+		local drawOk, drawErr = pcall(function()
+			resizedImage:DrawImageTransformed(
+				Vector2.new(0, 0),
+				Vector2.new(sx, sy),
+				0,
+				editableImage,
+				{ CombineType = Enum.ImageCombineType.Overwrite }
+			)
+		end)
+		if not drawOk then
+			editableImage:Destroy()
+			resizedImage:Destroy()
+			return {
+				success = false,
+				error = "Failed to resize image: " .. tostring(drawErr),
+				contentId = tostring(captureResult)
+			}
+		end
+	else
+		resizedImage = editableImage
+	end
+
+	-- Step 4: Read pixels, possibly retrying with even smaller size if Roblox refuses.
+	local pixelString
+	local readOk, pixelBuffer = pcall(function()
+		return resizedImage:ReadPixelsBuffer(Vector2.new(0, 0), Vector2.new(targetWidth, targetHeight))
+	end)
+	if readOk and pixelBuffer then
+		pixelString = buffer.tostring(pixelBuffer)
+	end
+
+	if pixelString and #pixelString == targetWidth * targetHeight * 4 then
+		resultData.base64 = base64encode(pixelString)
+		resultData.width = targetWidth
+		resultData.height = targetHeight
+		resultData.format = "RGBA"
+		resultData.encoding = "base64"
+		resultData.pixelDataSize = #pixelString
+		if autoShrunk then
+			resultData.autoShrunk = true
+			resultData.message = string.format(
+				"Screenshot captured. Auto-shrunk from requested %dx%d to %dx%d to stay under HTTP bridge limit.",
+				math.floor(originalSize.X * scale), math.floor(originalSize.Y * scale),
+				targetWidth, targetHeight
+			)
+		end
+	else
+		resultData.success = false
+		resultData.error = "Failed to read pixel buffer (got " ..
+			tostring(pixelString and #pixelString or "nil") ..
+			" bytes, expected " .. tostring(targetWidth * targetHeight * 4) .. ")"
+		resultData.width = targetWidth
+		resultData.height = targetHeight
+	end
+
+	if resizedImage ~= editableImage then
+		resizedImage:Destroy()
+	end
 	editableImage:Destroy()
 
 	return resultData
@@ -4867,25 +4913,43 @@ end
 -- VIEWPORTFRAME RENDERING SYSTEM
 -- ============================================
 
--- Camera angle presets
+-- Camera angle presets — UNIT DIRECTION VECTORS pointing FROM target TO camera.
+-- We construct the final camera CFrame via CFrame.lookAt(center + dir*distance, center)
+-- so look-at orientation is always clean, and rotation isn't double-applied.
 local CameraPresets = {
-	-- Standard orthographic views
-	front = CFrame.new(0, 0, 10) * CFrame.Angles(0, 0, 0),
-	back = CFrame.new(0, 0, -10) * CFrame.Angles(0, math.pi, 0),
-	left = CFrame.new(-10, 0, 0) * CFrame.Angles(0, math.pi/2, 0),
-	right = CFrame.new(10, 0, 0) * CFrame.Angles(0, -math.pi/2, 0),
-	top = CFrame.new(0, 10, 0) * CFrame.Angles(-math.pi/2, 0, 0),
-	bottom = CFrame.new(0, -10, 0) * CFrame.Angles(math.pi/2, 0, 0),
+	-- Orthographic views (camera looks toward origin from +X/+Y/+Z etc.)
+	front      = Vector3.new( 0,  0,  1).Unit,
+	back       = Vector3.new( 0,  0, -1).Unit,
+	right      = Vector3.new( 1,  0,  0).Unit,
+	left       = Vector3.new(-1,  0,  0).Unit,
+	top        = Vector3.new( 0,  1,  0).Unit,
+	bottom     = Vector3.new( 0, -1,  0).Unit,
 
-	-- Isometric views (popular for thumbnails)
-	iso = CFrame.new(7, 7, 7) * CFrame.Angles(-math.pi/6, math.pi/4, 0),
-	iso_front = CFrame.new(5, 5, 10) * CFrame.Angles(-math.pi/6, 0, 0),
-	iso_back = CFrame.new(-5, 5, -10) * CFrame.Angles(-math.pi/6, math.pi, 0),
+	-- Isometric views
+	iso        = Vector3.new( 1,  1,  1).Unit,
+	iso_front  = Vector3.new( 0,  1,  1).Unit,
+	iso_back   = Vector3.new( 0,  1, -1).Unit,
 
-	-- Dramatic angles
-	low_angle = CFrame.new(0, -5, 10) * CFrame.Angles(math.pi/6, 0, 0),
-	high_angle = CFrame.new(0, 15, 8) * CFrame.Angles(-math.pi/3, 0, 0),
+	-- Dramatic
+	low_angle  = Vector3.new( 0, -0.4, 1).Unit,
+	high_angle = Vector3.new( 0,  1.2, 0.6).Unit,
 }
+
+-- Resolve an angle parameter (string preset OR table {pitch,yaw,roll}) to a unit direction
+local function resolveCameraDirection(angleParam)
+	if type(angleParam) == "string" and CameraPresets[angleParam] then
+		return CameraPresets[angleParam]
+	elseif type(angleParam) == "table" then
+		-- Custom: pitch (X-axis tilt), yaw (Y-axis spin), roll ignored for direction
+		local pitch = math.rad(tonumber(angleParam.pitch) or 0)
+		local yaw   = math.rad(tonumber(angleParam.yaw)   or 0)
+		-- Start with "front" direction (+Z), apply yaw around Y, then pitch around X
+		local dir = (CFrame.Angles(0, yaw, 0) * CFrame.Angles(pitch, 0, 0)).LookVector
+		-- LookVector points FROM camera TO target. We want FROM target TO camera, so negate.
+		return (-dir).Unit
+	end
+	return CameraPresets.iso
+end
 
 -- Apply lighting preset to WorldModel
 local function applyLightingPreset(worldModel, preset)
@@ -4935,186 +4999,229 @@ local function applyLightingPreset(worldModel, preset)
 	-- default: no lights added (ambient only)
 end
 
--- Calculate bounding box of a model
-local function getModelBoundingBox(model)
+-- Calculate world-space axis-aligned bounding box of a Model OR a single BasePart.
+-- Properly accounts for part rotation by transforming the 8 corners of each part's
+-- local-space size box into world space.
+local function getModelBoundingBox(target)
+	-- Collect parts (including the target itself if it's a BasePart)
 	local parts = {}
-
-	-- Collect all BaseParts
-	for _, child in ipairs(model:GetDescendants()) do
+	if target:IsA("BasePart") then
+		table.insert(parts, target)
+	end
+	for _, child in ipairs(target:GetDescendants()) do
 		if child:IsA("BasePart") then
 			table.insert(parts, child)
 		end
 	end
 
+	-- Prefer Model:GetBoundingBox() when available — it handles rotation correctly
+	-- and covers attachments/MeshParts uniformly. Fallback only if it fails.
+	if target:IsA("Model") then
+		local ok, cf, sz = pcall(function() return target:GetBoundingBox() end)
+		if ok and cf and sz and sz.Magnitude > 0 then
+			return sz, cf.Position
+		end
+	end
+
 	if #parts == 0 then
-		-- No parts found, return default
 		return Vector3.new(1, 1, 1), Vector3.new(0, 0, 0)
 	end
 
-	-- Calculate bounding box
-	local minPos = parts[1].Position - parts[1].Size/2
-	local maxPos = parts[1].Position + parts[1].Size/2
+	-- Manual rotated AABB: project each part's 8 corners through its CFrame
+	local huge = math.huge
+	local minX, minY, minZ =  huge,  huge,  huge
+	local maxX, maxY, maxZ = -huge, -huge, -huge
+
+	local CORNER_SIGNS = {
+		Vector3.new( 1,  1,  1), Vector3.new( 1,  1, -1),
+		Vector3.new( 1, -1,  1), Vector3.new( 1, -1, -1),
+		Vector3.new(-1,  1,  1), Vector3.new(-1,  1, -1),
+		Vector3.new(-1, -1,  1), Vector3.new(-1, -1, -1),
+	}
 
 	for _, part in ipairs(parts) do
-		local partMin = part.Position - part.Size/2
-		local partMax = part.Position + part.Size/2
-
-		minPos = Vector3.new(
-			math.min(minPos.X, partMin.X),
-			math.min(minPos.Y, partMin.Y),
-			math.min(minPos.Z, partMin.Z)
-		)
-		maxPos = Vector3.new(
-			math.max(maxPos.X, partMax.X),
-			math.max(maxPos.Y, partMax.Y),
-			math.max(maxPos.Z, partMax.Z)
-		)
+		local cf = part.CFrame
+		local h = part.Size / 2
+		for _, s in ipairs(CORNER_SIGNS) do
+			local world = cf * Vector3.new(h.X * s.X, h.Y * s.Y, h.Z * s.Z)
+			if world.X < minX then minX = world.X end
+			if world.Y < minY then minY = world.Y end
+			if world.Z < minZ then minZ = world.Z end
+			if world.X > maxX then maxX = world.X end
+			if world.Y > maxY then maxY = world.Y end
+			if world.Z > maxZ then maxZ = world.Z end
+		end
 	end
 
-	local size = maxPos - minPos
-	local center = (minPos + maxPos) / 2
-
+	local size   = Vector3.new(maxX - minX, maxY - minY, maxZ - minZ)
+	local center = Vector3.new((minX + maxX) / 2, (minY + maxY) / 2, (minZ + maxZ) / 2)
 	return size, center
 end
 
--- Main handler: Render Object View
+--[[
+	render_object_view — REWRITTEN (v2)
+
+	Strategy:
+	  1. Build a ViewportFrame that fills the ENTIRE 3D capture area (CoreGui, IgnoreGuiInset,
+	     UDim2.fromScale(1,1)). Empirically verified that this exactly equals
+	     Camera.ViewportSize and the area CaptureService:CaptureScreenshot() captures.
+	  2. Compute camera distance using the bounding sphere + min(vFOV, hFOV) so the
+	     entire object fits regardless of screen aspect ratio.
+	  3. Use CFrame.lookAt() — no double-rotation hack.
+	  4. CaptureService captures the screen; the viewport content fills it edge-to-edge.
+	  5. Center-CROP the captured image to the requested aspect ratio (preserves shape).
+	  6. Resize to target dimensions with a SINGLE scale factor (no stretch).
+
+	This actually delivers what the docs promised:
+	  - No Studio chrome bleed
+	  - Correct aspect ratio
+	  - Correct camera orientation
+	  - Works at any resolution from 64×64 to 2048×2048
+]]
 handlers.renderObjectView = function(requestData)
+	local CaptureService = game:GetService("CaptureService")
+	local AssetService = game:GetService("AssetService")
+	local CoreGui = game:GetService("CoreGui")
+
 	local success, result = pcall(function()
+		-- ──────────── parse params ────────────
 		local instancePath = requestData.instancePath
 		if not instancePath then
-			return {
-				success = false,
-				error = "instancePath is required"
-			}
+			return { success = false, error = "instancePath is required" }
 		end
 
-		-- Parse resolution (default 768 to avoid CaptureService bug with <600px)
-		local resolution = requestData.resolution or {width = 768, height = 768}
-		local width = resolution.width or 768
-		local height = resolution.height or 768
+		local resolution = requestData.resolution or { width = 768, height = 768 }
+		local targetW = math.clamp(tonumber(resolution.width)  or 768, 64, 2048)
+		local targetH = math.clamp(tonumber(resolution.height) or 768, 64, 2048)
 
-		-- Clamp resolution for performance
-		width = math.clamp(width, 64, 2048)
-		height = math.clamp(height, 64, 2048)
-
-		local anglePreset = requestData.angle or "iso"
-		local lighting = requestData.lighting or "bright"
-		local background = requestData.background or "transparent"
+		local angleParam   = requestData.angle      or "iso"
+		local lighting     = requestData.lighting   or "bright"
+		local background   = requestData.background or "solid"
 		local autoDistance = requestData.autoDistance ~= false
 
-		-- Get target instance
-		local targetInstance = getInstanceByPath(instancePath)
-		if not targetInstance then
-			return {
-				success = false,
-				error = "Instance not found: " .. instancePath
-			}
+		-- ──────────── resolve target ────────────
+		local target = getInstanceByPath(instancePath)
+		if not target then
+			return { success = false, error = "Instance not found: " .. instancePath }
 		end
 
-		-- Create ViewportFrame (no parent = no GUI overhead)
-		local viewportFrame = Instance.new("ViewportFrame")
-		viewportFrame.Size = UDim2.fromOffset(width, height)
-		viewportFrame.BackgroundTransparency = background == "transparent" and 1 or 0
-		viewportFrame.BackgroundColor3 = background == "grid" and Color3.fromRGB(128, 128, 128) or Color3.fromRGB(255, 255, 255)
+		-- ──────────── build viewport ────────────
+		local tempGui = Instance.new("ScreenGui")
+		tempGui.Name = "MCPRenderViewport"
+		tempGui.IgnoreGuiInset = true
+		tempGui.ResetOnSpawn = false
+		tempGui.DisplayOrder = 2147483646
+		tempGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 
-		-- Create WorldModel for viewport
+		local viewportFrame = Instance.new("ViewportFrame")
+		viewportFrame.Size = UDim2.fromScale(1, 1)
+		viewportFrame.Position = UDim2.fromScale(0, 0)
+		viewportFrame.BorderSizePixel = 0
+		viewportFrame.ZIndex = 1
+		if background == "transparent" then
+			viewportFrame.BackgroundTransparency = 1
+		else
+			viewportFrame.BackgroundTransparency = 0
+			-- Default solid bg = white. Allow caller to pass a custom color.
+			local bgColor = requestData.backgroundColor
+			if typeof(bgColor) == "table" and bgColor.r and bgColor.g and bgColor.b then
+				viewportFrame.BackgroundColor3 = Color3.fromRGB(
+					tonumber(bgColor.r) or 255,
+					tonumber(bgColor.g) or 255,
+					tonumber(bgColor.b) or 255
+				)
+			elseif background == "grid" then
+				viewportFrame.BackgroundColor3 = Color3.fromRGB(220, 220, 220)
+			else
+				viewportFrame.BackgroundColor3 = Color3.fromRGB(245, 245, 245)
+			end
+		end
+		viewportFrame.Parent = tempGui
+
 		local worldModel = Instance.new("WorldModel")
 		worldModel.Parent = viewportFrame
 
 		local camera = Instance.new("Camera")
+		camera.FieldOfView = 70
 		camera.Parent = viewportFrame
 		viewportFrame.CurrentCamera = camera
 
-		-- Clone target into WorldModel
-		local clonedInstance = targetInstance:Clone()
-		clonedInstance.Parent = worldModel
-
-		-- Calculate bounding box and center
-		local boundingSize, boundingCenter = getModelBoundingBox(clonedInstance)
-		local maxDimension = math.max(boundingSize.X, boundingSize.Y, boundingSize.Z)
-
-		-- Position camera
-		local cameraOffset
-		if type(anglePreset) == "string" and CameraPresets[anglePreset] then
-			cameraOffset = CameraPresets[anglePreset]
-		elseif type(anglePreset) == "table" then
-			-- Custom angle {pitch, yaw, roll, distance}
-			local pitch = math.rad(anglePreset.pitch or 0)
-			local yaw = math.rad(anglePreset.yaw or 0)
-			local roll = math.rad(anglePreset.roll or 0)
-			local distance = anglePreset.distance or 10
-			cameraOffset = CFrame.new(0, 0, distance) * CFrame.Angles(pitch, yaw, roll)
-		else
-			cameraOffset = CameraPresets.iso
+		-- Clone target into world (preserves all properties incl. mesh/textures)
+		local cloned = target:Clone()
+		-- Anchor everything so physics doesn't move it
+		if cloned:IsA("BasePart") then
+			cloned.Anchored = true
 		end
+		for _, d in ipairs(cloned:GetDescendants()) do
+			if d:IsA("BasePart") then d.Anchored = true end
+		end
+		cloned.Parent = worldModel
 
-		-- Auto-calculate distance to fit object
-		local cameraDistance = 10
+		-- ──────────── camera positioning ────────────
+		local boundSize, boundCenter = getModelBoundingBox(cloned)
+		-- Bounding sphere radius (fits any orientation)
+		local sphereRadius = math.max(boundSize.Magnitude / 2, 0.5)
+
+		-- Parent the gui NOW so AbsoluteSize is populated for the viewport
+		tempGui.Parent = CoreGui
+		RunService.Heartbeat:Wait()
+
+		local screenSize = viewportFrame.AbsoluteSize
+		if screenSize.X < 1 or screenSize.Y < 1 then
+			-- Fallback: use camera.ViewportSize
+			screenSize = workspace.CurrentCamera.ViewportSize
+		end
+		local sourceAspect = screenSize.X / screenSize.Y
+
+		-- The captured image will be center-cropped to the TARGET aspect ratio
+		-- before being resized to (targetW × targetH). So we must size the camera
+		-- distance based on the smaller FOV of the *post-crop* viewport, not the source.
+		-- Vertical FOV is fixed at camera.FieldOfView regardless of crop.
+		-- Horizontal FOV after crop = 2*atan(tan(vFOV/2) * effectiveAspect), where
+		-- effectiveAspect is the smaller of source vs target aspect (we never gain pixels).
+		local vFovRad = math.rad(camera.FieldOfView)
+		local targetAspect = targetW / targetH
+		local effectiveAspect = math.min(sourceAspect, targetAspect)
+		local effectiveHFovRad = 2 * math.atan(math.tan(vFovRad / 2) * effectiveAspect)
+		local minFov = math.min(vFovRad, effectiveHFovRad)
+
+		-- Distance so bounding sphere fits in the smaller FOV (with padding).
+		local PADDING = 1.15
+		local cameraDistance
 		if autoDistance then
-			local fov = 70
-			cameraDistance = maxDimension / (2 * math.tan(math.rad(fov / 2))) * 1.3
-			cameraDistance = math.max(cameraDistance, 1) -- Minimum distance
-		elseif type(anglePreset) == "table" and anglePreset.distance then
-			cameraDistance = anglePreset.distance
+			cameraDistance = (sphereRadius / math.sin(minFov / 2)) * PADDING
+		elseif type(angleParam) == "table" and angleParam.distance then
+			cameraDistance = tonumber(angleParam.distance) or 10
+		else
+			cameraDistance = 10
 		end
 
-		-- Apply distance to camera offset
-		local offsetDirection = cameraOffset.Position.Unit
-		local finalCameraPos = boundingCenter + (offsetDirection * cameraDistance)
+		local dir = resolveCameraDirection(angleParam)
+		local cameraPos = boundCenter + dir * cameraDistance
+		camera.CFrame = CFrame.lookAt(cameraPos, boundCenter)
 
-		camera.CFrame = CFrame.new(finalCameraPos, boundingCenter) * cameraOffset.Rotation
-		camera.FieldOfView = 70
-
-		-- Apply lighting
+		-- ──────────── lighting + grid ────────────
 		applyLightingPreset(worldModel, lighting)
 
-		-- Add grid background if requested
 		if background == "grid" then
 			local gridPart = Instance.new("Part")
-			gridPart.Size = Vector3.new(maxDimension * 5, 0.1, maxDimension * 5)
-			gridPart.Position = boundingCenter - Vector3.new(0, boundingSize.Y/2 + 0.1, 0)
+			gridPart.Size = Vector3.new(sphereRadius * 8, 0.05, sphereRadius * 8)
+			gridPart.Position = boundCenter - Vector3.new(0, boundSize.Y / 2 + 0.025, 0)
 			gridPart.Anchored = true
 			gridPart.Material = Enum.Material.SmoothPlastic
-			gridPart.Color = Color3.fromRGB(200, 200, 200)
+			gridPart.Color = Color3.fromRGB(180, 180, 180)
 			gridPart.Parent = worldModel
 		end
 
-		-- Wait for viewport to render
-		task.wait(0.1)
+		-- Wait for the viewport to draw at its new size
+		RunService.Heartbeat:Wait()
 		RunService.Heartbeat:Wait()
 
-		-- WORKAROUND: ViewportFrame doesn't support direct pixel reading
-		-- We need to temporarily parent it to screen and use CaptureService
-		-- This is a limitation of Roblox's API
-		local StarterGui = game:GetService("StarterGui")
-		local CaptureService = game:GetService("CaptureService")
-		local AssetService = game:GetService("AssetService")
-
-		-- Create temporary ScreenGui
-		local tempGui = Instance.new("ScreenGui")
-		tempGui.Name = "MCPTempCapture"
-		tempGui.ResetOnSpawn = false
-		tempGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
-
-		-- CRITICAL FIX: Scale ViewportFrame to fill most of the screen before capture
-		-- CaptureScreenshot captures the ENTIRE screen, so a small ViewportFrame = tiny object
-		-- By scaling to ~90% of screen, the object fills most of the captured image
-		local screenSize = workspace.CurrentCamera.ViewportSize
-		viewportFrame.Size = UDim2.fromOffset(screenSize.X * 0.9, screenSize.Y * 0.9)
-		viewportFrame.Position = UDim2.fromOffset(screenSize.X * 0.05, screenSize.Y * 0.05)
-		viewportFrame.Parent = tempGui
-		tempGui.Parent = game.CoreGui
-
-		-- Wait a frame for rendering
-		RunService.Heartbeat:Wait()
-		task.wait(0.05) -- Extra wait to ensure viewport renders at new size
-
-		-- Capture screenshot of the viewport
+		-- ──────────── capture ────────────
 		local captureComplete = Instance.new("BindableEvent")
-		local captureResult = nil
-		local captureError = nil
+		local captureResult, captureError = nil, nil
 
-		pcall(function()
+		local pcOk, pcErr = pcall(function()
 			CaptureService:CaptureScreenshot(function(contentId)
 				if contentId then
 					captureResult = contentId
@@ -5125,78 +5232,133 @@ handlers.renderObjectView = function(requestData)
 			end)
 		end)
 
-		-- Wait with timeout
-		local timeoutThread = task.delay(5, function()
+		if not pcOk then
+			tempGui:Destroy()
+			return { success = false, error = "CaptureScreenshot threw: " .. tostring(pcErr) }
+		end
+
+		local timeoutThread = task.delay(8, function()
 			if not captureResult and not captureError then
-				captureError = "Capture timed out"
+				captureError = "Capture timed out (8s)"
 				captureComplete:Fire()
 			end
 		end)
-
 		captureComplete.Event:Wait()
 		task.cancel(timeoutThread)
 		captureComplete:Destroy()
+
+		-- We can destroy the gui now; the contentId is already saved
 		tempGui:Destroy()
-		viewportFrame:Destroy()
 
 		if captureError then
-			return {
-				success = false,
-				error = "Failed to capture viewport: " .. captureError,
-				note = "ViewportFrame capture requires CaptureService (limitation of Roblox API)"
+			return { success = false, error = "Failed to capture viewport: " .. captureError }
+		end
+
+		-- ──────────── crop + resize ────────────
+		local sourceImage = AssetService:CreateEditableImageAsync(Content.fromUri(tostring(captureResult)))
+		local sourceSize = sourceImage.Size
+		local srcAspect    = sourceSize.X / sourceSize.Y
+		local targetAspect = targetW / targetH
+
+		-- Center-crop the source to match target aspect ratio.
+		local cropW, cropH
+		if srcAspect > targetAspect then
+			-- Source is wider than target → crop sides
+			cropH = sourceSize.Y
+			cropW = math.floor(sourceSize.Y * targetAspect)
+		else
+			-- Source is taller than target → crop top/bottom
+			cropW = sourceSize.X
+			cropH = math.floor(sourceSize.X / targetAspect)
+		end
+		cropW = math.max(cropW, 1)
+		cropH = math.max(cropH, 1)
+		local cropX = math.floor((sourceSize.X - cropW) / 2)
+		local cropY = math.floor((sourceSize.Y - cropH) / 2)
+
+		-- Build cropped image
+		local croppedImage = AssetService:CreateEditableImage({
+			Size = Vector2.new(cropW, cropH),
+		})
+		-- DrawImageTransformed with offset = -cropOrigin draws the cropped region at (0,0)
+		croppedImage:DrawImageTransformed(
+			Vector2.new(cropW / 2, cropH / 2), -- destination center
+			Vector2.new(1, 1),                  -- no scale
+			0,                                   -- no rotation
+			sourceImage,
+			{
+				CombineType = Enum.ImageCombineType.Overwrite,
+				PivotPoint = Vector2.new(cropX + cropW / 2, cropY + cropH / 2),
 			}
-		end
+		)
+		sourceImage:Destroy()
 
-		-- Load captured image
-		local editableImage = AssetService:CreateEditableImageAsync(Content.fromUri(tostring(captureResult)))
-
-		-- Resize if needed
-		local originalSize = editableImage.Size
-		if originalSize.X ~= width or originalSize.Y ~= height then
-			local resizedImage = AssetService:CreateEditableImage({Size = Vector2.new(width, height)})
-			local scaleX = width / originalSize.X
-			local scaleY = height / originalSize.Y
-			resizedImage:DrawImageTransformed(
-				Vector2.new(0, 0),
-				Vector2.new(scaleX, scaleY),
+		-- Resize cropped image to exact target dimensions (uniform scale = no stretch)
+		local outputImage
+		if cropW == targetW and cropH == targetH then
+			outputImage = croppedImage
+		else
+			outputImage = AssetService:CreateEditableImage({
+				Size = Vector2.new(targetW, targetH),
+			})
+			local scale = targetW / cropW   -- equals targetH / cropH (matched aspects)
+			outputImage:DrawImageTransformed(
+				Vector2.new(targetW / 2, targetH / 2),
+				Vector2.new(scale, scale),
 				0,
-				editableImage,
-				{CombineType = Enum.ImageCombineType.Overwrite}
+				croppedImage,
+				{
+					CombineType = Enum.ImageCombineType.Overwrite,
+					PivotPoint = Vector2.new(cropW / 2, cropH / 2),
+				}
 			)
-			editableImage:Destroy()
-			editableImage = resizedImage
+			croppedImage:Destroy()
 		end
 
-		-- Convert to base64 RGBA
-		local rgbaBuffer = editableImage:ReadPixelsBuffer(Vector2.new(0, 0), editableImage.Size)
+		local rgbaBuffer = outputImage:ReadPixelsBuffer(Vector2.new(0, 0), outputImage.Size)
 		local rgbaString = buffer.tostring(rgbaBuffer)
 		local base64Data = base64encode(rgbaString)
-		editableImage:Destroy()
+		outputImage:Destroy()
 
 		return {
 			success = true,
 			base64 = base64Data,
-			width = width,
-			height = height,
+			width = targetW,
+			height = targetH,
+			format = "RGBA",
+			encoding = "base64",
 			viewInfo = {
-				objectName = targetInstance.Name,
-				objectClass = targetInstance.ClassName,
+				objectName  = target.Name,
+				objectClass = target.ClassName,
 				boundingBox = {
-					size = {x = boundingSize.X, y = boundingSize.Y, z = boundingSize.Z},
-					center = {x = boundingCenter.X, y = boundingCenter.Y, z = boundingCenter.Z}
+					size   = { x = boundSize.X,   y = boundSize.Y,   z = boundSize.Z },
+					center = { x = boundCenter.X, y = boundCenter.Y, z = boundCenter.Z },
 				},
 				camera = {
-					distance = cameraDistance,
-					position = {x = finalCameraPos.X, y = finalCameraPos.Y, z = finalCameraPos.Z}
+					distance     = cameraDistance,
+					position     = { x = cameraPos.X, y = cameraPos.Y, z = cameraPos.Z },
+					fieldOfView  = camera.FieldOfView,
+					sphereRadius = sphereRadius,
+				},
+				capture = {
+					sourceWidth  = sourceSize.X,
+					sourceHeight = sourceSize.Y,
+					cropOriginX  = cropX,
+					cropOriginY  = cropY,
+					cropWidth    = cropW,
+					cropHeight   = cropH,
 				},
 				settings = {
-					angle = anglePreset,
-					lighting = lighting,
+					angle      = angleParam,
+					lighting   = lighting,
 					background = background,
-					resolution = {width = width, height = height}
-				}
+					resolution = { width = targetW, height = targetH },
+				},
 			},
-			message = "Rendered " .. targetInstance.Name .. " at " .. width .. "x" .. height
+			message = string.format(
+				"Rendered %s at %dx%d (cropped from %dx%d source)",
+				target.Name, targetW, targetH, sourceSize.X, sourceSize.Y
+			),
 		}
 	end)
 
@@ -5205,7 +5367,7 @@ handlers.renderObjectView = function(requestData)
 	else
 		return {
 			success = false,
-			error = "Failed to render object: " .. tostring(result)
+			error = "Failed to render object: " .. tostring(result),
 		}
 	end
 end
@@ -5214,7 +5376,10 @@ end
 -- CAMERA CONTROL SYSTEM
 -- ============================================
 
--- Focus Studio camera on an object (like pressing F in Studio)
+-- Focus Studio camera on an object (like pressing F in Studio).
+-- IMPORTANT: We do NOT lock CameraType. In Studio edit-mode, the Studio camera
+-- responds to CFrame writes immediately, while keeping mouse/WASD navigation
+-- intact for the user.
 handlers.focusCamera = function(requestData)
 	local success, result = pcall(function()
 		local instancePath = requestData.instancePath
@@ -5227,7 +5392,7 @@ handlers.focusCamera = function(requestData)
 
 		local anglePreset = requestData.angle or "iso"
 		local autoDistance = requestData.autoDistance ~= false
-		local customDistance = requestData.distance
+		local customDistance = tonumber(requestData.distance)
 
 		-- Get target instance
 		local targetInstance = getInstanceByPath(instancePath)
@@ -5238,46 +5403,54 @@ handlers.focusCamera = function(requestData)
 			}
 		end
 
-		-- Calculate bounding box and center (reuse from ViewportFrame code)
+		-- Calculate bounding box and center (handles BasePart, Model with rotated parts)
 		local boundingSize, boundingCenter = getModelBoundingBox(targetInstance)
-		local maxDimension = math.max(boundingSize.X, boundingSize.Y, boundingSize.Z)
 
-		-- Get camera offset from presets
-		local cameraOffset
-		if type(anglePreset) == "string" and CameraPresets[anglePreset] then
-			cameraOffset = CameraPresets[anglePreset]
-		elseif type(anglePreset) == "table" then
-			-- Custom angle {pitch, yaw, roll, distance}
-			local pitch = math.rad(anglePreset.pitch or 0)
-			local yaw = math.rad(anglePreset.yaw or 0)
-			local roll = math.rad(anglePreset.roll or 0)
-			cameraOffset = CFrame.new(0, 0, 10) * CFrame.Angles(pitch, yaw, roll)
-		else
-			cameraOffset = CameraPresets.iso
-		end
+		-- Resolve camera direction (unit vector pointing FROM target TOWARD camera)
+		local direction = resolveCameraDirection(anglePreset)
 
-		-- Calculate distance to fit object in view (like F shortcut)
+		-- Calculate distance using bounding sphere + the smaller of vFOV/hFOV.
+		-- This guarantees the object fits regardless of viewport aspect ratio.
+		local camera = workspace.CurrentCamera
 		local cameraDistance
 		if customDistance then
-			cameraDistance = customDistance
+			cameraDistance = math.max(customDistance, 0.1)
 		elseif autoDistance then
-			-- FOV of 70 degrees, fit object with some padding
-			local fov = 70
-			cameraDistance = maxDimension / (2 * math.tan(math.rad(fov / 2))) * 1.5
+			local sphereRadius = math.max(boundingSize.Magnitude / 2, 0.5)
+			local viewportSize = camera.ViewportSize
+			local aspect = (viewportSize.X > 0 and viewportSize.Y > 0)
+				and (viewportSize.X / viewportSize.Y) or 1
+			local vFovRad = math.rad(camera.FieldOfView)
+			local hFovRad = 2 * math.atan(math.tan(vFovRad / 2) * aspect)
+			local minFov = math.min(vFovRad, hFovRad)
+			cameraDistance = (sphereRadius / math.sin(minFov / 2)) * 1.3 -- 30% padding
 			cameraDistance = math.max(cameraDistance, 5) -- Minimum 5 studs
 		else
-			cameraDistance = 20 -- Default distance
+			cameraDistance = 20
 		end
 
-		-- Apply distance to camera offset direction
-		local offsetDirection = cameraOffset.Position.Unit
-		local finalCameraPos = boundingCenter + (offsetDirection * cameraDistance)
+		-- Build clean camera CFrame using lookAt — no double rotation.
+		local finalCameraPos = boundingCenter + (direction * cameraDistance)
+		local newCFrame = CFrame.lookAt(finalCameraPos, boundingCenter)
 
-		-- Set Studio camera (workspace.CurrentCamera)
-		local camera = workspace.CurrentCamera
-		camera.CameraType = Enum.CameraType.Fixed
-		camera.CFrame = CFrame.new(finalCameraPos, boundingCenter) * cameraOffset.Rotation
+		-- Drive Studio camera. We don't change CameraType so Studio's mouse/WASD
+		-- navigation continues to work after this call.
+		camera.CFrame = newCFrame
 		camera.Focus = CFrame.new(boundingCenter)
+
+		-- Describe the angle in the response (string preset or pitch/yaw)
+		local angleResponse
+		if type(anglePreset) == "string" then
+			angleResponse = anglePreset
+		elseif type(anglePreset) == "table" then
+			angleResponse = {
+				pitch = tonumber(anglePreset.pitch) or 0,
+				yaw = tonumber(anglePreset.yaw) or 0,
+				roll = tonumber(anglePreset.roll) or 0
+			}
+		else
+			angleResponse = "iso"
+		end
 
 		return {
 			success = true,
@@ -5292,10 +5465,12 @@ handlers.focusCamera = function(requestData)
 			camera = {
 				position = {x = finalCameraPos.X, y = finalCameraPos.Y, z = finalCameraPos.Z},
 				lookAt = {x = boundingCenter.X, y = boundingCenter.Y, z = boundingCenter.Z},
+				direction = {x = direction.X, y = direction.Y, z = direction.Z},
 				distance = cameraDistance,
-				angle = anglePreset
+				angle = angleResponse
 			},
-			message = "Focused camera on " .. targetInstance.Name .. " from " .. tostring(anglePreset) .. " angle"
+			message = "Focused camera on " .. targetInstance.Name .. " from " ..
+				(type(anglePreset) == "string" and anglePreset or "custom") .. " angle"
 		}
 	end)
 

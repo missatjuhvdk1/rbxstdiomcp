@@ -21,6 +21,7 @@
     "test": "jest",
     "test:watch": "jest --watch",
     "test:coverage": "jest --coverage",
+    "plugin:install": "node scripts/install-plugin.mjs",
     "prepublishOnly": "npm run build"
   },
   "keywords": [

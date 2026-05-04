@@ -18,16 +18,19 @@ export const docTools: ToolDef[] = [
   {
     name: 'search_roblox_docs',
     description:
-      "Search Roblox's official creator documentation (mirror of github.com/Roblox/creator-docs) for a pattern. Returns matching lines with file path, line number, and optional surrounding context. " +
+      "Search Roblox's official creator documentation (mirror of github.com/Roblox/creator-docs). " +
+      'Returns matching lines with file path, line number, and surrounding context. ' +
       'Use this FIRST when you need authoritative info on a Roblox API, behavior, or guide topic — especially for things AI models commonly get wrong (animation, Motor6D C0/C1, R6/R15 rigs, AlignOrientation, etc.). ' +
-      'On first use the tool downloads ~30MB of docs to a local cache (~5s). Subsequent calls hit the cache instantly and refresh from upstream at most once per 24h.',
+      '\n\n**Token-AND mode** (default for multi-word queries): the query is split on whitespace and every token must appear within `window_lines` (default 3) of the anchor line. So `"Motor6D C0"` finds any passage where Motor6D and C0 are mentioned together — even if the docs literally write `Motor6D.C0` or `Class.Motor6D.C0|C0`. This is what you almost always want; do NOT pre-mangle queries to match the docs\' exact punctuation. ' +
+      'Wrap a phrase in double quotes to force a literal match, e.g. `"Class.Motor6D.C0"` (one token). Single-token queries fall back to literal substring search. ' +
+      '\n\nOn first use the tool downloads ~30MB of docs to a local cache (~5s). Subsequent calls hit the cache instantly and refresh from upstream at most once per 24h.',
     inputSchema: {
       type: 'object',
       properties: {
         query: {
           type: 'string',
           description:
-            'Search pattern. Literal string by default; set use_regex=true to use a JS regex. Examples: "Motor6D", "C0", "AlignOrientation", "R15 character".',
+            'Search query. Multiple whitespace-separated words trigger token-AND mode (each token must appear within `window_lines` of the anchor). Use double quotes to force a phrase: `"Class.Motor6D"` is one token. Examples: "Motor6D C0", "AlignOrientation servo", "humanoid animation rig".',
         },
         scope: {
           type: 'string',
@@ -42,7 +45,8 @@ export const docTools: ToolDef[] = [
         },
         use_regex: {
           type: 'boolean',
-          description: 'Treat `query` as a JS regex. Default false (literal substring match).',
+          description:
+            'Treat `query` as a single JS regex. Disables token-AND mode. Default false.',
           default: false,
         },
         case_sensitive: {
@@ -52,8 +56,15 @@ export const docTools: ToolDef[] = [
         },
         context_lines: {
           type: 'number',
-          description: 'Lines of context before/after each hit (like grep -C). 0–5. Default 0.',
+          description:
+            'Lines of context before/after each hit (like grep -C). 0–10. Default 0 in literal mode; in token-AND mode the matched window is always emitted, and this widens it further if larger than `window_lines`.',
           default: 0,
+        },
+        window_lines: {
+          type: 'number',
+          description:
+            'Token-AND mode only: how close (in lines) the tokens must appear to count as a hit. 1–10. Default 3. Lower = stricter (tokens on adjacent lines), higher = looser (tokens anywhere in a paragraph).',
+          default: 3,
         },
         max_hits: {
           type: 'number',
@@ -72,6 +83,7 @@ export const docTools: ToolDef[] = [
           useRegex: args?.use_regex ?? false,
           caseSensitive: args?.case_sensitive ?? false,
           contextLines: args?.context_lines ?? 0,
+          windowLines: args?.window_lines ?? 3,
           maxHits: args?.max_hits ?? 200,
         },
       ),
@@ -101,7 +113,8 @@ export const docTools: ToolDef[] = [
     name: 'list_roblox_docs',
     description:
       'List directory contents within the cached Roblox docs tree (like `ls`). Use to discover what reference docs or guides exist before searching/reading. ' +
-      'Pass an empty path to see top-level locales (just "en-us" today). Pass "en-us/reference/engine/classes" to see every class YAML, etc.',
+      'Pass an empty path to see top-level locales (just "en-us" today). ' +
+      '\n\n**Paginated**: large directories (engine `classes/` has ~1000 entries) are paginated at 100 items by default. The response includes `totalEntries`, `offset`, `limit`, and `truncated`. Bump `offset` to page through, or raise `limit` (max 1000) if you genuinely need everything in one shot — but you almost never do; prefer `search_roblox_docs` or `get_roblox_api_reference` to find a specific entry.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -111,9 +124,23 @@ export const docTools: ToolDef[] = [
             'Path relative to the docs content root. Empty string lists the top level. Examples: "en-us/reference/engine", "en-us/animation".',
           default: '',
         },
+        offset: {
+          type: 'number',
+          description: 'Pagination offset (0-indexed). Default 0.',
+          default: 0,
+        },
+        limit: {
+          type: 'number',
+          description: 'Page size. Default 100, max 1000.',
+          default: 100,
+        },
       },
     },
-    handler: (args, { tools }) => tools.listRobloxDocs(args?.path ?? ''),
+    handler: (args, { tools }) =>
+      tools.listRobloxDocs(args?.path ?? '', {
+        offset: args?.offset ?? 0,
+        limit: args?.limit ?? 100,
+      }),
   },
 
   {

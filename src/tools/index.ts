@@ -2,7 +2,13 @@ import { StudioHttpClient } from './studio-client.js';
 import { BridgeService } from '../bridge-service.js';
 import * as zlib from 'zlib';
 import { ensureDocsCache } from '../docs/fetcher.js';
-import { listDocs, readDocFile, searchDocs, type SearchOptions } from '../docs/search.js';
+import {
+  listDocs,
+  readDocFile,
+  searchDocs,
+  type ListOptions,
+  type SearchOptions,
+} from '../docs/search.js';
 import { resolveReference, type ReferenceCategory } from '../docs/reference.js';
 
 // PNG encoding utilities
@@ -1382,9 +1388,9 @@ export class RobloxStudioTools {
     };
   }
 
-  async listRobloxDocs(relPath: string = '') {
+  async listRobloxDocs(relPath: string = '', options: ListOptions = {}) {
     const ensured = await ensureDocsCache();
-    const listing = await listDocs(ensured.cacheDir, relPath);
+    const listing = await listDocs(ensured.cacheDir, relPath, options);
     if (!listing) {
       return {
         content: [

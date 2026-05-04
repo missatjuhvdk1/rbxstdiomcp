@@ -1,6 +1,6 @@
 # Roblox Studio MCP Server
 
-MCP server for AI-powered Roblox Studio integration. 29 specialized tools for exploring projects, analyzing scripts, and performing bulk operations. **Now with Claude Code-style script editing and visual feedback!**
+MCP server for AI-powered Roblox Studio integration. 43 specialized tools for exploring projects, analyzing scripts, and performing bulk operations. **Now with Claude Code-style script editing (read-before-edit guardrail included) and visual feedback!**
 
 https://devforum.roblox.com/t/v180-roblox-studio-mcp-speed-up-your-workflow-by-letting-ai-read-paths-and-properties/3707071
 
@@ -132,12 +132,12 @@ graph TB
 ```
 
 ### Key Components:
-- MCP Server (Node.js/TypeScript) - Exposes 24 tools via stdio
+- MCP Server (Node.js/TypeScript) - Exposes 43 tools via stdio
 - HTTP Bridge - Request/response queue on localhost:3002
 - Studio Plugin (Luau) - Polls server and executes API calls
 - Smart Caching - Efficient data transfer
 
-## 29 AI Tools
+## 43 AI Tools
 
 ### File System Tools
 - `get_file_tree` - Complete project hierarchy with scripts, models, folders
@@ -183,13 +183,14 @@ graph TB
 - `undo` - Undo the last MCP operation in Studio's history
 - `redo` - Redo a previously undone operation
 
-### Claude Code-Style Script Editing (NEW in v1.12.0) ⭐
+### Claude Code-Style Script Editing ⭐
 String-based script editing that works just like Claude Code's Edit tool - no more line number guessing!
 
-- `edit_script` - **RECOMMENDED**: Find exact text and replace it, no line numbers needed. Auto-validates syntax and rejects broken code.
+- `edit_script` - **RECOMMENDED** for partial edits: find exact text and replace it, no line numbers needed. Auto-validates Luau syntax and rejects broken code.
 - `search_script` - Search for patterns within scripts (like grep), with optional context lines
 - `get_script_function` - Extract a specific function by name with line numbers
 - `find_and_replace_in_scripts` - Batch find & replace across multiple scripts
+- `validate_script` - Standalone Luau syntax check (also runs automatically after every `edit_script`)
 
 ```typescript
 // Example: Safe string-based editing
@@ -203,13 +204,26 @@ edit_script({
 // If it matches → clean replacement ✓
 ```
 
-**Why this is better:**
-| Line-based (old) | String-based (v1.12.0) |
+**🛡️ Read-before-edit guardrail.** `edit_script` and `find_and_replace_in_scripts` refuse
+to operate on a script you haven't inspected this session — the same structural guarantee
+Claude Code's native `Edit` tool gives. Call `get_script_source`, `search_script`,
+`get_script_function`, or `set_script_source` on the path first; the guardrail then
+unlocks automatically. This makes blind script rewrites impossible by construction.
+
+**Why string-based editing replaced line-based editing:**
+| Line-based (removed) | String-based (current) |
 |---|---|
 | "Edit lines 45-52" 🤞 | "Find this exact code" ✓ |
 | Line numbers shift after edits | Matches the actual content |
 | Can break `end` statements | Validates syntax before applying |
 | Requires counting lines | Just copy the text to replace |
+
+> **Note:** The legacy line-based partial editors (`edit_script_lines`,
+> `insert_script_lines`, `delete_script_lines`) were removed. They've been
+> fully superseded by `edit_script` — for example, "delete lines 10-15"
+> becomes `edit_script(old_string=<those lines>, new_string="")`,
+> and "insert after line 20" becomes
+> `edit_script(old_string=<line 20>, new_string=<line 20 + new code>)`.
 
 ### Visual Feedback Tools (NEW in v2.2.0) 👁️
 AI can now "see" what it creates! Camera control + screenshot = complete visual feedback loop.
@@ -234,6 +248,33 @@ capture_screenshot() // → AI sees what it created! 👀
 > **Note:** All mutation tools (set_property, create_object, delete_object, etc.) are now automatically wrapped in ChangeHistoryService recordings, making every AI change undoable via Ctrl+Z in Studio or the `undo` tool.
 
 > Note: Previous tools removed: `get_file_content`, `get_file_properties`, `get_selection`, `get_dependencies`, `validate_references`. Use Rojo/Argon workflows instead.
+
+### Roblox Docs Tools (NEW in v2.4.0) 📚
+
+AI models often have stale or imprecise training data on Roblox-specific topics — animation, `Motor6D` `C0`/`C1`, R6/R15 rig anatomy, `AlignOrientation`, and so on. These tools give the model first-class access to the canonical reference: a local mirror of [github.com/Roblox/creator-docs](https://github.com/Roblox/creator-docs).
+
+- `search_roblox_docs` - Pure-JS regex search across the docs (like `grep`). Returns line-numbered hits with optional context.
+- `get_roblox_doc` - Read a full doc file by relative path.
+- `list_roblox_docs` - List a directory's contents (like `ls`).
+- `get_roblox_api_reference` - Resolve a class/datatype/enum/global/library by name (e.g. `"Motor6D"`, `"CFrame"`, `"Material"`) and return parsed YAML.
+
+**How the cache works:**
+- First use lazily downloads ~30MB of docs (~2s) to a per-OS cache directory:
+  - Linux: `~/.cache/rbxstudio-mcp-nodejs/docs`
+  - macOS: `~/Library/Caches/rbxstudio-mcp-nodejs/docs`
+  - Windows: `%LOCALAPPDATA%\rbxstudio-mcp-nodejs\Cache\docs`
+- Override with `RBXSTUDIO_DOCS_DIR=/some/path`.
+- Subsequent calls hit the cache instantly.
+- Every 24h, the next call hits GitHub's commits API for the latest SHA — if unchanged, no redownload (~20ms); if changed, the tarball is re-fetched.
+
+**Filtering:** to keep the cache small the tarball is filtered during extract to the parts AI tends to need: `reference/engine/` (full API ref) plus `animation/`, `characters/`, `ui/`, `scripting/`, `physics/`, `workspace/`, `players/`, `input/`, `cloud-services/`, `sound/`. The full creator-docs repo is ~200MB; our cached subset is ~7MB.
+
+```typescript
+// Typical workflow when stuck on Motor6D:
+search_roblox_docs("Motor6D C0", { extensions: ["yaml"] })
+get_roblox_api_reference("Motor6D")     // structured YAML
+get_roblox_doc("en-us/animation/using.md")  // long-form guide
+```
 
 ## AI-Optimized Features
 

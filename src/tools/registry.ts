@@ -8,6 +8,7 @@ import { scriptTools } from './defs/scripts.js';
 import { runtimeTools } from './defs/runtime.js';
 import { visualTools } from './defs/visual.js';
 import { executeTools } from './defs/execute.js';
+import { docTools } from './defs/docs.js';
 
 /**
  * The full registry of MCP tool definitions.
@@ -26,6 +27,7 @@ export const allTools: ToolDef[] = [
   ...runtimeTools,
   ...visualTools,
   ...executeTools,
+  ...docTools,
 ];
 
 /** Fast lookup: tool name → ToolDef. */

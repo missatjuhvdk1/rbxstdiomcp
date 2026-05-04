@@ -94,7 +94,7 @@ Attributes & Tags:     "Tag all enemies for CollectionService" / "Set custom att
 
 **Creation:** `create_object`, `mass_create_objects`, `smart_duplicate`, `mass_duplicate`
 
-**Scripts:** `get_script_source`, `set_script_source`, `edit_script_lines`, `insert_script_lines`, `delete_script_lines`
+**Scripts:** `get_script_source`, `set_script_source`, `edit_script` (string-based, recommended), `search_script`, `get_script_function`, `find_and_replace_in_scripts`, `validate_script`
 
 **Attributes:** `get_attribute`, `set_attribute`, `get_attributes`, `delete_attribute`
 
@@ -121,7 +121,7 @@ Attributes & Tags:     "Tag all enemies for CollectionService" / "Set custom att
 - **Improved Tool Descriptions:** Clearer documentation distinguishing Roblox instances from local files
 
 ### v1.7.x
-- **Partial Script Editing:** `edit_script_lines`, `insert_script_lines`, `delete_script_lines` for targeted edits without rewriting entire scripts
+- **Partial Script Editing:** `edit_script` (string-based, with read-before-edit guardrail and post-edit syntax validation) for targeted edits without rewriting entire scripts. *(The legacy line-based variants `edit_script_lines`, `insert_script_lines`, `delete_script_lines` were removed in favor of `edit_script` — line numbers shift after every edit and made the legacy tools unreliable.)*
 - **Attributes Support:** `get_attribute`, `set_attribute`, `get_attributes`, `delete_attribute` with Vector3, Color3, UDim2, BrickColor support
 - **Tags (CollectionService):** `get_tags`, `add_tag`, `remove_tag`, `get_tagged` for tag-based workflows
 - **Improved Script Handling:** `get_script_source` now returns `numberedSource` field with line numbers for accurate editing

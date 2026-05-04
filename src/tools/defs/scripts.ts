@@ -1,14 +1,27 @@
 import type { ToolDef } from '../types.js';
 
 /**
- * Script editing tools — both Claude Code-style (string-based) and
- * legacy line-based — plus search, function extraction, and validation.
+ * Script editing tools — string-based (Claude Code-style) only.
+ *
+ * The legacy line-based partial editors (edit_script_lines /
+ * insert_script_lines / delete_script_lines) were removed: line numbers
+ * shift on every edit, the model has to count manually, and `edit_script`
+ * does the same job more reliably with exact string matching + automatic
+ * syntax validation.
+ *
+ * `edit_script` and `find_and_replace_in_scripts` enforce a read-before-
+ * edit guardrail at the protocol level — the same pattern Claude Code's
+ * native Edit/Write tools use — so callers can't blindly rewrite a script
+ * they've never inspected. The guardrail is implemented in
+ * RobloxStudioTools (see `src/tools/index.ts`).
  */
 export const scriptTools: ToolDef[] = [
   {
     name: 'get_script_source',
     description:
-      'Get the source code of a Roblox script (LocalScript, Script, or ModuleScript). Returns both "source" (raw code) and "numberedSource" (with line numbers prefixed like "1: code"). Use numberedSource to accurately identify line numbers for editing. For large scripts (>1500 lines), use startLine/endLine to read specific sections.',
+      'Read the source of a Roblox script (LocalScript, Script, or ModuleScript). Returns both `source` (raw) and `numberedSource` (line-numbered, like `cat -n`). ' +
+      '⚠️ For scripts >500 lines, you SHOULD pass `startLine`/`endLine` instead of slurping the whole file — or better, use `search_script` / `get_script_function` to pull just the part you need. ' +
+      'Calling this tool also unlocks `edit_script` for this path (read-before-edit guardrail).',
     inputSchema: {
       type: 'object',
       properties: {
@@ -20,12 +33,12 @@ export const scriptTools: ToolDef[] = [
         startLine: {
           type: 'number',
           description:
-            'Optional: Start line number (1-indexed). Use for reading specific sections of large scripts.',
+            'Optional: Start line number (1-indexed). RECOMMENDED for any script >500 lines.',
         },
         endLine: {
           type: 'number',
           description:
-            'Optional: End line number (inclusive). Use for reading specific sections of large scripts.',
+            'Optional: End line number (inclusive). RECOMMENDED for any script >500 lines.',
         },
       },
       required: ['instancePath'],
@@ -37,7 +50,10 @@ export const scriptTools: ToolDef[] = [
   {
     name: 'set_script_source',
     description:
-      'Replace the entire source code of a Roblox script. Uses ScriptEditorService:UpdateSourceAsync (works with open editors). For partial edits, prefer edit_script_lines, insert_script_lines, or delete_script_lines.',
+      '⚠️ EXPENSIVE — FOR FULL REWRITES OR NEW-SCRIPT POPULATION ONLY. Replaces the ENTIRE source of a script. ' +
+      'For any partial change (adding a function, fixing a bug, refactoring a block) use `edit_script` instead — it is dramatically cheaper in tokens and far less likely to silently truncate the file. ' +
+      'Use this tool only when: (a) you just created the script via `create_object` and are populating it from scratch, or (b) you genuinely want to overwrite >80% of the existing source. ' +
+      'Like `edit_script`, this counts as having "read" the script for guardrail purposes (since you authored the new content).',
     inputSchema: {
       type: 'object',
       properties: {
@@ -48,7 +64,7 @@ export const scriptTools: ToolDef[] = [
         },
         source: {
           type: 'string',
-          description: 'New source code for the script',
+          description: 'New source code for the script (replaces the entire existing content)',
         },
       },
       required: ['instancePath', 'source'],
@@ -57,97 +73,11 @@ export const scriptTools: ToolDef[] = [
   },
 
   {
-    name: 'edit_script_lines',
-    description:
-      'Replace specific lines in a Roblox script without rewriting the entire source. IMPORTANT: Use the "numberedSource" field from get_script_source to identify the correct line numbers. Lines are 1-indexed and ranges are inclusive.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        instancePath: {
-          type: 'string',
-          description:
-            'Roblox instance path to the script (e.g., "game.ServerScriptService.MainScript")',
-        },
-        startLine: {
-          type: 'number',
-          description: 'First line to replace (1-indexed). Get this from the "numberedSource" field.',
-        },
-        endLine: {
-          type: 'number',
-          description: 'Last line to replace (inclusive). Get this from the "numberedSource" field.',
-        },
-        newContent: {
-          type: 'string',
-          description:
-            'New content to replace the specified lines (can be multiple lines separated by newlines)',
-        },
-      },
-      required: ['instancePath', 'startLine', 'endLine', 'newContent'],
-    },
-    handler: (args, { tools }) =>
-      tools.editScriptLines(args?.instancePath, args?.startLine, args?.endLine, args?.newContent),
-  },
-
-  {
-    name: 'insert_script_lines',
-    description:
-      'Insert new lines into a Roblox script at a specific position. IMPORTANT: Use the "numberedSource" field from get_script_source to identify the correct line numbers.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        instancePath: {
-          type: 'string',
-          description:
-            'Roblox instance path to the script (e.g., "game.ServerScriptService.MainScript")',
-        },
-        afterLine: {
-          type: 'number',
-          description:
-            'Insert after this line number (0 = insert at very beginning, 1 = after first line). Get line numbers from "numberedSource".',
-          default: 0,
-        },
-        newContent: {
-          type: 'string',
-          description: 'Content to insert (can be multiple lines separated by newlines)',
-        },
-      },
-      required: ['instancePath', 'newContent'],
-    },
-    handler: (args, { tools }) =>
-      tools.insertScriptLines(args?.instancePath, args?.afterLine, args?.newContent),
-  },
-
-  {
-    name: 'delete_script_lines',
-    description:
-      'Delete specific lines from a Roblox script. IMPORTANT: Use the "numberedSource" field from get_script_source to identify the correct line numbers.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        instancePath: {
-          type: 'string',
-          description:
-            'Roblox instance path to the script (e.g., "game.ServerScriptService.MainScript")',
-        },
-        startLine: {
-          type: 'number',
-          description: 'First line to delete (1-indexed). Get this from the "numberedSource" field.',
-        },
-        endLine: {
-          type: 'number',
-          description: 'Last line to delete (inclusive). Get this from the "numberedSource" field.',
-        },
-      },
-      required: ['instancePath', 'startLine', 'endLine'],
-    },
-    handler: (args, { tools }) =>
-      tools.deleteScriptLines(args?.instancePath, args?.startLine, args?.endLine),
-  },
-
-  {
     name: 'edit_script',
     description:
-      "RECOMMENDED: String-based script editing like Claude Code's Edit tool. Find exact text and replace it - no line numbers needed! This is the safest and most reliable way to edit scripts. The edit will FAIL safely if old_string is not found or appears multiple times (unless replace_all is true). Always validates syntax after editing.",
+      "RECOMMENDED for all partial script edits. String-based editing like Claude Code's Edit tool: find exact text and replace it — no line numbers, no shifting offsets, no truncation risk. " +
+      'Fails safely if `old_string` is not found, or appears more than once (unless `replace_all` is true). Validates Luau syntax after the edit and reverts if broken. ' +
+      '🛡️ GUARDRAIL: this tool requires you to have called `get_script_source`, `search_script`, `get_script_function`, or `set_script_source` on this `instancePath` first (within the current MCP server lifetime). This prevents blind edits to scripts you have never inspected.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -193,7 +123,7 @@ export const scriptTools: ToolDef[] = [
   {
     name: 'search_script',
     description:
-      'Search for patterns within a script source code (like grep). Returns matching lines with line numbers and optional context.',
+      'Search for patterns within a script source code (like grep). Returns matching lines with line numbers and optional context. Counts as having "read" the script for the `edit_script` guardrail.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -231,7 +161,7 @@ export const scriptTools: ToolDef[] = [
   {
     name: 'get_script_function',
     description:
-      'Extract a specific function from a script by name. Returns the function source code with start/end line numbers. Perfect for editing just one function without affecting the rest of the script.',
+      'Extract a specific function from a script by name. Returns the function source code with start/end line numbers. Perfect for editing just one function without affecting the rest of the script. Counts as having "read" the script for the `edit_script` guardrail.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -254,7 +184,8 @@ export const scriptTools: ToolDef[] = [
   {
     name: 'find_and_replace_in_scripts',
     description:
-      'Find and replace text across multiple scripts at once. Like edit_script but for batch operations. Validates all scripts after editing.',
+      'Find and replace text across multiple scripts at once. Like `edit_script` but for batch operations. Validates all scripts after editing. ' +
+      '🛡️ GUARDRAIL: every path in `paths` must have been read first via `get_script_source`, `search_script`, `get_script_function`, or `set_script_source`. The whole batch is rejected if any path is unread.',
     inputSchema: {
       type: 'object',
       properties: {

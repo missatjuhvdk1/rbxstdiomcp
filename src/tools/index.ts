@@ -1,6 +1,9 @@
 import { StudioHttpClient } from './studio-client.js';
 import { BridgeService } from '../bridge-service.js';
 import * as zlib from 'zlib';
+import { ensureDocsCache } from '../docs/fetcher.js';
+import { listDocs, readDocFile, searchDocs, type SearchOptions } from '../docs/search.js';
+import { resolveReference, type ReferenceCategory } from '../docs/reference.js';
 
 // PNG encoding utilities
 function createPNG(rgbaData: Buffer, width: number, height: number): Buffer {
@@ -87,9 +90,47 @@ export class RobloxStudioTools {
   private client: StudioHttpClient;
   private bridge: BridgeService;
 
+  /**
+   * Read-before-edit guardrail.
+   *
+   * Tracks which script paths the model has already inspected during this
+   * MCP server lifetime. `edit_script` and `find_and_replace_in_scripts`
+   * refuse to operate on paths that aren't in this set, mirroring the
+   * structural guarantee Claude Code's native Edit tool gives ("you must
+   * Read a file before editing it").
+   *
+   * A path is added when any of these tools succeeds:
+   *   - get_script_source       (model saw the source)
+   *   - search_script           (model saw matched lines + context)
+   *   - get_script_function     (model saw a function body)
+   *   - set_script_source       (model authored the new content)
+   *
+   * The set is process-wide and persists across requests. It is cleared
+   * only when the MCP server restarts. We deliberately do NOT remove
+   * paths after edits — once you've seen a script, string-based edits
+   * remain safe because `old_string` matching is content-based, not
+   * line-based.
+   */
+  private readScripts: Set<string> = new Set();
+
   constructor(bridge: BridgeService) {
     this.bridge = bridge;
     this.client = new StudioHttpClient(bridge);
+  }
+
+  /** Mark `instancePath` as read for the edit_script guardrail. */
+  private markScriptRead(instancePath: string): void {
+    if (instancePath) this.readScripts.add(instancePath);
+  }
+
+  /** Throw a helpful error if `instancePath` hasn't been read this session. */
+  private requireScriptRead(instancePath: string, callerName: string): void {
+    if (this.readScripts.has(instancePath)) return;
+    throw new Error(
+      `${callerName}: refusing to edit "${instancePath}" because you have not inspected it yet in this session. ` +
+        `Call get_script_source (preferred), search_script, or get_script_function on this path first so you know what you're changing. ` +
+        `This guardrail prevents blind edits to scripts you haven't seen — the same pattern Claude Code's Edit tool enforces natively.`,
+    );
   }
 
   // File System Tools
@@ -495,12 +536,28 @@ export class RobloxStudioTools {
     };
   }
 
-  // Script Management Tools
+  // ============================================
+  // SCRIPT MANAGEMENT TOOLS
+  //
+  // The legacy line-based partial editors (edit_script_lines /
+  // insert_script_lines / delete_script_lines) were removed in favor of
+  // the string-based editScript() below — line numbers shift after every
+  // edit, which makes line-based editing unreliable for AI workflows.
+  //
+  // edit_script + find_and_replace_in_scripts are protected by a
+  // read-before-edit guardrail (see `requireScriptRead`).
+  // ============================================
+
   async getScriptSource(instancePath: string, startLine?: number, endLine?: number) {
     if (!instancePath) {
       throw new Error('Instance path is required for get_script_source');
     }
     const response = await this.client.request('/api/get-script-source', { instancePath, startLine, endLine });
+    // Mark as read for the edit_script guardrail. We mark on success
+    // (post-request) so that a failed read doesn't unlock edits.
+    if (!(response as any)?.error) {
+      this.markScriptRead(instancePath);
+    }
     return {
       content: [
         {
@@ -516,22 +573,11 @@ export class RobloxStudioTools {
       throw new Error('Instance path and source code string are required for set_script_source');
     }
     const response = await this.client.request('/api/set-script-source', { instancePath, source });
-    return {
-      content: [
-        {
-          type: 'text',
-          text: JSON.stringify(response, null, 2)
-        }
-      ]
-    };
-  }
-
-  // Partial Script Editing Tools
-  async editScriptLines(instancePath: string, startLine: number, endLine: number, newContent: string) {
-    if (!instancePath || !startLine || !endLine || typeof newContent !== 'string') {
-      throw new Error('Instance path, startLine, endLine, and newContent are required for edit_script_lines');
+    // The model authored the new content, so it has effectively "seen"
+    // the script. Allow follow-up edit_script calls without re-reading.
+    if (!(response as any)?.error) {
+      this.markScriptRead(instancePath);
     }
-    const response = await this.client.request('/api/edit-script-lines', { instancePath, startLine, endLine, newContent });
     return {
       content: [
         {
@@ -541,44 +587,14 @@ export class RobloxStudioTools {
       ]
     };
   }
-
-  async insertScriptLines(instancePath: string, afterLine: number, newContent: string) {
-    if (!instancePath || typeof newContent !== 'string') {
-      throw new Error('Instance path and newContent are required for insert_script_lines');
-    }
-    const response = await this.client.request('/api/insert-script-lines', { instancePath, afterLine: afterLine || 0, newContent });
-    return {
-      content: [
-        {
-          type: 'text',
-          text: JSON.stringify(response, null, 2)
-        }
-      ]
-    };
-  }
-
-  async deleteScriptLines(instancePath: string, startLine: number, endLine: number) {
-    if (!instancePath || !startLine || !endLine) {
-      throw new Error('Instance path, startLine, and endLine are required for delete_script_lines');
-    }
-    const response = await this.client.request('/api/delete-script-lines', { instancePath, startLine, endLine });
-    return {
-      content: [
-        {
-          type: 'text',
-          text: JSON.stringify(response, null, 2)
-        }
-      ]
-    };
-  }
-
-  // ============================================
-  // CLAUDE CODE-STYLE SCRIPT EDITING TOOLS
-  // ============================================
 
   /**
-   * edit_script - String-based script editing like Claude Code's Edit tool
-   * Find exact text and replace it - no line numbers needed!
+   * edit_script - String-based script editing like Claude Code's Edit tool.
+   * Find exact text and replace it - no line numbers needed.
+   *
+   * Guardrail: requires a prior read of `instancePath` via
+   * get_script_source / search_script / get_script_function /
+   * set_script_source. See `requireScriptRead` for rationale.
    */
   async editScript(instancePath: string, oldString: string, newString: string, replaceAll: boolean = false, validateAfter: boolean = true) {
     if (!instancePath) {
@@ -593,6 +609,10 @@ export class RobloxStudioTools {
     if (oldString === newString) {
       throw new Error('old_string and new_string must be different');
     }
+
+    // Read-before-edit guardrail — mirrors Claude Code's native Edit tool.
+    this.requireScriptRead(instancePath, 'edit_script');
+
     const response = await this.client.request('/api/edit-script', {
       instancePath,
       oldString,
@@ -611,7 +631,8 @@ export class RobloxStudioTools {
   }
 
   /**
-   * search_script - Search for patterns within a script (like grep)
+   * search_script - Search for patterns within a script (like grep).
+   * Counts as having "read" the script for the edit_script guardrail.
    */
   async searchScript(instancePath: string, pattern: string, useRegex: boolean = false, contextLines: number = 0) {
     if (!instancePath || !pattern) {
@@ -623,6 +644,9 @@ export class RobloxStudioTools {
       useRegex,
       contextLines
     });
+    if (!(response as any)?.error) {
+      this.markScriptRead(instancePath);
+    }
     return {
       content: [
         {
@@ -634,7 +658,8 @@ export class RobloxStudioTools {
   }
 
   /**
-   * get_script_function - Extract a specific function from a script by name
+   * get_script_function - Extract a specific function from a script by name.
+   * Counts as having "read" the script for the edit_script guardrail.
    */
   async getScriptFunction(instancePath: string, functionName: string) {
     if (!instancePath || !functionName) {
@@ -644,6 +669,9 @@ export class RobloxStudioTools {
       instancePath,
       functionName
     });
+    if (!(response as any)?.error) {
+      this.markScriptRead(instancePath);
+    }
     return {
       content: [
         {
@@ -655,7 +683,11 @@ export class RobloxStudioTools {
   }
 
   /**
-   * find_and_replace_in_scripts - Find and replace across multiple scripts
+   * find_and_replace_in_scripts - Batch find-and-replace across multiple scripts.
+   *
+   * Guardrail: every path in `paths` must have been read first. We reject
+   * the whole batch if any path is unread — partial application would
+   * leave the workspace in an inconsistent state.
    */
   async findAndReplaceInScripts(paths: string[], oldString: string, newString: string, validateAfter: boolean = true) {
     if (!paths || paths.length === 0) {
@@ -664,6 +696,16 @@ export class RobloxStudioTools {
     if (typeof oldString !== 'string' || typeof newString !== 'string') {
       throw new Error('old_string and new_string are required');
     }
+
+    // Read-before-edit guardrail — fail fast for the whole batch.
+    const unread = paths.filter((p) => !this.readScripts.has(p));
+    if (unread.length > 0) {
+      throw new Error(
+        `find_and_replace_in_scripts: refusing to edit ${unread.length} unread script(s): ${unread.join(', ')}. ` +
+          `Call get_script_source / search_script / get_script_function on each path first.`,
+      );
+    }
+
     const response = await this.client.request('/api/find-and-replace-in-scripts', {
       paths,
       oldString,
@@ -1327,4 +1369,179 @@ export class RobloxStudioTools {
       ]
     };
   }
+
+  // ============================================
+  // ROBLOX CREATOR-DOCS TOOLS
+  //
+  // These tools mirror github.com/Roblox/creator-docs to a local cache
+  // and let the model search/read it like a local repo. They do NOT go
+  // through the Studio HTTP bridge — they're pure server-side.
+  //
+  // The cache is downloaded lazily on first use (~5s, ~30MB) and
+  // refreshed at most once every 24h with a SHA short-circuit. See
+  // src/docs/fetcher.ts for the strategy.
+  // ============================================
+
+  async searchRobloxDocs(query: string, options: SearchOptions = {}) {
+    if (!query || typeof query !== 'string') {
+      throw new Error('query is required for search_roblox_docs');
+    }
+    const ensured = await ensureDocsCache();
+    const summary = await searchDocs(ensured.cacheDir, query, options);
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify(
+            {
+              cache: {
+                action: ensured.action,
+                sha: ensured.meta.sha,
+                downloadedAt: ensured.meta.downloadedAt,
+                durationMs: ensured.durationMs,
+              },
+              query,
+              options,
+              ...summary,
+            },
+            null,
+            2,
+          ),
+        },
+      ],
+    };
+  }
+
+  async getRobloxDoc(relPath: string) {
+    if (!relPath || typeof relPath !== 'string') {
+      throw new Error('path is required for get_roblox_doc');
+    }
+    const ensured = await ensureDocsCache();
+    const doc = await readDocFile(ensured.cacheDir, relPath);
+    if (!doc) {
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(
+              {
+                error: `Doc not found: "${relPath}". Use list_roblox_docs to discover paths, or search_roblox_docs to find a hit.`,
+                cache: {
+                  sha: ensured.meta.sha,
+                  fileCount: ensured.meta.fileCount,
+                  cacheDir: ensured.cacheDir,
+                },
+              },
+              null,
+              2,
+            ),
+          },
+        ],
+      };
+    }
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify(
+            {
+              path: doc.path,
+              bytes: doc.bytes,
+              cache: {
+                action: ensured.action,
+                sha: ensured.meta.sha,
+              },
+              content: doc.content,
+            },
+            null,
+            2,
+          ),
+        },
+      ],
+    };
+  }
+
+  async listRobloxDocs(relPath: string = '') {
+    const ensured = await ensureDocsCache();
+    const listing = await listDocs(ensured.cacheDir, relPath);
+    if (!listing) {
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(
+              {
+                error: `Path not found: "${relPath}".`,
+                cache: { sha: ensured.meta.sha, fileCount: ensured.meta.fileCount },
+              },
+              null,
+              2,
+            ),
+          },
+        ],
+      };
+    }
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify(
+            {
+              cache: {
+                action: ensured.action,
+                sha: ensured.meta.sha,
+              },
+              ...listing,
+            },
+            null,
+            2,
+          ),
+        },
+      ],
+    };
+  }
+
+  async getRobloxApiReference(name: string, category?: ReferenceCategory) {
+    if (!name || typeof name !== 'string') {
+      throw new Error('name is required for get_roblox_api_reference');
+    }
+    const ensured = await ensureDocsCache();
+    const result = await resolveReference(ensured.cacheDir, name, category);
+    if (!result) {
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(
+              {
+                error: `No API reference found for "${name}"${category ? ` in category "${category}"` : ''}. Try search_roblox_docs to find similar names.`,
+                cache: { sha: ensured.meta.sha, fileCount: ensured.meta.fileCount },
+              },
+              null,
+              2,
+            ),
+          },
+        ],
+      };
+    }
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify(
+            {
+              cache: {
+                action: ensured.action,
+                sha: ensured.meta.sha,
+              },
+              ...result,
+            },
+            null,
+            2,
+          ),
+        },
+      ],
+    };
+  }
+
 }

@@ -1,6 +1,6 @@
 # Roblox Studio MCP Server
 
-MCP server for AI-powered Roblox Studio integration. 43 specialized tools for exploring projects, analyzing scripts, and performing bulk operations. **Now with Claude Code-style script editing (read-before-edit guardrail included) and visual feedback!**
+MCP server for AI-powered Roblox Studio integration. 43 specialized tools for exploring projects, analyzing scripts, and performing bulk operations. **Now with Claude Code-style script editing and visual feedback!**
 
 https://devforum.roblox.com/t/v180-roblox-studio-mcp-speed-up-your-workflow-by-letting-ai-read-paths-and-properties/3707071
 
@@ -203,12 +203,6 @@ edit_script({
 // If syntax is broken → ERROR (edit rejected, original preserved)
 // If it matches → clean replacement ✓
 ```
-
-**🛡️ Read-before-edit guardrail.** `edit_script` and `find_and_replace_in_scripts` refuse
-to operate on a script you haven't inspected this session — the same structural guarantee
-Claude Code's native `Edit` tool gives. Call `get_script_source`, `search_script`,
-`get_script_function`, or `set_script_source` on the path first; the guardrail then
-unlocks automatically. This makes blind script rewrites impossible by construction.
 
 **Why string-based editing replaced line-based editing:**
 | Line-based (removed) | String-based (current) |

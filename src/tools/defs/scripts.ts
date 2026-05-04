@@ -8,20 +8,13 @@ import type { ToolDef } from '../types.js';
  * shift on every edit, the model has to count manually, and `edit_script`
  * does the same job more reliably with exact string matching + automatic
  * syntax validation.
- *
- * `edit_script` and `find_and_replace_in_scripts` enforce a read-before-
- * edit guardrail at the protocol level — the same pattern Claude Code's
- * native Edit/Write tools use — so callers can't blindly rewrite a script
- * they've never inspected. The guardrail is implemented in
- * RobloxStudioTools (see `src/tools/index.ts`).
  */
 export const scriptTools: ToolDef[] = [
   {
     name: 'get_script_source',
     description:
       'Read the source of a Roblox script (LocalScript, Script, or ModuleScript). Returns both `source` (raw) and `numberedSource` (line-numbered, like `cat -n`). ' +
-      '⚠️ For scripts >500 lines, you SHOULD pass `startLine`/`endLine` instead of slurping the whole file — or better, use `search_script` / `get_script_function` to pull just the part you need. ' +
-      'Calling this tool also unlocks `edit_script` for this path (read-before-edit guardrail).',
+      '⚠️ For scripts >500 lines, you SHOULD pass `startLine`/`endLine` instead of slurping the whole file — or better, use `search_script` / `get_script_function` to pull just the part you need.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -52,8 +45,7 @@ export const scriptTools: ToolDef[] = [
     description:
       '⚠️ EXPENSIVE — FOR FULL REWRITES OR NEW-SCRIPT POPULATION ONLY. Replaces the ENTIRE source of a script. ' +
       'For any partial change (adding a function, fixing a bug, refactoring a block) use `edit_script` instead — it is dramatically cheaper in tokens and far less likely to silently truncate the file. ' +
-      'Use this tool only when: (a) you just created the script via `create_object` and are populating it from scratch, or (b) you genuinely want to overwrite >80% of the existing source. ' +
-      'Like `edit_script`, this counts as having "read" the script for guardrail purposes (since you authored the new content).',
+      'Use this tool only when: (a) you just created the script via `create_object` and are populating it from scratch, or (b) you genuinely want to overwrite >80% of the existing source.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -76,8 +68,7 @@ export const scriptTools: ToolDef[] = [
     name: 'edit_script',
     description:
       "RECOMMENDED for all partial script edits. String-based editing like Claude Code's Edit tool: find exact text and replace it — no line numbers, no shifting offsets, no truncation risk. " +
-      'Fails safely if `old_string` is not found, or appears more than once (unless `replace_all` is true). Validates Luau syntax after the edit and reverts if broken. ' +
-      '🛡️ GUARDRAIL: this tool requires you to have called `get_script_source`, `search_script`, `get_script_function`, or `set_script_source` on this `instancePath` first (within the current MCP server lifetime). This prevents blind edits to scripts you have never inspected.',
+      'Fails safely if `old_string` is not found, or appears more than once (unless `replace_all` is true). Validates Luau syntax after the edit and reverts if broken.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -123,7 +114,7 @@ export const scriptTools: ToolDef[] = [
   {
     name: 'search_script',
     description:
-      'Search for patterns within a script source code (like grep). Returns matching lines with line numbers and optional context. Counts as having "read" the script for the `edit_script` guardrail.',
+      'Search for patterns within a script source code (like grep). Returns matching lines with line numbers and optional context.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -161,7 +152,7 @@ export const scriptTools: ToolDef[] = [
   {
     name: 'get_script_function',
     description:
-      'Extract a specific function from a script by name. Returns the function source code with start/end line numbers. Perfect for editing just one function without affecting the rest of the script. Counts as having "read" the script for the `edit_script` guardrail.',
+      'Extract a specific function from a script by name. Returns the function source code with start/end line numbers. Perfect for editing just one function without affecting the rest of the script.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -184,8 +175,7 @@ export const scriptTools: ToolDef[] = [
   {
     name: 'find_and_replace_in_scripts',
     description:
-      'Find and replace text across multiple scripts at once. Like `edit_script` but for batch operations. Validates all scripts after editing. ' +
-      '🛡️ GUARDRAIL: every path in `paths` must have been read first via `get_script_source`, `search_script`, `get_script_function`, or `set_script_source`. The whole batch is rejected if any path is unread.',
+      'Find and replace text across multiple scripts at once. Like `edit_script` but for batch operations. Validates all scripts after editing.',
     inputSchema: {
       type: 'object',
       properties: {

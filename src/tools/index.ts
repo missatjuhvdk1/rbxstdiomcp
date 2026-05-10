@@ -1246,10 +1246,20 @@ export class RobloxStudioTools {
     }
 
     // ---- Resolve target slot -------------------------------------------
-    let slotTarget: 'server' | { client: number };
-    let queueTarget: 'server' | { client: number };
+    // Architecture note: HttpService is server-only in Roblox, so the client
+    // companion CANNOT POST eval-results directly. Instead, target='client'
+    // commands ride the SERVER queue with a `forwardTo` metadata field; the
+    // server companion picks them up, dispatches via clientRelay:InvokeClient,
+    // and POSTs the result on the client's behalf. This means the bridge's
+    // reply slot is always 'server' regardless of logical target.
     let resolvedClientName: string | null = null;
     let resolvedClientUserId: number | null = null;
+    const evalArgs: Record<string, any> = {
+      // replyId added below
+      code,
+      timeoutMs: tMs,
+      captureLogs: !!captureLogs,
+    };
 
     if (target === 'server') {
       if (!status.serverReady) {
@@ -1264,15 +1274,13 @@ export class RobloxStudioTools {
           'ServerScriptService.LoadStringEnabled is false in this place, so the server companion cannot loadstring user code. Enable LoadStringEnabled in Studio (Game Settings → Security → Allow HTTP Requests / LoadString) BEFORE starting the test, then re-run play_solo.'
         );
       }
-      slotTarget = 'server';
-      queueTarget = 'server';
     } else {
       // target === 'client'
       const clients = status.clients;
       if (clients.length === 0) {
         return fail(
           'no_clients_connected',
-          'No client companion has polled in yet. Either no Player has joined the test, or the LocalScript was blocked. Wait until at least one player joins, or fall back to target="server".'
+          'No client companion has registered yet. Either no Player has joined the test, the LocalScript hasn\'t fired its hello RemoteEvent yet, or the server companion isn\'t set up. Wait briefly, or fall back to target="server".'
         );
       }
       let chosen = clients[0];
@@ -1303,7 +1311,7 @@ export class RobloxStudioTools {
       if (!chosen.ready) {
         return fail(
           'companion_not_ready',
-          `Client companion for ${chosen.name} (userId=${chosen.userId}) has not finished its first poll. Wait briefly and retry.`
+          `Client companion for ${chosen.name} (userId=${chosen.userId}) has not finished its hello yet. Wait briefly and retry.`
         );
       }
       // Loadstring is core (always enabled in client LocalScripts), but we
@@ -1315,10 +1323,11 @@ export class RobloxStudioTools {
           `Client companion for ${chosen.name} reported loadstring unavailable. (This is unusual on the client; check that the LocalScript was injected correctly.)`
         );
       }
-      slotTarget = { client: chosen.userId };
-      queueTarget = { client: chosen.userId };
       resolvedClientName = chosen.name;
       resolvedClientUserId = chosen.userId;
+      // forwardTo tells the server companion to InvokeClient this player
+      // instead of running the code locally on the server.
+      evalArgs.forwardTo = { userId: chosen.userId, playerName: chosen.name };
     }
 
     // ---- Register slot, then enqueue the command ----------------------
@@ -1326,19 +1335,20 @@ export class RobloxStudioTools {
     // to skip allocating a watcher promise. But we need the replyId baked
     // into the enqueued args, so generate it up front.
     const replyId = uuidv4();
+    evalArgs.replyId = replyId;
 
-    // Register the watchdog slot BEFORE enqueueing — otherwise an
-    // exceptionally fast companion (sub-millisecond between poll RTTs)
-    // could in theory deliver before we've slotted, though in practice
-    // the HTTP RTT alone makes this impossible.
-    const replyPromise = this.bridge.registerEvalReply(replyId, slotTarget, tMs);
+    // Register the watchdog slot BEFORE enqueueing. We always use 'server'
+    // as the slot target because the server companion is what actually
+    // POSTs /test-session/eval-result back to us (even for client-target
+    // evals — see forwardTo dispatch in the server companion template).
+    const replyPromise = this.bridge.registerEvalReply(replyId, 'server', tMs);
 
     const queued = this.bridge.enqueueTestCommand(
       {
         cmd: 'eval',
-        args: { replyId, code, timeoutMs: tMs, captureLogs: !!captureLogs },
+        args: evalArgs,
       },
-      queueTarget
+      'server'
     );
     if (!queued) {
       // Bridge couldn't accept (session ended between status check and

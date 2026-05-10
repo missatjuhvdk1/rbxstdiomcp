@@ -72,6 +72,8 @@ local COMPANION_SCRIPT_TEMPLATE = [[-- _MCPTestCompanion (auto-generated, safe t
 
 local HttpService = game:GetService("HttpService")
 local LogService = game:GetService("LogService")
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local StudioTestService
 do
 	local ok, svc = pcall(function() return game:GetService("StudioTestService") end)
@@ -103,6 +105,43 @@ do
 	end
 end
 
+-- ---------------------------------------------------------------------------
+-- CLIENT RELAY (server-side gateway)
+-- ---------------------------------------------------------------------------
+-- HttpService:RequestAsync is server-only in Roblox: LocalScripts can't make
+-- HTTP requests. So the server companion is the only HTTP gateway, and the
+-- client companion talks to us through these Remotes:
+--
+--   _MCPClientHello  RemoteEvent     client -> server, register/loadstring info
+--   _MCPClientLogs   RemoteEvent     client -> server, batched LogService output
+--   _MCPClientRelay  RemoteFunction  server -> client, dispatch run_live_lua eval
+--
+-- We keep these in ReplicatedStorage with Archivable=false so they don't get
+-- saved into the place file, and they're cleaned up automatically when the
+-- test session ends and the cloned DataModel is torn down.
+-- ---------------------------------------------------------------------------
+local clientRelay
+local clientHello
+local clientLogs
+do
+	local function makeRemote(className, name)
+		local existing = ReplicatedStorage:FindFirstChild(name)
+		if existing and existing.ClassName == className then
+			return existing
+		elseif existing then
+			pcall(function() existing:Destroy() end)
+		end
+		local inst = Instance.new(className)
+		inst.Name = name
+		inst.Archivable = false
+		inst.Parent = ReplicatedStorage
+		return inst
+	end
+	clientRelay = makeRemote("RemoteFunction", "_MCPClientRelay")
+	clientHello = makeRemote("RemoteEvent", "_MCPClientHello")
+	clientLogs  = makeRemote("RemoteEvent", "_MCPClientLogs")
+end
+
 local function postJSON(path, body)
 	local ok, response = pcall(function()
 		return HttpService:RequestAsync({
@@ -120,6 +159,57 @@ local function postJSON(path, body)
 		return false, nil
 	end
 end
+
+-- ---------------------------------------------------------------------------
+-- Client gateway: forward client-side Remote events into the bridge over HTTP.
+-- Clients can't make HTTP requests themselves (HttpService is server-only), so
+-- they fire RemoteEvents at us and we forward.
+-- ---------------------------------------------------------------------------
+clientHello.OnServerEvent:Connect(function(player, payload)
+	-- payload = { loadstringReady = bool }
+	-- Register the client with the bridge by issuing a single poll on its
+	-- behalf with a hello field. The bridge populates its clients map from
+	-- this poll, which is what run_live_lua's target='client' resolution
+	-- looks at.
+	local loadstringReady = false
+	if type(payload) == "table" and payload.loadstringReady ~= nil then
+		loadstringReady = payload.loadstringReady and true or false
+	end
+	task.spawn(function()
+		postJSON("/test-session/poll", {
+			sessionId = SESSION_ID,
+			target = "client",
+			userId = player.UserId,
+			playerName = player.Name,
+			hello = { loadstringReady = loadstringReady },
+		})
+	end)
+end)
+
+clientLogs.OnServerEvent:Connect(function(player, messages)
+	-- messages: array of { message, messageType, timestamp }
+	if type(messages) ~= "table" then return end
+	-- Tag each message with the player's name so multi-client tests are
+	-- legible in get_playtest_output.
+	local tagged = {}
+	for i, m in ipairs(messages) do
+		if type(m) == "table" then
+			tagged[i] = {
+				message = "[" .. player.Name .. "] " .. tostring(m.message or ""),
+				messageType = m.messageType or "MessageOutput",
+				timestamp = m.timestamp or os.time(),
+			}
+		end
+	end
+	if #tagged == 0 then return end
+	task.spawn(function()
+		postJSON("/test-session/log", {
+			sessionId = SESSION_ID,
+			source = "client",
+			messages = tagged,
+		})
+	end)
+end)
 
 -- ---------------------------------------------------------------------------
 -- Result serializer (mirrors the plugin's executeLua serializer so MCP
@@ -261,9 +351,9 @@ local function buildEvalEnv()
 	return setmetatable({
 		game = game,
 		workspace = workspace,
-		Players = game:GetService("Players"),
+		Players = Players,
 		Workspace = workspace,
-		ReplicatedStorage = game:GetService("ReplicatedStorage"),
+		ReplicatedStorage = ReplicatedStorage,
 		ServerStorage = game:GetService("ServerStorage"),
 		ServerScriptService = game:GetService("ServerScriptService"),
 		StarterGui = game:GetService("StarterGui"),
@@ -334,6 +424,78 @@ local function handleEvalCommand(args)
 			replied = true
 			payload.durationMs = math.floor((os.clock() - startedAt) * 1000)
 			postEvalResult(replyId, payload)
+		end
+
+		-- ----------------------------------------------------------------
+		-- forwardTo path: run_live_lua with target='client' enqueues on the
+		-- server queue with forwardTo metadata; we dispatch via InvokeClient
+		-- through _MCPClientRelay. The client's OnClientInvoke handler does
+		-- the actual eval and returns the payload.
+		-- ----------------------------------------------------------------
+		if type(args.forwardTo) == "table" then
+			local targetUserId = args.forwardTo.userId
+			local targetName = args.forwardTo.playerName
+			local target = nil
+			if type(targetUserId) == "number" then
+				for _, p in ipairs(Players:GetPlayers()) do
+					if p.UserId == targetUserId then target = p; break end
+				end
+			end
+			if not target and type(targetName) == "string" and #targetName > 0 then
+				target = Players:FindFirstChild(targetName)
+			end
+			if not target then
+				safeReply({
+					ok = false,
+					errorType = "no_such_player",
+					error = string.format(
+						"Could not resolve target client (userId=%s, playerName=%s) — they may have left the test.",
+						tostring(targetUserId), tostring(targetName)
+					),
+				})
+				return
+			end
+
+			-- Server-side watchdog: InvokeClient blocks until the client
+			-- returns, but if the client hangs we still want a bounded reply.
+			task.delay(timeoutMs / 1000 + 1, function()
+				if replied then return end
+				safeReply({
+					ok = false,
+					errorType = "timeout",
+					error = string.format(
+						"Client eval did not return within %d ms (server-side watchdog).",
+						timeoutMs
+					),
+				})
+			end)
+
+			local invokeOk, payload = pcall(function()
+				return clientRelay:InvokeClient(target, {
+					replyId = replyId,
+					code = code,
+					timeoutMs = timeoutMs,
+					captureLogs = captureLogs,
+				})
+			end)
+			if not invokeOk then
+				safeReply({
+					ok = false,
+					errorType = "client_disconnected",
+					error = "InvokeClient failed (client likely left the test): " .. tostring(payload),
+				})
+				return
+			end
+			if type(payload) ~= "table" then
+				safeReply({
+					ok = false,
+					errorType = "client_protocol_error",
+					error = "Client returned a non-table payload: " .. typeof(payload),
+				})
+				return
+			end
+			safeReply(payload)
+			return
 		end
 
 		if not LOADSTRING_READY then
@@ -510,38 +672,44 @@ end)
 -- ----------------------------------------------------------------------------
 local CLIENT_COMPANION_SCRIPT_TEMPLATE = [[-- _MCPTestCompanion_Client (auto-generated, safe to delete)
 -- Runs in each Player's PlayerScripts during a Studio test session started by
--- the MCP plugin. Streams local LogService output and runs run_live_lua eval
--- commands targeted at this client.
+-- the MCP plugin. Streams local LogService output to the server companion via
+-- RemoteEvents and runs run_live_lua eval commands dispatched through a
+-- RemoteFunction.
+--
+-- IMPORTANT: HttpService is server-only in Roblox. LocalScripts CANNOT make
+-- HTTP requests (they'll silently fail with HttpError). So everything goes
+-- through Remotes. The server companion in ServerScriptService is the only
+-- HTTP gateway and forwards messages on our behalf.
 --
 -- DO NOT modify or delete while a play test is running — it will be cleaned
 -- up automatically by the MCP plugin.
 
-local HttpService = game:GetService("HttpService")
 local LogService = game:GetService("LogService")
 local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
-local SERVER_URL = "__MCP_SERVER_URL__"
-local SESSION_ID = "__MCP_SESSION_ID__"
-local POLL_INTERVAL = 0.4
 local LOG_FLUSH_INTERVAL = 0.25
 local MAX_BUFFER = 5000
-local MAX_CONSECUTIVE_FAILURES = 30
+local REMOTE_WAIT_TIMEOUT = 30 -- seconds
 
 local localPlayer = Players.LocalPlayer
-if not localPlayer then
-	-- LocalScript should always have LocalPlayer; bail otherwise.
-	return
-end
-local USER_ID = localPlayer.UserId
+if not localPlayer then return end -- LocalScript guarantees LocalPlayer; bail otherwise
 local PLAYER_NAME = localPlayer.Name
 
-local outputBuffer = {}
-local stopRequested = false
-local consecutiveFailures = 0
+-- Wait for the server companion to create the Remotes in ReplicatedStorage.
+-- The server companion runs slightly before us in test mode (Server scripts
+-- start before LocalScripts), but we still WaitForChild defensively.
+local clientRelay = ReplicatedStorage:WaitForChild("_MCPClientRelay", REMOTE_WAIT_TIMEOUT)
+local clientHello = ReplicatedStorage:WaitForChild("_MCPClientHello", REMOTE_WAIT_TIMEOUT)
+local clientLogs  = ReplicatedStorage:WaitForChild("_MCPClientLogs",  REMOTE_WAIT_TIMEOUT)
+if not (clientRelay and clientHello and clientLogs) then
+	-- Server companion didn't set up Remotes in time. Nothing we can do.
+	warn("[_MCPTestCompanion_Client] Remotes not found in ReplicatedStorage — server companion missing or slow")
+	return
+end
 
 -- Probe loadstring availability ONCE up front. Note: client-side gating may
--- differ from server's ServerScriptService.LoadStringEnabled (it's always
--- allowed in some Studio contexts), so we just probe to find out.
+-- differ from server's ServerScriptService.LoadStringEnabled, so we probe.
 local LOADSTRING_READY = false
 do
 	local ok, fn = pcall(loadstring, "return 1")
@@ -553,24 +721,13 @@ do
 	end
 end
 
-local function postJSON(path, body)
-	local ok, response = pcall(function()
-		return HttpService:RequestAsync({
-			Url = SERVER_URL .. path,
-			Method = "POST",
-			Headers = { ["Content-Type"] = "application/json" },
-			Body = HttpService:JSONEncode(body),
-		})
-	end)
-	if ok and response and response.Success then
-		consecutiveFailures = 0
-		return true, response
-	else
-		consecutiveFailures += 1
-		return false, nil
-	end
-end
+-- Announce ourselves to the server companion, which will register us with
+-- the bridge over HTTP on our behalf.
+clientHello:FireServer({ loadstringReady = LOADSTRING_READY })
 
+-- ---------------------------------------------------------------------------
+-- Result serializer (matches the server companion's serializer 1:1).
+-- ---------------------------------------------------------------------------
 local function serializeValue(value, depth, seen)
 	depth = depth or 0
 	seen = seen or {}
@@ -647,44 +804,46 @@ local function serializeValue(value, depth, seen)
 	end
 end
 
+-- ---------------------------------------------------------------------------
+-- LogService streaming → batched FireServer
+-- ---------------------------------------------------------------------------
+local outputBuffer = {}
 LogService.MessageOut:Connect(function(message, messageType)
 	if #outputBuffer >= MAX_BUFFER then
 		table.remove(outputBuffer, 1)
 	end
 	table.insert(outputBuffer, {
-		message = "[" .. PLAYER_NAME .. "] " .. tostring(message),
+		message = tostring(message),
 		messageType = messageType.Name,
 		timestamp = os.time(),
 	})
 end)
 
 task.spawn(function()
-	while not stopRequested do
+	while true do
 		if #outputBuffer > 0 then
 			local toSend = outputBuffer
 			outputBuffer = {}
-			local ok = postJSON("/test-session/log", {
-				sessionId = SESSION_ID,
-				source = "client",
-				messages = toSend,
-			})
-			if not ok then
-				for i = 1, math.min(#toSend, MAX_BUFFER - #outputBuffer) do
-					table.insert(outputBuffer, toSend[i])
-				end
-			end
+			-- FireServer is fire-and-forget; the server companion will tag
+			-- with our PLAYER_NAME and forward to /test-session/log.
+			pcall(function() clientLogs:FireServer(toSend) end)
 		end
 		task.wait(LOG_FLUSH_INTERVAL)
 	end
 end)
 
+-- ---------------------------------------------------------------------------
+-- Eval handler. The server companion calls clientRelay:InvokeClient(player,
+-- args), which suspends the server until we return a payload table. We do
+-- the same setfenv/xpcall sandbox dance as the server, with our own watchdog.
+-- ---------------------------------------------------------------------------
 local function buildEvalEnv()
 	return setmetatable({
 		game = game,
 		workspace = workspace,
 		Players = Players,
 		Workspace = workspace,
-		ReplicatedStorage = game:GetService("ReplicatedStorage"),
+		ReplicatedStorage = ReplicatedStorage,
 		StarterGui = game:GetService("StarterGui"),
 		StarterPlayer = game:GetService("StarterPlayer"),
 		Lighting = game:GetService("Lighting"),
@@ -693,7 +852,6 @@ local function buildEvalEnv()
 		RunService = game:GetService("RunService"),
 		UserInputService = game:GetService("UserInputService"),
 		ContextActionService = game:GetService("ContextActionService"),
-		HttpService = HttpService,
 		CollectionService = game:GetService("CollectionService"),
 		GuiService = game:GetService("GuiService"),
 		TextService = game:GetService("TextService"),
@@ -724,150 +882,128 @@ local function buildEvalEnv()
 	}, { __index = _G })
 end
 
-local function postEvalResult(replyId, payload)
-	payload.sessionId = SESSION_ID
-	payload.replyId = replyId
-	postJSON("/test-session/eval-result", payload)
-end
-
-local function handleEvalCommand(args)
-	if not args or type(args.replyId) ~= "string" or type(args.code) ~= "string" then
-		return
+local function runEval(args)
+	-- args = { replyId, code, timeoutMs, captureLogs }
+	if type(args) ~= "table" or type(args.code) ~= "string" then
+		return { ok = false, errorType = "client_protocol_error", error = "Invalid eval args" }
 	end
-	local replyId = args.replyId
 	local code = args.code
 	local timeoutMs = type(args.timeoutMs) == "number" and args.timeoutMs or 5000
 	local captureLogs = args.captureLogs ~= false
 
-	task.spawn(function()
-		local startedAt = os.clock()
-		local replied = false
-		local function safeReply(payload)
-			if replied then return end
-			replied = true
-			payload.durationMs = math.floor((os.clock() - startedAt) * 1000)
-			postEvalResult(replyId, payload)
-		end
+	local startedAt = os.clock()
+	local replied = false
+	local resultPayload = nil
+	local function reply(payload)
+		if replied then return end
+		replied = true
+		payload.durationMs = math.floor((os.clock() - startedAt) * 1000)
+		resultPayload = payload
+	end
 
-		if not LOADSTRING_READY then
-			safeReply({
-				ok = false,
-				errorType = "loadstring_disabled",
-				error = "loadstring is disabled on this client. (LocalScript loadstring depends on Studio settings; ServerScriptService.LoadStringEnabled may also be required.)",
-			})
-			return
-		end
+	if not LOADSTRING_READY then
+		reply({
+			ok = false,
+			errorType = "loadstring_disabled",
+			error = "loadstring is disabled on this client. (LocalScript loadstring depends on Studio settings; ServerScriptService.LoadStringEnabled may also be required.)",
+		})
+		return resultPayload
+	end
 
-		local localLogs = {}
-		local logConn = nil
-		if captureLogs then
-			logConn = LogService.MessageOut:Connect(function(message, messageType)
-				if #localLogs >= 200 then return end
-				table.insert(localLogs, {
-					message = tostring(message),
-					messageType = messageType.Name,
-					timestamp = os.time(),
-				})
-			end)
-		end
-		local function detachLogs()
-			if logConn then
-				pcall(function() logConn:Disconnect() end)
-				logConn = nil
-			end
-		end
-
-		local compileOk, fnOrErr = pcall(loadstring, code, "run_live_lua_client")
-		if not compileOk or type(fnOrErr) ~= "function" then
-			detachLogs()
-			safeReply({
-				ok = false,
-				errorType = "compile_error",
-				error = "Failed to compile: " .. tostring(fnOrErr),
-				logs = captureLogs and localLogs or nil,
-			})
-			return
-		end
-		setfenv(fnOrErr, buildEvalEnv())
-
-		task.delay(timeoutMs / 1000, function()
-			if replied then return end
-			detachLogs()
-			safeReply({
-				ok = false,
-				errorType = "timeout",
-				error = string.format("Eval did not return within %d ms (the spawned thread may still be running in the client).", timeoutMs),
-				logs = captureLogs and localLogs or nil,
+	local localLogs = {}
+	local logConn = nil
+	if captureLogs then
+		logConn = LogService.MessageOut:Connect(function(message, messageType)
+			if #localLogs >= 200 then return end
+			table.insert(localLogs, {
+				message = tostring(message),
+				messageType = messageType.Name,
+				timestamp = os.time(),
 			})
 		end)
-
-		local results = table.pack(xpcall(fnOrErr, function(err)
-			return { error = tostring(err), traceback = debug.traceback(nil, 2) }
-		end))
-		local execOk = results[1]
-		if replied then
-			detachLogs()
-			return
+	end
+	local function detachLogs()
+		if logConn then
+			pcall(function() logConn:Disconnect() end)
+			logConn = nil
 		end
+	end
 
-		if not execOk then
-			detachLogs()
-			local err = results[2] or {}
-			safeReply({
-				ok = false,
-				errorType = "runtime_error",
-				error = (type(err) == "table" and err.error) or tostring(err),
-				traceback = (type(err) == "table") and err.traceback or nil,
-				logs = captureLogs and localLogs or nil,
-			})
-			return
-		end
-
-		local values = {}
-		for i = 2, results.n do
-			values[i - 1] = serializeValue(results[i], 0, {})
-		end
+	local compileOk, fnOrErr = pcall(loadstring, code, "run_live_lua_client")
+	if not compileOk or type(fnOrErr) ~= "function" then
 		detachLogs()
-		safeReply({
-			ok = true,
-			values = values,
+		reply({
+			ok = false,
+			errorType = "compile_error",
+			error = "Failed to compile: " .. tostring(fnOrErr),
+			logs = captureLogs and localLogs or nil,
+		})
+		return resultPayload
+	end
+	setfenv(fnOrErr, buildEvalEnv())
+
+	-- Local watchdog: if user code yields longer than timeoutMs, the watchdog
+	-- pre-fills resultPayload with a timeout response, then the slow code
+	-- still finishes (we can't kill it cleanly) but its result is discarded.
+	task.delay(timeoutMs / 1000, function()
+		if replied then return end
+		detachLogs()
+		reply({
+			ok = false,
+			errorType = "timeout",
+			error = string.format("Eval did not return within %d ms (the spawned thread may still be running in the client).", timeoutMs),
 			logs = captureLogs and localLogs or nil,
 		})
 	end)
+
+	local results = table.pack(xpcall(fnOrErr, function(err)
+		return { error = tostring(err), traceback = debug.traceback(nil, 2) }
+	end))
+	local execOk = results[1]
+	if replied then
+		detachLogs()
+		return resultPayload
+	end
+
+	if not execOk then
+		detachLogs()
+		local err = results[2] or {}
+		reply({
+			ok = false,
+			errorType = "runtime_error",
+			error = (type(err) == "table" and err.error) or tostring(err),
+			traceback = (type(err) == "table") and err.traceback or nil,
+			logs = captureLogs and localLogs or nil,
+		})
+		return resultPayload
+	end
+
+	local values = {}
+	for i = 2, results.n do
+		values[i - 1] = serializeValue(results[i], 0, {})
+	end
+	detachLogs()
+	reply({
+		ok = true,
+		values = values,
+		logs = captureLogs and localLogs or nil,
+	})
+	return resultPayload
 end
 
-task.spawn(function()
-	local helloSent = false
-	while not stopRequested and consecutiveFailures < MAX_CONSECUTIVE_FAILURES do
-		local pollBody = {
-			sessionId = SESSION_ID,
-			target = "client",
-			userId = USER_ID,
-			playerName = PLAYER_NAME,
-		}
-		if not helloSent then
-			pollBody.hello = { loadstringReady = LOADSTRING_READY }
-		end
-		local ok, response = postJSON("/test-session/poll", pollBody)
-		if ok then helloSent = true end
-		if ok and response and response.Body then
-			local decodeOk, body = pcall(function()
-				return HttpService:JSONDecode(response.Body)
-			end)
-			if decodeOk and body then
-				if body.ended then
-					stopRequested = true
-					break
-				end
-				if body.command and body.command.cmd == "eval" then
-					handleEvalCommand(body.command.args)
-				end
-				-- Clients ignore "end"; only the server companion calls EndTest.
-			end
-		end
-		task.wait(POLL_INTERVAL)
+clientRelay.OnClientInvoke = function(args)
+	-- pcall the whole thing so a runtime crash inside runEval still produces
+	-- a deterministic reply for the server-side InvokeClient caller.
+	local ok, payloadOrErr = pcall(runEval, args)
+	if ok and type(payloadOrErr) == "table" then
+		return payloadOrErr
 	end
-end)
+	return {
+		ok = false,
+		errorType = "client_protocol_error",
+		error = "runEval crashed: " .. tostring(payloadOrErr),
+	}
+end
 ]]
 
 -- gsub-safe replacement (treat replacement as plain string, not a pattern).

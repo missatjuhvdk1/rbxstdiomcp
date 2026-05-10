@@ -575,10 +575,12 @@ local function handleEvalCommand(args)
 			return
 		end
 
-		-- LogService.MessageOut events are deferred to the next Heartbeat,
-		-- so prints from the eval haven't propagated to our local handler
-		-- yet. Yield once so they land before we detach + reply.
+		-- LogService.MessageOut events are deferred and need TWO Heartbeats
+		-- to actually invoke listeners (verified empirically — one task.wait
+		-- isn't enough). Yield twice so prints fired during the eval land
+		-- in localLogs before we detach + reply. Total cost ~32ms.
 		if captureLogs then
+			task.wait()
 			task.wait()
 		end
 
@@ -977,9 +979,12 @@ local function runEval(args)
 		return resultPayload
 	end
 
-	-- LogService.MessageOut is deferred to the next Heartbeat — yield once
-	-- so any prints/warns from the eval land in localLogs before we detach.
+	-- LogService.MessageOut events are deferred and need TWO Heartbeats
+	-- to actually invoke listeners (verified empirically — one task.wait
+	-- isn't enough). Yield twice so prints fired during the eval land
+	-- in localLogs before we detach + reply. Total cost ~32ms.
 	if captureLogs then
+		task.wait()
 		task.wait()
 	end
 

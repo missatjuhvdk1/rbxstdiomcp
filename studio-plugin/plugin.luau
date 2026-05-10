@@ -530,14 +530,17 @@ local function handleEvalCommand(args)
 			end
 		end
 
-		-- Compile
-		local compileOk, fnOrErr = pcall(loadstring, code, "run_live_lua")
-		if not compileOk or type(fnOrErr) ~= "function" then
+		-- Compile. NOTE: loadstring returns (nil, errorMessage) on syntax
+		-- failure rather than throwing — wrapping in pcall would discard the
+		-- error message into pcall's third return slot and leave fnOrErr=nil.
+		-- Calling loadstring directly captures both function and error cleanly.
+		local fnOrErr, compileErr = loadstring(code, "run_live_lua")
+		if type(fnOrErr) ~= "function" then
 			detachLogs()
 			safeReply({
 				ok = false,
 				errorType = "compile_error",
-				error = "Failed to compile: " .. tostring(fnOrErr),
+				error = "Failed to compile: " .. tostring(compileErr or fnOrErr or "<unknown>"),
 				logs = captureLogs and localLogs or nil,
 			})
 			return
@@ -570,6 +573,13 @@ local function handleEvalCommand(args)
 			-- Watchdog already responded.
 			detachLogs()
 			return
+		end
+
+		-- LogService.MessageOut events are deferred to the next Heartbeat,
+		-- so prints from the eval haven't propagated to our local handler
+		-- yet. Yield once so they land before we detach + reply.
+		if captureLogs then
+			task.wait()
 		end
 
 		if not execOk then
@@ -929,13 +939,15 @@ local function runEval(args)
 		end
 	end
 
-	local compileOk, fnOrErr = pcall(loadstring, code, "run_live_lua_client")
-	if not compileOk or type(fnOrErr) ~= "function" then
+	-- Capture both return values directly (loadstring returns nil + error
+	-- message on syntax failure rather than throwing).
+	local fnOrErr, compileErr = loadstring(code, "run_live_lua_client")
+	if type(fnOrErr) ~= "function" then
 		detachLogs()
 		reply({
 			ok = false,
 			errorType = "compile_error",
-			error = "Failed to compile: " .. tostring(fnOrErr),
+			error = "Failed to compile: " .. tostring(compileErr or fnOrErr or "<unknown>"),
 			logs = captureLogs and localLogs or nil,
 		})
 		return resultPayload
@@ -963,6 +975,12 @@ local function runEval(args)
 	if replied then
 		detachLogs()
 		return resultPayload
+	end
+
+	-- LogService.MessageOut is deferred to the next Heartbeat — yield once
+	-- so any prints/warns from the eval land in localLogs before we detach.
+	if captureLogs then
+		task.wait()
 	end
 
 	if not execOk then

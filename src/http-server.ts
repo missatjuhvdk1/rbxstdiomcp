@@ -314,13 +314,33 @@ export function createHttpServer(tools: RobloxStudioTools, bridge: BridgeService
   // Companion polls this for commands. Always echoes back the session
   // status so the companion can self-terminate cleanly when the session
   // is marked ended (e.g. user clicked Studio's Stop button).
+  //
+  // Body shape:
+  //   { sessionId: string,
+  //     target?: 'server' | 'client',  // defaults to 'server' for back-compat
+  //     userId?: number,                // required when target='client'
+  //     playerName?: string,            // optional, helps run_live_lua resolve targets
+  //     hello?: { loadstringReady: boolean }  // sent on first poll }
   app.post('/test-session/poll', (req, res) => {
-    const { sessionId } = req.body || {};
+    const { sessionId, target, userId, playerName, hello } = req.body || {};
     if (typeof sessionId !== 'string' || sessionId.length === 0) {
       res.status(400).json({ error: 'sessionId required' });
       return;
     }
-    const result = bridge.popTestCommand(sessionId);
+    const normalizedTarget = target === 'client' ? 'client' : 'server';
+    const options: {
+      userId?: number;
+      playerName?: string;
+      hello?: { loadstringReady?: boolean };
+    } = {};
+    if (typeof userId === 'number') options.userId = userId;
+    if (typeof playerName === 'string') options.playerName = playerName;
+    if (hello && typeof hello === 'object') {
+      options.hello = {
+        loadstringReady: !!hello.loadstringReady,
+      };
+    }
+    const result = bridge.popTestCommand(sessionId, normalizedTarget, options);
     res.json({
       command: result.command,
       ended: result.ended,
@@ -329,9 +349,11 @@ export function createHttpServer(tools: RobloxStudioTools, bridge: BridgeService
   });
 
   // Companion streams LogService output here. Body shape:
-  //   { sessionId: string, messages: [{ message, messageType, timestamp }] }
+  //   { sessionId: string,
+  //     source?: 'server' | 'client',  // tags entries so consumers can split
+  //     messages: [{ message, messageType, timestamp }] }
   app.post('/test-session/log', (req, res) => {
-    const { sessionId, messages } = req.body || {};
+    const { sessionId, messages, source } = req.body || {};
     if (typeof sessionId !== 'string' || sessionId.length === 0) {
       res.status(400).json({ error: 'sessionId required' });
       return;
@@ -340,8 +362,36 @@ export function createHttpServer(tools: RobloxStudioTools, bridge: BridgeService
       res.status(400).json({ error: 'messages must be an array' });
       return;
     }
-    const result = bridge.appendTestOutput(sessionId, messages, 'server');
+    const normalizedSource: 'server' | 'client' = source === 'client' ? 'client' : 'server';
+    const result = bridge.appendTestOutput(sessionId, messages, normalizedSource);
     res.json({ accepted: result.accepted, sessionMatch: result.sessionMatch });
+  });
+
+  // Companion delivers run_live_lua results here. Body shape:
+  //   { sessionId, replyId, ok, values?, errorType?, error?, traceback?,
+  //     logs?, durationMs? }
+  // Idempotent w.r.t. the same replyId — late deliveries (after the
+  // watchdog already fired) are accepted but discarded.
+  app.post('/test-session/eval-result', (req, res) => {
+    const { sessionId, replyId, ok, values, errorType, error, traceback, logs, durationMs } = req.body || {};
+    if (typeof sessionId !== 'string' || sessionId.length === 0) {
+      res.status(400).json({ error: 'sessionId required' });
+      return;
+    }
+    if (typeof replyId !== 'string' || replyId.length === 0) {
+      res.status(400).json({ error: 'replyId required' });
+      return;
+    }
+    const matched = bridge.resolveEvalReply(sessionId, replyId, {
+      ok: !!ok,
+      values: Array.isArray(values) ? values : undefined,
+      errorType,
+      error: typeof error === 'string' ? error : undefined,
+      traceback: typeof traceback === 'string' ? traceback : undefined,
+      logs: Array.isArray(logs) ? logs : undefined,
+      durationMs: typeof durationMs === 'number' ? durationMs : undefined,
+    });
+    res.json({ matched });
   });
 
   // Either the companion (after processing an end command) or the Edit-side

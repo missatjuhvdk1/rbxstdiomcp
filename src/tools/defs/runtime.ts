@@ -75,4 +75,55 @@ export const runtimeTools: ToolDef[] = [
     handler: (args, { tools }) =>
       tools.getPlaytestOutput(args?.sinceSeq, args?.limit, args?.messageTypes),
   },
+
+  {
+    name: 'run_live_lua',
+    description:
+      'Execute Lua/Luau code INSIDE a running play test (started via play_solo). Runs in the test\'s Server or Client DataModel, with full access to running game state — fire RemoteEvents, query Players, read Workspace state at the current physics tick, mutate the live world, etc. This is different from execute_lua (which runs in the Edit-mode plugin context).\n\nNever throws — every failure path is reported in the response body as { success: false, error: <enum>, message }. Possible error enums: "no_playtest" (call play_solo first), "playtest_ended" (start a new test), "companion_not_ready" (wait briefly), "loadstring_disabled" (server only — enable LoadStringEnabled before play_solo), "no_clients_connected" / "multiple_clients" / "no_such_player" (client targeting), "compile_error", "runtime_error", "timeout", "companion_error".\n\nReturns ALL Lua return values packed into `values` (an array — single-return becomes length-1, no-return becomes empty). If captureLogs=true, prints/warns/errors emitted by the executed code are returned in `logs`. Errors include `traceback` from debug.traceback.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        code: {
+          type: 'string',
+          description:
+            'Lua/Luau source to execute. Has access to the full Roblox API in the test DataModel: game, workspace, all services (Players, ReplicatedStorage, etc.), Instance, Vector3, CFrame, Color3, etc., plus loadstring, require, debug. Use `return` to send values back to the caller (multi-return supported).',
+        },
+        target: {
+          type: 'string',
+          enum: ['server', 'client'],
+          description:
+            'Where to run the code. "server" runs in the test\'s Server DataModel (full Game/RemoteEvent/DataStore access; needs LoadStringEnabled=true in place settings). "client" runs in a Player\'s LocalPlayer context (PlayerGui, ContextActionService, LocalPlayer.Character). Defaults to "server".',
+          default: 'server',
+        },
+        playerName: {
+          type: 'string',
+          description:
+            'Only used when target="client" and multiple clients are connected. The display name (or username) of the Player to run the code on. If omitted and exactly one client is connected, that one is used.',
+        },
+        timeoutMs: {
+          type: 'number',
+          description:
+            'Max time the code may run before the watchdog fires with errorType="timeout". Range 1000–30000ms, default 5000ms.',
+          default: 5000,
+          minimum: 1000,
+          maximum: 30000,
+        },
+        captureLogs: {
+          type: 'boolean',
+          description:
+            'When true (default), capture print()/warn()/error() output emitted by the code and return it in `logs`. Set to false if your code is chatty and you only care about return values.',
+          default: true,
+        },
+      },
+      required: ['code'],
+    },
+    handler: (args, { tools }) =>
+      tools.runLiveLua(
+        args?.code,
+        (args?.target as 'server' | 'client') ?? 'server',
+        args?.playerName,
+        args?.timeoutMs,
+        args?.captureLogs,
+      ),
+  },
 ];

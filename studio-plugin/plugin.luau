@@ -18,7 +18,7 @@ pcall(function()
 end)
 
 -- ============================================================================
--- TEST SESSION COMPANION
+-- TEST SESSION COMPANIONS
 --
 -- StudioTestService:EndTest() can only be called from the Server DataModel of
 -- a running test. The plugin lives in the Edit DataModel, so it cannot call
@@ -26,26 +26,49 @@ end)
 -- ServerScriptService BEFORE calling ExecutePlayModeAsync. When the test
 -- starts, that Script runs in the Server DataModel and:
 --   1. Streams LogService.MessageOut to the bridge (/test-session/log)
---   2. Polls the bridge (/test-session/poll) for an "end" command
---   3. On "end", calls StudioTestService:EndTest() — which terminates the
+--   2. Polls the bridge (/test-session/poll) for commands
+--   3. On 'end', calls StudioTestService:EndTest() — which terminates the
 --      yielding ExecutePlayModeAsync call back in the plugin.
+--   4. On 'eval', loadstring()s + xpcall()s the supplied code on its own
+--      task thread and POSTs the result to /test-session/eval-result.
+--
+-- We also inject a parallel CLIENT companion (LocalScript) into
+-- StarterPlayer.StarterPlayerScripts. StarterPlayerScripts auto-clones into
+-- each Player's PlayerScripts when they join, so every player in the test
+-- gets their own companion copy. Clients identify themselves to the bridge
+-- by userId so run_live_lua can target a specific player or pick any
+-- available one.
 --
 -- Cleanup strategy:
---   - Tagged with TEST_COMPANION_TAG so we can find orphans
+--   - Both companions tagged with TEST_COMPANION_TAG so we can find orphans
 --   - Swept on plugin activate, on every playSolo start, and after the test
 --     ends (whether via stop_play, natural end, or user clicking Stop)
+--
+-- LLM-stomp prevention:
+--   - Distinctive name + leading "(auto-generated, safe to delete)" comment
+--   - CollectionService tag
+--   - Hard refusals in destructive MCP tools (delete_object, edit_script,
+--     set_script_source, set_property Disabled, move_instance) for any
+--     instance bearing the tag or matching the name
 -- ============================================================================
 local TEST_COMPANION_NAME = "_MCPTestCompanion"
+local TEST_COMPANION_NAME_CLIENT = "_MCPTestCompanion_Client"
 local TEST_COMPANION_TAG = "_MCPTestCompanion"
 
--- The companion script source. Two placeholders are substituted at injection
--- time: __MCP_SERVER_URL__ and __MCP_SESSION_ID__. We use distinctive
--- placeholders (not %%...%% or {{...}}) to avoid collisions with Lua's own
--- pattern syntax during gsub.
+-- ----------------------------------------------------------------------------
+-- SERVER companion template. Runs as a regular Script in ServerScriptService.
+-- Placeholders __MCP_SERVER_URL__ and __MCP_SESSION_ID__ are substituted at
+-- injection time. We use distinctive placeholders (not %%...%% or {{...}}) to
+-- avoid collisions with Lua's own pattern syntax.
+-- ----------------------------------------------------------------------------
 local COMPANION_SCRIPT_TEMPLATE = [[-- _MCPTestCompanion (auto-generated, safe to delete)
 -- Runs in the Server DataModel of a Studio test session started by the MCP
--- plugin. Pipes output back to the local MCP bridge and listens for an "end"
--- command to terminate the test cleanly via StudioTestService:EndTest().
+-- plugin. Pipes output back to the local MCP bridge, listens for an "end"
+-- command to terminate the test cleanly via StudioTestService:EndTest(), and
+-- runs run_live_lua "eval" commands on the test's actual server.
+--
+-- DO NOT modify or delete while a play test is running — it will be cleaned
+-- up automatically by the MCP plugin.
 
 local HttpService = game:GetService("HttpService")
 local LogService = game:GetService("LogService")
@@ -66,6 +89,20 @@ local outputBuffer = {}
 local stopRequested = false
 local consecutiveFailures = 0
 
+-- Probe loadstring availability ONCE up front. Result goes into the hello
+-- payload so the bridge can refuse run_live_lua with a clear error if the
+-- user hasn't enabled ServerScriptService.LoadStringEnabled.
+local LOADSTRING_READY = false
+do
+	local ok, fn = pcall(loadstring, "return 1")
+	if ok and type(fn) == "function" then
+		local execOk, execVal = pcall(fn)
+		if execOk and execVal == 1 then
+			LOADSTRING_READY = true
+		end
+	end
+end
+
 local function postJSON(path, body)
 	local ok, response = pcall(function()
 		return HttpService:RequestAsync({
@@ -81,6 +118,96 @@ local function postJSON(path, body)
 	else
 		consecutiveFailures += 1
 		return false, nil
+	end
+end
+
+-- ---------------------------------------------------------------------------
+-- Result serializer (mirrors the plugin's executeLua serializer so MCP
+-- clients see the same shapes whether they're running edit-mode execute_lua
+-- or runtime run_live_lua). Depth + cycle guarded.
+-- ---------------------------------------------------------------------------
+local function serializeValue(value, depth, seen)
+	depth = depth or 0
+	seen = seen or {}
+	if depth > 8 then return "<max depth>" end
+
+	local t = typeof(value)
+	if value == nil then
+		return nil
+	elseif t == "string" then
+		-- Cap very long strings so a runaway print doesn't pollute the wire.
+		if #value > 65536 then
+			return string.sub(value, 1, 65536) .. "...<truncated>"
+		end
+		return value
+	elseif t == "number" then
+		-- JSON can't represent NaN/Infinity; coerce to string.
+		if value ~= value then return "NaN" end
+		if value == math.huge then return "Infinity" end
+		if value == -math.huge then return "-Infinity" end
+		return value
+	elseif t == "boolean" then
+		return value
+	elseif t == "Vector3" then
+		return { type = "Vector3", X = value.X, Y = value.Y, Z = value.Z }
+	elseif t == "Vector2" then
+		return { type = "Vector2", X = value.X, Y = value.Y }
+	elseif t == "CFrame" then
+		return { type = "CFrame", components = { value:GetComponents() } }
+	elseif t == "Color3" then
+		return { type = "Color3", R = value.R, G = value.G, B = value.B }
+	elseif t == "BrickColor" then
+		return { type = "BrickColor", Name = value.Name }
+	elseif t == "UDim" then
+		return { type = "UDim", Scale = value.Scale, Offset = value.Offset }
+	elseif t == "UDim2" then
+		return {
+			type = "UDim2",
+			X = { Scale = value.X.Scale, Offset = value.X.Offset },
+			Y = { Scale = value.Y.Scale, Offset = value.Y.Offset },
+		}
+	elseif t == "Rect" then
+		return { type = "Rect", Min = { X = value.Min.X, Y = value.Min.Y }, Max = { X = value.Max.X, Y = value.Max.Y } }
+	elseif t == "Ray" then
+		return {
+			type = "Ray",
+			Origin = { X = value.Origin.X, Y = value.Origin.Y, Z = value.Origin.Z },
+			Direction = { X = value.Direction.X, Y = value.Direction.Y, Z = value.Direction.Z },
+		}
+	elseif t == "NumberRange" then
+		return { type = "NumberRange", Min = value.Min, Max = value.Max }
+	elseif t == "EnumItem" then
+		return { type = "EnumItem", Name = tostring(value), Value = value.Value }
+	elseif t == "Instance" then
+		local fullName = "<unparented>"
+		pcall(function() fullName = value:GetFullName() end)
+		return { type = "Instance", ClassName = value.ClassName, Name = value.Name, Path = fullName }
+	elseif t == "table" then
+		if seen[value] then return "<cycle>" end
+		seen[value] = true
+		local result = {}
+		local count = 0
+		for k, v in pairs(value) do
+			count += 1
+			if count > 200 then
+				result["__truncated__"] = true
+				break
+			end
+			local keyStr = type(k) == "string" and k or tostring(k)
+			result[keyStr] = serializeValue(v, depth + 1, seen)
+		end
+		seen[value] = nil
+		return result
+	elseif t == "function" then
+		return "<function>"
+	elseif t == "thread" then
+		return "<thread>"
+	elseif t == "buffer" then
+		return "<buffer>"
+	else
+		-- Fallback: stringify whatever it is.
+		local ok, str = pcall(tostring, value)
+		return ok and str or ("<" .. t .. ">")
 	end
 end
 
@@ -105,6 +232,7 @@ task.spawn(function()
 			outputBuffer = {}
 			local ok = postJSON("/test-session/log", {
 				sessionId = SESSION_ID,
+				source = "server",
 				messages = toSend,
 			})
 			if not ok then
@@ -120,10 +248,210 @@ task.spawn(function()
 	end
 end)
 
+-- ---------------------------------------------------------------------------
+-- Eval handler. Compiles user code via loadstring, runs under xpcall on its
+-- own task thread, captures LogService output during the call window, and
+-- POSTs the result back to /test-session/eval-result. A task.delay watchdog
+-- forces a 'timeout' reply if the user code yields too long.
+-- ---------------------------------------------------------------------------
+local function buildEvalEnv()
+	-- Mirror executeLua's sandbox so the same conveniences are available
+	-- on the in-test side. We expose game/services so the AI can mutate
+	-- live state, fire RemoteEvents, etc.
+	return setmetatable({
+		game = game,
+		workspace = workspace,
+		Players = game:GetService("Players"),
+		Workspace = workspace,
+		ReplicatedStorage = game:GetService("ReplicatedStorage"),
+		ServerStorage = game:GetService("ServerStorage"),
+		ServerScriptService = game:GetService("ServerScriptService"),
+		StarterGui = game:GetService("StarterGui"),
+		StarterPack = game:GetService("StarterPack"),
+		StarterPlayer = game:GetService("StarterPlayer"),
+		Lighting = game:GetService("Lighting"),
+		SoundService = game:GetService("SoundService"),
+		TweenService = game:GetService("TweenService"),
+		RunService = game:GetService("RunService"),
+		UserInputService = game:GetService("UserInputService"),
+		HttpService = HttpService,
+		CollectionService = game:GetService("CollectionService"),
+		PhysicsService = game:GetService("PhysicsService"),
+		PathfindingService = game:GetService("PathfindingService"),
+		TextService = game:GetService("TextService"),
+		MarketplaceService = game:GetService("MarketplaceService"),
+		TeleportService = game:GetService("TeleportService"),
+		DataStoreService = game:GetService("DataStoreService"),
+		MemoryStoreService = game:GetService("MemoryStoreService"),
+		MessagingService = game:GetService("MessagingService"),
+		BadgeService = game:GetService("BadgeService"),
+		Instance = Instance,
+		Vector3 = Vector3, Vector2 = Vector2, CFrame = CFrame, Color3 = Color3,
+		BrickColor = BrickColor, UDim = UDim, UDim2 = UDim2, Rect = Rect, Ray = Ray,
+		Region3 = Region3, NumberSequence = NumberSequence,
+		NumberSequenceKeypoint = NumberSequenceKeypoint, ColorSequence = ColorSequence,
+		ColorSequenceKeypoint = ColorSequenceKeypoint, NumberRange = NumberRange,
+		TweenInfo = TweenInfo, Font = Font, Enum = Enum,
+		print = print, warn = warn, error = error, assert = assert,
+		type = type, typeof = typeof, tostring = tostring, tonumber = tonumber,
+		pairs = pairs, ipairs = ipairs, next = next, select = select, unpack = unpack,
+		pcall = pcall, xpcall = xpcall,
+		rawget = rawget, rawset = rawset, rawequal = rawequal,
+		setmetatable = setmetatable, getmetatable = getmetatable, newproxy = newproxy,
+		table = table, string = string, math = math,
+		os = { time = os.time, date = os.date, difftime = os.difftime, clock = os.clock },
+		coroutine = coroutine, bit32 = bit32, utf8 = utf8, buffer = buffer,
+		task = task, wait = task.wait, delay = task.delay, spawn = task.spawn, defer = task.defer,
+		loadstring = loadstring,
+		require = require,
+		debug = debug,
+		tick = tick,
+	}, { __index = _G })
+end
+
+local function postEvalResult(replyId, payload)
+	payload.sessionId = SESSION_ID
+	payload.replyId = replyId
+	postJSON("/test-session/eval-result", payload)
+end
+
+local function handleEvalCommand(args)
+	if not args or type(args.replyId) ~= "string" or type(args.code) ~= "string" then
+		return -- malformed; bridge will time out, no point replying without replyId
+	end
+	local replyId = args.replyId
+	local code = args.code
+	local timeoutMs = type(args.timeoutMs) == "number" and args.timeoutMs or 5000
+	local captureLogs = args.captureLogs ~= false -- default true
+
+	-- Run the eval on its own task so this command poller can keep going
+	-- (a slow eval shouldn't block log streaming or further commands).
+	task.spawn(function()
+		local startedAt = os.clock()
+		local replied = false
+		local function safeReply(payload)
+			if replied then return end
+			replied = true
+			payload.durationMs = math.floor((os.clock() - startedAt) * 1000)
+			postEvalResult(replyId, payload)
+		end
+
+		if not LOADSTRING_READY then
+			safeReply({
+				ok = false,
+				errorType = "loadstring_disabled",
+				error = "loadstring is disabled. Enable ServerScriptService.LoadStringEnabled in the Properties pane (it has the NotScriptable tag so it cannot be flipped from code) and start a new play test.",
+			})
+			return
+		end
+
+		-- Capture logs scoped to this eval call. We collect into a private
+		-- buffer via a fresh LogService connection, then disconnect once
+		-- we've replied.
+		local localLogs = {}
+		local logConn = nil
+		if captureLogs then
+			logConn = LogService.MessageOut:Connect(function(message, messageType)
+				if #localLogs >= 200 then return end
+				table.insert(localLogs, {
+					message = tostring(message),
+					messageType = messageType.Name,
+					timestamp = os.time(),
+				})
+			end)
+		end
+
+		local function detachLogs()
+			if logConn then
+				pcall(function() logConn:Disconnect() end)
+				logConn = nil
+			end
+		end
+
+		-- Compile
+		local compileOk, fnOrErr = pcall(loadstring, code, "run_live_lua")
+		if not compileOk or type(fnOrErr) ~= "function" then
+			detachLogs()
+			safeReply({
+				ok = false,
+				errorType = "compile_error",
+				error = "Failed to compile: " .. tostring(fnOrErr),
+				logs = captureLogs and localLogs or nil,
+			})
+			return
+		end
+
+		setfenv(fnOrErr, buildEvalEnv())
+
+		-- Watchdog: if the user code yields longer than timeoutMs, reply
+		-- with a synthetic timeout. The user thread will keep running
+		-- (we can't kill a yielded thread cleanly) but the AI gets a
+		-- bounded response.
+		task.delay(timeoutMs / 1000, function()
+			if replied then return end
+			detachLogs()
+			safeReply({
+				ok = false,
+				errorType = "timeout",
+				error = string.format("Eval did not return within %d ms (the spawned thread may still be running in the test).", timeoutMs),
+				logs = captureLogs and localLogs or nil,
+			})
+		end)
+
+		-- Execute. Pack multi-return into an array so the bridge can
+		-- preserve `return a, b, c` semantics.
+		local results = table.pack(xpcall(fnOrErr, function(err)
+			return { error = tostring(err), traceback = debug.traceback(nil, 2) }
+		end))
+		local execOk = results[1]
+		if replied then
+			-- Watchdog already responded.
+			detachLogs()
+			return
+		end
+
+		if not execOk then
+			detachLogs()
+			local err = results[2] or {}
+			safeReply({
+				ok = false,
+				errorType = "runtime_error",
+				error = (type(err) == "table" and err.error) or tostring(err),
+				traceback = (type(err) == "table") and err.traceback or nil,
+				logs = captureLogs and localLogs or nil,
+			})
+			return
+		end
+
+		-- Pack remaining values (results[2..n]) as the multi-return array.
+		local values = {}
+		for i = 2, results.n do
+			values[i - 1] = serializeValue(results[i], 0, {})
+		end
+
+		detachLogs()
+		safeReply({
+			ok = true,
+			values = values,
+			logs = captureLogs and localLogs or nil,
+		})
+	end)
+end
+
 -- Command poller
 task.spawn(function()
+	-- First poll includes hello so the bridge can record loadstring
+	-- readiness for later run_live_lua callers.
+	local helloSent = false
 	while not stopRequested and consecutiveFailures < MAX_CONSECUTIVE_FAILURES do
-		local ok, response = postJSON("/test-session/poll", { sessionId = SESSION_ID })
+		local pollBody = { sessionId = SESSION_ID, target = "server" }
+		if not helloSent then
+			pollBody.hello = { loadstringReady = LOADSTRING_READY }
+		end
+		local ok, response = postJSON("/test-session/poll", pollBody)
+		if ok then
+			helloSent = true
+		end
 		if ok and response and response.Body then
 			local decodeOk, body = pcall(function()
 				return HttpService:JSONDecode(response.Body)
@@ -143,6 +471,7 @@ task.spawn(function()
 						outputBuffer = {}
 						postJSON("/test-session/log", {
 							sessionId = SESSION_ID,
+							source = "server",
 							messages = final,
 						})
 					end
@@ -160,7 +489,380 @@ task.spawn(function()
 						end)
 					end
 					return
+				elseif body.command and body.command.cmd == "eval" then
+					handleEvalCommand(body.command.args)
 				end
+			end
+		end
+		task.wait(POLL_INTERVAL)
+	end
+end)
+]]
+
+-- ----------------------------------------------------------------------------
+-- CLIENT companion template. Runs as a LocalScript in StarterPlayerScripts
+-- (which auto-clones into each Player's PlayerScripts on join). Each Player
+-- gets their own copy and identifies to the bridge by userId. Only handles
+-- 'eval' commands and streams its local LogService.
+--
+-- It does NOT call EndTest (only the server can do that), so the only stop
+-- signal it cares about is the bridge's `ended` flag.
+-- ----------------------------------------------------------------------------
+local CLIENT_COMPANION_SCRIPT_TEMPLATE = [[-- _MCPTestCompanion_Client (auto-generated, safe to delete)
+-- Runs in each Player's PlayerScripts during a Studio test session started by
+-- the MCP plugin. Streams local LogService output and runs run_live_lua eval
+-- commands targeted at this client.
+--
+-- DO NOT modify or delete while a play test is running — it will be cleaned
+-- up automatically by the MCP plugin.
+
+local HttpService = game:GetService("HttpService")
+local LogService = game:GetService("LogService")
+local Players = game:GetService("Players")
+
+local SERVER_URL = "__MCP_SERVER_URL__"
+local SESSION_ID = "__MCP_SESSION_ID__"
+local POLL_INTERVAL = 0.4
+local LOG_FLUSH_INTERVAL = 0.25
+local MAX_BUFFER = 5000
+local MAX_CONSECUTIVE_FAILURES = 30
+
+local localPlayer = Players.LocalPlayer
+if not localPlayer then
+	-- LocalScript should always have LocalPlayer; bail otherwise.
+	return
+end
+local USER_ID = localPlayer.UserId
+local PLAYER_NAME = localPlayer.Name
+
+local outputBuffer = {}
+local stopRequested = false
+local consecutiveFailures = 0
+
+-- Probe loadstring availability ONCE up front. Note: client-side gating may
+-- differ from server's ServerScriptService.LoadStringEnabled (it's always
+-- allowed in some Studio contexts), so we just probe to find out.
+local LOADSTRING_READY = false
+do
+	local ok, fn = pcall(loadstring, "return 1")
+	if ok and type(fn) == "function" then
+		local execOk, execVal = pcall(fn)
+		if execOk and execVal == 1 then
+			LOADSTRING_READY = true
+		end
+	end
+end
+
+local function postJSON(path, body)
+	local ok, response = pcall(function()
+		return HttpService:RequestAsync({
+			Url = SERVER_URL .. path,
+			Method = "POST",
+			Headers = { ["Content-Type"] = "application/json" },
+			Body = HttpService:JSONEncode(body),
+		})
+	end)
+	if ok and response and response.Success then
+		consecutiveFailures = 0
+		return true, response
+	else
+		consecutiveFailures += 1
+		return false, nil
+	end
+end
+
+local function serializeValue(value, depth, seen)
+	depth = depth or 0
+	seen = seen or {}
+	if depth > 8 then return "<max depth>" end
+	local t = typeof(value)
+	if value == nil then
+		return nil
+	elseif t == "string" then
+		if #value > 65536 then return string.sub(value, 1, 65536) .. "...<truncated>" end
+		return value
+	elseif t == "number" then
+		if value ~= value then return "NaN" end
+		if value == math.huge then return "Infinity" end
+		if value == -math.huge then return "-Infinity" end
+		return value
+	elseif t == "boolean" then
+		return value
+	elseif t == "Vector3" then
+		return { type = "Vector3", X = value.X, Y = value.Y, Z = value.Z }
+	elseif t == "Vector2" then
+		return { type = "Vector2", X = value.X, Y = value.Y }
+	elseif t == "CFrame" then
+		return { type = "CFrame", components = { value:GetComponents() } }
+	elseif t == "Color3" then
+		return { type = "Color3", R = value.R, G = value.G, B = value.B }
+	elseif t == "BrickColor" then
+		return { type = "BrickColor", Name = value.Name }
+	elseif t == "UDim" then
+		return { type = "UDim", Scale = value.Scale, Offset = value.Offset }
+	elseif t == "UDim2" then
+		return {
+			type = "UDim2",
+			X = { Scale = value.X.Scale, Offset = value.X.Offset },
+			Y = { Scale = value.Y.Scale, Offset = value.Y.Offset },
+		}
+	elseif t == "Rect" then
+		return { type = "Rect", Min = { X = value.Min.X, Y = value.Min.Y }, Max = { X = value.Max.X, Y = value.Max.Y } }
+	elseif t == "Ray" then
+		return {
+			type = "Ray",
+			Origin = { X = value.Origin.X, Y = value.Origin.Y, Z = value.Origin.Z },
+			Direction = { X = value.Direction.X, Y = value.Direction.Y, Z = value.Direction.Z },
+		}
+	elseif t == "NumberRange" then
+		return { type = "NumberRange", Min = value.Min, Max = value.Max }
+	elseif t == "EnumItem" then
+		return { type = "EnumItem", Name = tostring(value), Value = value.Value }
+	elseif t == "Instance" then
+		local fullName = "<unparented>"
+		pcall(function() fullName = value:GetFullName() end)
+		return { type = "Instance", ClassName = value.ClassName, Name = value.Name, Path = fullName }
+	elseif t == "table" then
+		if seen[value] then return "<cycle>" end
+		seen[value] = true
+		local result = {}
+		local count = 0
+		for k, v in pairs(value) do
+			count += 1
+			if count > 200 then result["__truncated__"] = true; break end
+			local keyStr = type(k) == "string" and k or tostring(k)
+			result[keyStr] = serializeValue(v, depth + 1, seen)
+		end
+		seen[value] = nil
+		return result
+	elseif t == "function" then
+		return "<function>"
+	elseif t == "thread" then
+		return "<thread>"
+	elseif t == "buffer" then
+		return "<buffer>"
+	else
+		local ok, str = pcall(tostring, value)
+		return ok and str or ("<" .. t .. ">")
+	end
+end
+
+LogService.MessageOut:Connect(function(message, messageType)
+	if #outputBuffer >= MAX_BUFFER then
+		table.remove(outputBuffer, 1)
+	end
+	table.insert(outputBuffer, {
+		message = "[" .. PLAYER_NAME .. "] " .. tostring(message),
+		messageType = messageType.Name,
+		timestamp = os.time(),
+	})
+end)
+
+task.spawn(function()
+	while not stopRequested do
+		if #outputBuffer > 0 then
+			local toSend = outputBuffer
+			outputBuffer = {}
+			local ok = postJSON("/test-session/log", {
+				sessionId = SESSION_ID,
+				source = "client",
+				messages = toSend,
+			})
+			if not ok then
+				for i = 1, math.min(#toSend, MAX_BUFFER - #outputBuffer) do
+					table.insert(outputBuffer, toSend[i])
+				end
+			end
+		end
+		task.wait(LOG_FLUSH_INTERVAL)
+	end
+end)
+
+local function buildEvalEnv()
+	return setmetatable({
+		game = game,
+		workspace = workspace,
+		Players = Players,
+		Workspace = workspace,
+		ReplicatedStorage = game:GetService("ReplicatedStorage"),
+		StarterGui = game:GetService("StarterGui"),
+		StarterPlayer = game:GetService("StarterPlayer"),
+		Lighting = game:GetService("Lighting"),
+		SoundService = game:GetService("SoundService"),
+		TweenService = game:GetService("TweenService"),
+		RunService = game:GetService("RunService"),
+		UserInputService = game:GetService("UserInputService"),
+		ContextActionService = game:GetService("ContextActionService"),
+		HttpService = HttpService,
+		CollectionService = game:GetService("CollectionService"),
+		GuiService = game:GetService("GuiService"),
+		TextService = game:GetService("TextService"),
+		MarketplaceService = game:GetService("MarketplaceService"),
+		Instance = Instance,
+		Vector3 = Vector3, Vector2 = Vector2, CFrame = CFrame, Color3 = Color3,
+		BrickColor = BrickColor, UDim = UDim, UDim2 = UDim2, Rect = Rect, Ray = Ray,
+		Region3 = Region3, NumberSequence = NumberSequence,
+		NumberSequenceKeypoint = NumberSequenceKeypoint, ColorSequence = ColorSequence,
+		ColorSequenceKeypoint = ColorSequenceKeypoint, NumberRange = NumberRange,
+		TweenInfo = TweenInfo, Font = Font, Enum = Enum,
+		print = print, warn = warn, error = error, assert = assert,
+		type = type, typeof = typeof, tostring = tostring, tonumber = tonumber,
+		pairs = pairs, ipairs = ipairs, next = next, select = select, unpack = unpack,
+		pcall = pcall, xpcall = xpcall,
+		rawget = rawget, rawset = rawset, rawequal = rawequal,
+		setmetatable = setmetatable, getmetatable = getmetatable, newproxy = newproxy,
+		table = table, string = string, math = math,
+		os = { time = os.time, date = os.date, difftime = os.difftime, clock = os.clock },
+		coroutine = coroutine, bit32 = bit32, utf8 = utf8, buffer = buffer,
+		task = task, wait = task.wait, delay = task.delay, spawn = task.spawn, defer = task.defer,
+		loadstring = loadstring,
+		require = require,
+		debug = debug,
+		tick = tick,
+		LocalPlayer = localPlayer,
+		PlayerGui = localPlayer:FindFirstChildOfClass("PlayerGui"),
+	}, { __index = _G })
+end
+
+local function postEvalResult(replyId, payload)
+	payload.sessionId = SESSION_ID
+	payload.replyId = replyId
+	postJSON("/test-session/eval-result", payload)
+end
+
+local function handleEvalCommand(args)
+	if not args or type(args.replyId) ~= "string" or type(args.code) ~= "string" then
+		return
+	end
+	local replyId = args.replyId
+	local code = args.code
+	local timeoutMs = type(args.timeoutMs) == "number" and args.timeoutMs or 5000
+	local captureLogs = args.captureLogs ~= false
+
+	task.spawn(function()
+		local startedAt = os.clock()
+		local replied = false
+		local function safeReply(payload)
+			if replied then return end
+			replied = true
+			payload.durationMs = math.floor((os.clock() - startedAt) * 1000)
+			postEvalResult(replyId, payload)
+		end
+
+		if not LOADSTRING_READY then
+			safeReply({
+				ok = false,
+				errorType = "loadstring_disabled",
+				error = "loadstring is disabled on this client. (LocalScript loadstring depends on Studio settings; ServerScriptService.LoadStringEnabled may also be required.)",
+			})
+			return
+		end
+
+		local localLogs = {}
+		local logConn = nil
+		if captureLogs then
+			logConn = LogService.MessageOut:Connect(function(message, messageType)
+				if #localLogs >= 200 then return end
+				table.insert(localLogs, {
+					message = tostring(message),
+					messageType = messageType.Name,
+					timestamp = os.time(),
+				})
+			end)
+		end
+		local function detachLogs()
+			if logConn then
+				pcall(function() logConn:Disconnect() end)
+				logConn = nil
+			end
+		end
+
+		local compileOk, fnOrErr = pcall(loadstring, code, "run_live_lua_client")
+		if not compileOk or type(fnOrErr) ~= "function" then
+			detachLogs()
+			safeReply({
+				ok = false,
+				errorType = "compile_error",
+				error = "Failed to compile: " .. tostring(fnOrErr),
+				logs = captureLogs and localLogs or nil,
+			})
+			return
+		end
+		setfenv(fnOrErr, buildEvalEnv())
+
+		task.delay(timeoutMs / 1000, function()
+			if replied then return end
+			detachLogs()
+			safeReply({
+				ok = false,
+				errorType = "timeout",
+				error = string.format("Eval did not return within %d ms (the spawned thread may still be running in the client).", timeoutMs),
+				logs = captureLogs and localLogs or nil,
+			})
+		end)
+
+		local results = table.pack(xpcall(fnOrErr, function(err)
+			return { error = tostring(err), traceback = debug.traceback(nil, 2) }
+		end))
+		local execOk = results[1]
+		if replied then
+			detachLogs()
+			return
+		end
+
+		if not execOk then
+			detachLogs()
+			local err = results[2] or {}
+			safeReply({
+				ok = false,
+				errorType = "runtime_error",
+				error = (type(err) == "table" and err.error) or tostring(err),
+				traceback = (type(err) == "table") and err.traceback or nil,
+				logs = captureLogs and localLogs or nil,
+			})
+			return
+		end
+
+		local values = {}
+		for i = 2, results.n do
+			values[i - 1] = serializeValue(results[i], 0, {})
+		end
+		detachLogs()
+		safeReply({
+			ok = true,
+			values = values,
+			logs = captureLogs and localLogs or nil,
+		})
+	end)
+end
+
+task.spawn(function()
+	local helloSent = false
+	while not stopRequested and consecutiveFailures < MAX_CONSECUTIVE_FAILURES do
+		local pollBody = {
+			sessionId = SESSION_ID,
+			target = "client",
+			userId = USER_ID,
+			playerName = PLAYER_NAME,
+		}
+		if not helloSent then
+			pollBody.hello = { loadstringReady = LOADSTRING_READY }
+		end
+		local ok, response = postJSON("/test-session/poll", pollBody)
+		if ok then helloSent = true end
+		if ok and response and response.Body then
+			local decodeOk, body = pcall(function()
+				return HttpService:JSONDecode(response.Body)
+			end)
+			if decodeOk and body then
+				if body.ended then
+					stopRequested = true
+					break
+				end
+				if body.command and body.command.cmd == "eval" then
+					handleEvalCommand(body.command.args)
+				end
+				-- Clients ignore "end"; only the server companion calls EndTest.
 			end
 		end
 		task.wait(POLL_INTERVAL)
@@ -194,14 +896,26 @@ local function cleanupTestCompanions()
 			count += 1
 		end
 	end)
-	-- Belt & suspenders: also remove any name-matching script in
-	-- ServerScriptService in case the tag was somehow stripped.
+	-- Belt & suspenders: also remove any name-matching scripts in the
+	-- two known parents in case the tag was somehow stripped.
 	pcall(function()
 		local sss = game:GetService("ServerScriptService")
 		for _, child in ipairs(sss:GetChildren()) do
-			if child.Name == TEST_COMPANION_NAME then
+			if child.Name == TEST_COMPANION_NAME or child.Name == TEST_COMPANION_NAME_CLIENT then
 				pcall(function() child:Destroy() end)
 				count += 1
+			end
+		end
+	end)
+	pcall(function()
+		local starterPlayer = game:GetService("StarterPlayer")
+		local sps = starterPlayer and starterPlayer:FindFirstChild("StarterPlayerScripts")
+		if sps then
+			for _, child in ipairs(sps:GetChildren()) do
+				if child.Name == TEST_COMPANION_NAME or child.Name == TEST_COMPANION_NAME_CLIENT then
+					pcall(function() child:Destroy() end)
+					count += 1
+				end
 			end
 		end
 	end)
@@ -209,16 +923,17 @@ local function cleanupTestCompanions()
 end
 
 local function injectTestCompanion(serverUrl, sessionId)
-	-- Always sweep before creating to guarantee at most one companion exists.
+	-- Always sweep before creating to guarantee at most one of each companion exists.
 	cleanupTestCompanions()
 
-	local source = COMPANION_SCRIPT_TEMPLATE
-	source = plainReplace(source, "__MCP_SERVER_URL__", serverUrl)
-	source = plainReplace(source, "__MCP_SESSION_ID__", sessionId)
+	-- ----- SERVER companion -----
+	local serverSource = COMPANION_SCRIPT_TEMPLATE
+	serverSource = plainReplace(serverSource, "__MCP_SERVER_URL__", serverUrl)
+	serverSource = plainReplace(serverSource, "__MCP_SESSION_ID__", sessionId)
 
-	local script = Instance.new("Script")
-	script.Name = TEST_COMPANION_NAME
-	script.Source = source
+	local serverScript = Instance.new("Script")
+	serverScript.Name = TEST_COMPANION_NAME
+	serverScript.Source = serverSource
 	-- IMPORTANT: Archivable MUST stay true (the default).
 	-- ExecutePlayModeAsync builds the test DataModel by Clone()-ing the Edit
 	-- DataModel, and Instance:Clone() silently returns nil for any instance
@@ -231,14 +946,42 @@ local function injectTestCompanion(serverUrl, sessionId)
 	-- We rely on the cleanup sweeps (on plugin activate, before each test,
 	-- after each test) to keep companions out of the saved file. The script
 	-- is also tagged with TEST_COMPANION_TAG so any orphan is easy to find.
-	script.Archivable = true
-	script.Parent = game:GetService("ServerScriptService")
-
+	serverScript.Archivable = true
+	serverScript.Parent = game:GetService("ServerScriptService")
 	pcall(function()
-		CollectionService:AddTag(script, TEST_COMPANION_TAG)
+		CollectionService:AddTag(serverScript, TEST_COMPANION_TAG)
 	end)
 
-	return script
+	-- ----- CLIENT companion -----
+	-- LocalScripts in StarterPlayer.StarterPlayerScripts auto-clone into
+	-- each Player's PlayerScripts on join, so this single LocalScript
+	-- yields one companion per player in the test.
+	local clientScript = nil
+	pcall(function()
+		local clientSource = CLIENT_COMPANION_SCRIPT_TEMPLATE
+		clientSource = plainReplace(clientSource, "__MCP_SERVER_URL__", serverUrl)
+		clientSource = plainReplace(clientSource, "__MCP_SESSION_ID__", sessionId)
+
+		local sp = game:GetService("StarterPlayer")
+		local sps = sp:FindFirstChild("StarterPlayerScripts")
+		if not sps then
+			-- Some empty places ship without StarterPlayerScripts. Create it.
+			sps = Instance.new("StarterPlayerScripts")
+			sps.Parent = sp
+		end
+
+		local ls = Instance.new("LocalScript")
+		ls.Name = TEST_COMPANION_NAME_CLIENT
+		ls.Source = clientSource
+		ls.Archivable = true
+		ls.Parent = sps
+		pcall(function()
+			CollectionService:AddTag(ls, TEST_COMPANION_TAG)
+		end)
+		clientScript = ls
+	end)
+
+	return serverScript, clientScript
 end
 
 -- Track output log for get_output
@@ -4380,7 +5123,7 @@ handlers.playSolo = function(requestData)
 	cleanupTestCompanions()
 
 	local success, result = pcall(function()
-		local companion = injectTestCompanion(pluginState.serverUrl, sessionId)
+		local serverCompanion, clientCompanion = injectTestCompanion(pluginState.serverUrl, sessionId)
 
 		-- ExecutePlayModeAsync yields until the test ends. Run it on its
 		-- own thread so the HTTP response for play_solo returns now,
@@ -4417,8 +5160,9 @@ handlers.playSolo = function(requestData)
 			success = true,
 			sessionId = sessionId,
 			method = "StudioTestService:ExecutePlayModeAsync",
-			companionPath = getInstancePath(companion),
-			message = "Started Play Solo with MCP companion. Use stop_play to end, get_playtest_output to read logs.",
+			companionPath = getInstancePath(serverCompanion),
+			clientCompanionPath = clientCompanion and getInstancePath(clientCompanion) or nil,
+			message = "Started Play Solo with MCP server + client companions. Use stop_play to end, get_playtest_output to read logs, run_live_lua to execute code in the running test.",
 		}
 	end)
 

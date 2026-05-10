@@ -1,6 +1,7 @@
 import { StudioHttpClient } from './studio-client.js';
 import { BridgeService } from '../bridge-service.js';
 import * as zlib from 'zlib';
+import { v4 as uuidv4 } from 'uuid';
 import { ensureDocsCache } from '../docs/fetcher.js';
 import {
   listDocs,
@@ -99,6 +100,62 @@ export class RobloxStudioTools {
   constructor(bridge: BridgeService) {
     this.bridge = bridge;
     this.client = new StudioHttpClient(bridge);
+  }
+
+  // ============================================
+  // MCP-INTERNAL SAFETY GUARDS
+  //
+  // run_live_lua relies on injected companion Scripts that live in
+  // ServerScriptService and StarterPlayer.StarterPlayerScripts. We don't
+  // want a confused AI to accidentally delete/edit/disable them via the
+  // generic destructive tools (set_property, delete_object, set_script_source,
+  // edit_script, find_and_replace_in_scripts, move_instance) — those would
+  // silently break the bridge.
+  //
+  // The plugin already does opportunistic sweeping by tag/name on activate
+  // and at the start/end of each play_solo. This guard is the second layer:
+  // refuse the operation outright with a friendly explanation, so the AI
+  // gets explicit feedback instead of mysterious "no eval reply" errors.
+  // ============================================
+  private static readonly MCP_INTERNAL_NAMES = [
+    '_MCPTestCompanion',
+    '_MCPTestCompanion_Client',
+  ];
+
+  private isMCPInternal(path: string | undefined | null): boolean {
+    if (!path || typeof path !== 'string') return false;
+    for (const name of RobloxStudioTools.MCP_INTERNAL_NAMES) {
+      // Match as a path segment (preceded/followed by '.' or end-of-string),
+      // not as a substring inside an arbitrary user-named instance.
+      if (
+        path === name ||
+        path.endsWith('.' + name) ||
+        path.includes('.' + name + '.') ||
+        path.startsWith(name + '.')
+      ) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private mcpInternalRefusal(action: string, instancePath: string) {
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify(
+            {
+              success: false,
+              error: 'mcp_internal',
+              message: `Refusing to ${action} "${instancePath}" — this is an MCP-internal companion Script used by run_live_lua / play_solo. The plugin manages its lifecycle automatically; if you really want it gone, run stop_play and the plugin will sweep it on the next activation. (Names reserved: _MCPTestCompanion, _MCPTestCompanion_Client.)`,
+            },
+            null,
+            2,
+          ),
+        },
+      ],
+    };
   }
 
   // File System Tools
@@ -254,10 +311,21 @@ export class RobloxStudioTools {
     if (!instancePath || !propertyName) {
       throw new Error('Instance path and property name are required for set_property');
     }
-    const response = await this.client.request('/api/set-property', { 
-      instancePath, 
-      propertyName, 
-      propertyValue 
+    // Refuse to mutate MCP-internal companions — only the destructive
+    // properties; reading/altering benign metadata (e.g. Source via the
+    // dedicated API) is already gated below.
+    if (this.isMCPInternal(instancePath)) {
+      const dangerous = new Set([
+        'Disabled', 'Source', 'Parent', 'Name', 'Archivable', 'RunContext', 'Enabled',
+      ]);
+      if (dangerous.has(propertyName)) {
+        return this.mcpInternalRefusal(`set ${propertyName} on`, instancePath);
+      }
+    }
+    const response = await this.client.request('/api/set-property', {
+      instancePath,
+      propertyName,
+      propertyValue
     });
     return {
       content: [
@@ -379,6 +447,9 @@ export class RobloxStudioTools {
   async deleteObject(instancePath: string) {
     if (!instancePath) {
       throw new Error('Instance path is required for delete_object');
+    }
+    if (this.isMCPInternal(instancePath)) {
+      return this.mcpInternalRefusal('delete', instancePath);
     }
     const response = await this.client.request('/api/delete-object', { instancePath });
     return {
@@ -532,6 +603,9 @@ export class RobloxStudioTools {
     if (!instancePath || typeof source !== 'string') {
       throw new Error('Instance path and source code string are required for set_script_source');
     }
+    if (this.isMCPInternal(instancePath)) {
+      return this.mcpInternalRefusal('rewrite source of', instancePath);
+    }
     const response = await this.client.request('/api/set-script-source', { instancePath, source });
     return {
       content: [
@@ -559,6 +633,9 @@ export class RobloxStudioTools {
     }
     if (oldString === newString) {
       throw new Error('old_string and new_string must be different');
+    }
+    if (this.isMCPInternal(instancePath)) {
+      return this.mcpInternalRefusal('edit', instancePath);
     }
 
     const response = await this.client.request('/api/edit-script', {
@@ -633,12 +710,43 @@ export class RobloxStudioTools {
       throw new Error('old_string and new_string are required');
     }
 
+    // Filter out MCP-internal paths and report which ones we skipped, so
+    // the AI doesn't silently include companions in a batch rename.
+    const blocked: string[] = [];
+    const allowed: string[] = [];
+    for (const p of paths) {
+      if (this.isMCPInternal(p)) {
+        blocked.push(p);
+      } else {
+        allowed.push(p);
+      }
+    }
+    if (allowed.length === 0) {
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify({
+              success: false,
+              error: 'mcp_internal',
+              message: `All targeted paths are MCP-internal companion Scripts. Refusing to edit. Blocked: ${blocked.join(', ')}`,
+            }, null, 2),
+          },
+        ],
+      };
+    }
+
     const response = await this.client.request('/api/find-and-replace-in-scripts', {
-      paths,
+      paths: allowed,
       oldString,
       newString,
       validateAfter
     });
+    if (blocked.length > 0) {
+      const responseObj = response as any;
+      responseObj.skippedMCPInternal = blocked;
+      responseObj.note = `${blocked.length} MCP-internal companion Script(s) were skipped: ${blocked.join(', ')}`;
+    }
     return {
       content: [
         {
@@ -812,6 +920,9 @@ export class RobloxStudioTools {
     if (!sourcePath || !targetParent) {
       throw new Error('Source path and target parent are required for clone_instance');
     }
+    if (this.isMCPInternal(sourcePath)) {
+      return this.mcpInternalRefusal('clone', sourcePath);
+    }
     const response = await this.client.request('/api/clone-instance', {
       sourcePath,
       targetParent,
@@ -830,6 +941,9 @@ export class RobloxStudioTools {
   async moveInstance(instancePath: string, newParent: string) {
     if (!instancePath || !newParent) {
       throw new Error('Instance path and new parent are required for move_instance');
+    }
+    if (this.isMCPInternal(instancePath)) {
+      return this.mcpInternalRefusal('move', instancePath);
     }
     const response = await this.client.request('/api/move-instance', {
       instancePath,
@@ -1057,6 +1171,217 @@ export class RobloxStudioTools {
         type: 'text',
         text: JSON.stringify(result, null, 2),
       }],
+    };
+  }
+
+  // ============================================
+  // RUN_LIVE_LUA — execute code inside the running play test
+  //
+  // Flow:
+  //   1. Pre-flight: bridge.getTestSessionStatus() — fail fast with a
+  //      structured `error` field (no thrown exception) for the common
+  //      cases the AI needs to handle differently (no playtest, ended,
+  //      companion not yet connected, no clients on a client-target call,
+  //      loadstring disabled).
+  //   2. Generate a replyId, register a watchdog slot.
+  //   3. Enqueue an "eval" command on the appropriate companion's queue.
+  //      The companion picks it up on its next poll (~400ms cadence),
+  //      runs it under loadstring + xpcall + LogService capture, then
+  //      POSTs the result to /test-session/eval-result.
+  //   4. Await the slot — resolves with the companion's reply, or with a
+  //      synthetic timeout / companion_error if the watchdog fires.
+  //
+  // This method NEVER throws — all failure paths come back as
+  // `{ success: false, error: <enum>, message: ... }` so the AI can branch
+  // on the error type without try/catch ceremony.
+  // ============================================
+
+  async runLiveLua(
+    code: string,
+    target: 'server' | 'client' = 'server',
+    playerName?: string,
+    timeoutMs: number = 5000,
+    captureLogs: boolean = true
+  ) {
+    // Helper to wrap structured failures consistently.
+    const fail = (
+      error: string,
+      message: string,
+      extra: Record<string, any> = {}
+    ) => ({
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify(
+            { success: false, error, message, target, ...extra },
+            null,
+            2
+          ),
+        },
+      ],
+    });
+
+    // ---- Argument validation (still no throws — friendly errors) -------
+    if (typeof code !== 'string' || code.length === 0) {
+      return fail('invalid_args', 'code is required and must be a non-empty string.');
+    }
+    if (target !== 'server' && target !== 'client') {
+      return fail('invalid_args', `target must be "server" or "client", got "${target}".`);
+    }
+    const tMs = Math.max(1000, Math.min(30000, Math.floor(Number(timeoutMs) || 5000)));
+
+    // ---- Pre-flight on the bridge state --------------------------------
+    const status = this.bridge.getTestSessionStatus();
+    if (!status) {
+      return fail(
+        'no_playtest',
+        'No play test is running. Call play_solo first to start one, then retry run_live_lua.'
+      );
+    }
+    if (status.status === 'ended') {
+      return fail(
+        'playtest_ended',
+        `The play test has already ended. Start a new one with play_solo before running live code.`
+      );
+    }
+
+    // ---- Resolve target slot -------------------------------------------
+    let slotTarget: 'server' | { client: number };
+    let queueTarget: 'server' | { client: number };
+    let resolvedClientName: string | null = null;
+    let resolvedClientUserId: number | null = null;
+
+    if (target === 'server') {
+      if (!status.serverReady) {
+        return fail(
+          'companion_not_ready',
+          'Server companion has not connected yet. The play test was started but the in-test Script has not made its first poll. Wait ~1s and retry.'
+        );
+      }
+      if (!status.serverLoadstringReady) {
+        return fail(
+          'loadstring_disabled',
+          'ServerScriptService.LoadStringEnabled is false in this place, so the server companion cannot loadstring user code. Enable LoadStringEnabled in Studio (Game Settings → Security → Allow HTTP Requests / LoadString) BEFORE starting the test, then re-run play_solo.'
+        );
+      }
+      slotTarget = 'server';
+      queueTarget = 'server';
+    } else {
+      // target === 'client'
+      const clients = status.clients;
+      if (clients.length === 0) {
+        return fail(
+          'no_clients_connected',
+          'No client companion has polled in yet. Either no Player has joined the test, or the LocalScript was blocked. Wait until at least one player joins, or fall back to target="server".'
+        );
+      }
+      let chosen = clients[0];
+      if (playerName) {
+        const match = clients.find(
+          (c) => c.name === playerName || c.name.toLowerCase() === playerName.toLowerCase()
+        );
+        if (!match) {
+          return fail(
+            'no_such_player',
+            `No connected client named "${playerName}". Connected players: ${clients
+              .map((c) => `${c.name} (userId=${c.userId})`)
+              .join(', ')}.`,
+            { connectedClients: clients }
+          );
+        }
+        chosen = match;
+      } else if (clients.length > 1) {
+        // Multi-client play test, ambiguous — bail loudly.
+        return fail(
+          'multiple_clients',
+          `Multiple clients are connected; pass playerName to disambiguate. Connected: ${clients
+            .map((c) => `${c.name} (userId=${c.userId})`)
+            .join(', ')}.`,
+          { connectedClients: clients }
+        );
+      }
+      if (!chosen.ready) {
+        return fail(
+          'companion_not_ready',
+          `Client companion for ${chosen.name} (userId=${chosen.userId}) has not finished its first poll. Wait briefly and retry.`
+        );
+      }
+      // Loadstring is core (always enabled in client LocalScripts), but we
+      // surface the flag for completeness if the companion ever reports
+      // false.
+      if (!chosen.loadstringReady) {
+        return fail(
+          'loadstring_disabled',
+          `Client companion for ${chosen.name} reported loadstring unavailable. (This is unusual on the client; check that the LocalScript was injected correctly.)`
+        );
+      }
+      slotTarget = { client: chosen.userId };
+      queueTarget = { client: chosen.userId };
+      resolvedClientName = chosen.name;
+      resolvedClientUserId = chosen.userId;
+    }
+
+    // ---- Register slot, then enqueue the command ----------------------
+    // Use the bridge's enqueue first because if it returns false we want
+    // to skip allocating a watcher promise. But we need the replyId baked
+    // into the enqueued args, so generate it up front.
+    const replyId = uuidv4();
+
+    // Register the watchdog slot BEFORE enqueueing — otherwise an
+    // exceptionally fast companion (sub-millisecond between poll RTTs)
+    // could in theory deliver before we've slotted, though in practice
+    // the HTTP RTT alone makes this impossible.
+    const replyPromise = this.bridge.registerEvalReply(replyId, slotTarget, tMs);
+
+    const queued = this.bridge.enqueueTestCommand(
+      {
+        cmd: 'eval',
+        args: { replyId, code, timeoutMs: tMs, captureLogs: !!captureLogs },
+      },
+      queueTarget
+    );
+    if (!queued) {
+      // Bridge couldn't accept (session ended between status check and
+      // enqueue, or invalid target). The watchdog will eventually trigger
+      // a companion_error reply, but we'd rather not wait a full grace
+      // window — return immediately.
+      return fail(
+        'companion_error',
+        'Failed to enqueue eval command on the bridge (session may have just ended). Re-check play_solo state.'
+      );
+    }
+
+    // Await the reply (will always resolve — watchdog guarantees it).
+    const startedAt = Date.now();
+    const reply = await replyPromise;
+    const totalDurationMs = Date.now() - startedAt;
+
+    // ---- Map the reply into the canonical Result shape ----------------
+    const baseResult: Record<string, any> = {
+      success: !!reply.ok,
+      target,
+      timeoutMs: tMs,
+      durationMs: typeof reply.durationMs === 'number' ? reply.durationMs : totalDurationMs,
+    };
+    if (resolvedClientName) baseResult.player = { name: resolvedClientName, userId: resolvedClientUserId };
+
+    if (reply.ok) {
+      baseResult.values = reply.values ?? [];
+      if (reply.logs && reply.logs.length > 0) baseResult.logs = reply.logs;
+    } else {
+      baseResult.error = reply.errorType ?? 'companion_error';
+      baseResult.message = reply.error ?? 'Unknown eval failure.';
+      if (reply.traceback) baseResult.traceback = reply.traceback;
+      if (reply.logs && reply.logs.length > 0) baseResult.logs = reply.logs;
+    }
+
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify(baseResult, null, 2),
+        },
+      ],
     };
   }
 

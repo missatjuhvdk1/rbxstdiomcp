@@ -1184,23 +1184,50 @@ local function serializeValue(value)
 	end
 end
 
--- Helper to log an action for undo tracking
-local function logAction(actionType, target, summary, details)
-	-- Clear redo history when a new action is performed
-	redoHistory = {}
+-- ============================================
+-- DEFERRED ACTION LOGGING
+-- ============================================
+-- Handlers call logAction() to record what they just did for the
+-- get_history / undo / redo tools. We don't want a tracked entry sitting
+-- in actionHistory unless Studio's ChangeHistoryService actually committed
+-- a waypoint for the same operation — otherwise undo() will pop our
+-- tracked entry while Studio reverts something completely different.
+--
+-- Architecture: logAction() stashes the entry in `_pendingActionLog`.
+-- processRequest() snapshots GetCanUndo / GetCanRedo around the
+-- TryBeginRecording / FinishRecording window, then calls
+-- commitPendingLog() iff a real waypoint was added. Otherwise it calls
+-- discardPendingLog().
+local _pendingActionLog = nil  -- single-slot buffer for current request
 
-	table.insert(actionHistory, {
+local function logAction(actionType, target, summary, details)
+	-- Stash; processRequest decides whether to keep it.
+	_pendingActionLog = {
 		action = actionType,
 		target = target,
 		summary = summary,
 		details = details or {},
-		timestamp = os.time()
-	})
+		timestamp = os.time(),
+	}
+end
+
+local function commitPendingLog()
+	if not _pendingActionLog then return end
+	local entry = _pendingActionLog
+	_pendingActionLog = nil
+
+	-- A new committed action clears the redo branch.
+	redoHistory = {}
+	table.insert(actionHistory, entry)
 
 	-- Keep history from growing too large
 	if #actionHistory > MAX_ACTION_HISTORY then
 		table.remove(actionHistory, 1)
 	end
+end
+
+local function discardPendingLog()
+	_pendingActionLog = nil
 end
 
 -- Connect to LogService to capture output
@@ -1955,16 +1982,116 @@ processRequest = function(request)
 	-- Check if this is a mutation endpoint
 	local recordingName = mutationEndpoints[endpoint]
 	if recordingName then
-		-- Wrap in ChangeHistoryService recording for proper undo
+		-- ─────────────────────────────────────────────────────────────────
+		-- Two parallel undo channels — CHS waypoints AND plugin-side log
+		-- ─────────────────────────────────────────────────────────────────
+		-- Most mutations flow through ChangeHistoryService (CHS) waypoints:
+		-- create_object, set_property, delete_object, etc. — these we track
+		-- BOTH in CHS (so Ctrl+Z and our undo tool work) AND in actionHistory
+		-- (so get_history can show readable summaries).
+		--
+		-- BUT script `Source` property changes are architecturally decoupled
+		-- from CHS in Studio: the script editor maintains its OWN undo stack
+		-- separate from CHS. A direct `instance.Source = "..."` assignment
+		-- changes the value, but CHS will NOT capture it in a waypoint — so
+		-- CHS:Undo() won't revert it (it'll skip ahead and revert the previous
+		-- waypoint, destroying something unrelated). This is the root cause
+		-- of "Bug 1: edit_script undo doesn't actually revert source".
+		--
+		-- Fix: for source-only handlers (edit_script / set_script_source /
+		-- find_and_replace_in_scripts) we Cancel the CHS recording (no empty
+		-- waypoint) and instead store a pre/post-Source snapshot inside the
+		-- tracked action's `details.scriptEdits`. Our undo handler detects
+		-- these entries and restores the source manually via direct
+		-- assignment, bypassing CHS entirely. Real undo, no side effects.
+		--
+		-- Result sentinels that drive the decision:
+		--   • result._isSourceEditOnly == true →
+		--       Script source changes only, no CHS waypoint to keep.
+		--       Cancel recording, KEEP tracked log (with snapshots).
+		--   • result._didNotMutate == true →
+		--       Handler knows it did nothing (e.g. find_and_replace 0 matches).
+		--       Cancel recording, DROP tracked log.
+		--   • result._mutatesUnknown == true →
+		--       Arbitrary user code (execute_lua). Use a synchronous
+		--       descendant-count delta to decide.
+		--   • Otherwise →
+		--       Trusted mutator. Commit recording, KEEP tracked log.
+		--
+		-- Why synchronous descendant-count delta (and NOT DescendantAdded)?
+		-- The DescendantAdded / DescendantRemoving signals fire DEFERRED in
+		-- Studio plugins — by the time the handler returns and we'd read a
+		-- counter, no events have fired yet. Earlier v2 used those signals
+		-- and silently rolled back every execute_lua mutation. Synchronous
+		-- snapshot via #game:GetDescendants() works around the deferral —
+		-- it's O(N) but only runs for the unknown-mutator case.
+		_pendingActionLog = nil  -- start clean
+
+		-- Snapshot tree size BEFORE handler, only when we'll need it.
+		-- For execute_lua (the only _mutatesUnknown source) we need the
+		-- before/after delta; everything else trusts the handler's sentinel.
+		local descCountBefore
+		if endpoint == "/api/execute-lua" then
+			descCountBefore = #game:GetDescendants()
+		end
+
 		local recording = ChangeHistoryService:TryBeginRecording("MCP: " .. recordingName)
 		local success, result = pcall(handler, data)
 
+		local handlerOK = success and not (result and result.error)
+
+		-- commitCHS: should we keep the CHS waypoint?
+		-- commitLog: should we keep the tracked action entry?
+		local commitCHS = false
+		local commitLog = false
+
+		if handlerOK then
+			local r = type(result) == "table" and result or nil
+			if r and r._isSourceEditOnly == true then
+				-- Source-only: Cancel CHS (no real waypoint), keep tracked log
+				-- with snapshots for plugin-side undo.
+				commitCHS = false
+				commitLog = true
+			elseif r and r._didNotMutate == true then
+				-- Genuine no-op: drop both.
+				commitCHS = false
+				commitLog = false
+			elseif r and r._mutatesUnknown == true then
+				-- execute_lua: synchronous tree-size delta tells us if
+				-- user code added/removed instances. Property-only mutations
+				-- (e.g. just changing Position) won't be detected — that's an
+				-- accepted edge case; users wanting full tracking should use
+				-- the dedicated set_property tool.
+				local treeChanged = (#game:GetDescendants() ~= descCountBefore)
+				commitCHS = treeChanged
+				commitLog = treeChanged
+			else
+				-- Trusted mutator (create_object, set_property, etc.) →
+				-- always commit on handler success.
+				commitCHS = true
+				commitLog = true
+			end
+		end
+
 		if recording then
-			if success and not (result and result.error) then
+			if commitCHS then
 				ChangeHistoryService:FinishRecording(recording, Enum.FinishRecordingOperation.Commit)
 			else
 				ChangeHistoryService:FinishRecording(recording, Enum.FinishRecordingOperation.Cancel)
 			end
+		end
+
+		if commitLog then
+			commitPendingLog()
+		else
+			discardPendingLog()
+		end
+
+		-- Strip internal sentinels from the response so callers don't see them.
+		if type(result) == "table" then
+			result._mutatesUnknown = nil
+			result._didNotMutate = nil
+			result._isSourceEditOnly = nil
 		end
 
 		if success then
@@ -3626,55 +3753,62 @@ handlers.setScriptSource = function(requestData)
 	sourceToSet = sourceToSet:gsub("\\t", "\t")
 	sourceToSet = sourceToSet:gsub("\\r", "\r")
 	sourceToSet = sourceToSet:gsub("\\\\", "\\")
-	local updateSuccess, updateResult = pcall(function()
-		local oldSourceLength = string.len(instance.Source)
 
-		ScriptEditorService:UpdateSourceAsync(instance, function(oldContent)
-			return sourceToSet
-		end)
+	-- Primary path: direct property assignment. Roblox's script editor
+	-- maintains its own undo stack separate from ChangeHistoryService — so
+	-- CHS waypoints will NOT capture this Source change. We work around
+	-- this by snapshotting pre/post source into the tracked action entry;
+	-- the undo handler restores the snapshot directly. The processRequest
+	-- wrapper sees `_isSourceEditOnly` and Cancels the (empty) CHS
+	-- recording so it doesn't pollute Studio's undo stack.
+	--
+	-- Caveat: if the user has unsaved buffer edits in Studio's script
+	-- editor for this script, those edits will be replaced. Intentional —
+	-- consistent with previous behavior, and predictable for callers.
+	local preSource = instance.Source
 
-		ChangeHistoryService:SetWaypoint("Set script source: " .. instance.Name)
+	local directSuccess, directResult = pcall(function()
+		local oldSourceLength = string.len(preSource)
+		instance.Source = sourceToSet
 
 		return {
 			success = true,
 			instancePath = instancePath,
 			oldSourceLength = oldSourceLength,
 			newSourceLength = string.len(sourceToSet),
-			method = "UpdateSourceAsync",
-			message = "Script source updated successfully (editor-safe)"
-		}
-	end)
-
-	if updateSuccess then
-		return updateResult
-	end
-
-	-- Fallback to direct assignment if UpdateSourceAsync fails
-	local directSuccess, directResult = pcall(function()
-		local oldSource = instance.Source
-		instance.Source = sourceToSet
-
-		ChangeHistoryService:SetWaypoint("Set script source: " .. instance.Name)
-
-		return {
-			success = true,
-			instancePath = instancePath,
-			oldSourceLength = string.len(oldSource),
-			newSourceLength = string.len(sourceToSet),
 			method = "direct",
-			message = "Script source updated successfully (direct assignment)"
+			message = "Script source updated successfully"
 		}
 	end)
 
 	if directSuccess then
-		-- Log for undo tracking
-		logAction("set_script_source", instancePath, "Script source replaced (" .. directResult.newSourceLength .. " chars)", {
-			method = "direct"
-		})
+		-- Snapshot for plugin-side undo restoration. Stored as a list so the
+		-- same code path also handles find_and_replace's batch edits.
+		logAction(
+			"set_script_source",
+			instancePath,
+			"Script source replaced (" .. directResult.newSourceLength .. " chars)",
+			{
+				method = "direct",
+				scriptEdits = {
+					{
+						instancePath = instancePath,
+						preSource = preSource,
+						postSource = sourceToSet,
+					},
+				},
+			}
+		)
+		-- Source-only change: tell processRequest to Cancel the CHS
+		-- recording but keep our tracked log entry (which has the snapshots).
+		directResult._isSourceEditOnly = true
 		return directResult
 	end
 
-	-- Final fallback: replace the script entirely
+	-- Fallback: replace the script entirely (used when direct assignment
+	-- throws — e.g. for some plugin-managed script kinds). This DOES
+	-- mutate the tree (Destroy + Instance.new), so CHS captures it.
+	-- That makes the action a regular CHS-backed mutation, not source-only.
 	local replaceSuccess, replaceResult = pcall(function()
 		local parent = instance.Parent
 		local name = instance.Name
@@ -3695,8 +3829,6 @@ handlers.setScriptSource = function(requestData)
 		newScript.Parent = parent
 		instance:Destroy()
 
-		ChangeHistoryService:SetWaypoint("Replace script: " .. name)
-
 		return {
 			success = true,
 			instancePath = getInstancePath(newScript),
@@ -3706,15 +3838,15 @@ handlers.setScriptSource = function(requestData)
 	end)
 
 	if replaceSuccess then
-		-- Log for undo tracking
 		logAction("set_script_source", replaceResult.instancePath, "Script replaced entirely", {
 			method = "replace"
 		})
+		-- Replace path mutates the tree (Destroy + Instance.new) — CHS
+		-- captures this naturally, so we let processRequest Commit normally.
 		return replaceResult
 	else
 		return {
-			error = "Failed to set script source. UpdateSourceAsync failed: " .. tostring(updateResult) ..
-			        ". Direct assignment failed: " .. tostring(directResult) ..
+			error = "Failed to set script source. Direct assignment failed: " .. tostring(directResult) ..
 			        ". Replace method failed: " .. tostring(replaceResult)
 		}
 	end
@@ -3847,12 +3979,20 @@ handlers.editScript = function(requestData)
 			end
 		end
 
-		-- Apply the change. The /api/edit-script endpoint is in
-		-- mutationEndpoints, so the surrounding processRequest wrapper
-		-- handles TryBeginRecording/FinishRecording automatically.
-		ScriptEditorService:UpdateSourceAsync(instance, function(oldContent)
-			return newSource
-		end)
+		-- Apply via direct property assignment. NOTE: this does NOT produce
+		-- a ChangeHistoryService waypoint (Studio's script editor maintains
+		-- its own undo stack disjoint from CHS) — so undo support for this
+		-- edit comes from the pre/post-source SNAPSHOT we attach to the
+		-- tracked action entry below. The processRequest wrapper sees
+		-- `_isSourceEditOnly = true` in our return value and Cancels the
+		-- (empty) CHS recording.
+		--
+		-- We do NOT use ScriptEditorService:UpdateSourceAsync — same
+		-- reason (and it has the same CHS limitation), with the added
+		-- downside of being yield-only and harder to reason about.
+		-- (Caveat: unsaved buffer edits in Studio's script editor will be
+		-- replaced — same trade-off as set_script_source.)
+		instance.Source = newSource
 
 		-- Prepare summary for logging
 		local shortOld = #searchStr > 30 and (string.sub(searchStr, 1, 30) .. "...") or searchStr
@@ -3868,17 +4008,37 @@ handlers.editScript = function(requestData)
 			message = replaceAll
 				and ("Replaced " .. occurrences .. " occurrence(s) successfully")
 				or "Edit applied successfully",
-			_logSummary = shortOld:gsub("\n", "\\n") .. " → " .. shortNew:gsub("\n", "\\n")
+			_logSummary = shortOld:gsub("\n", "\\n") .. " → " .. shortNew:gsub("\n", "\\n"),
+			_preSource = source,
+			_postSource = newSource,
 		}
 	end)
 
 	if success then
 		if result.success then
-			-- Log for undo tracking
-			logAction("edit_script", instancePath, result._logSummary or "Script edited", {
-				replacements = result.replacements
-			})
-			result._logSummary = nil  -- Remove internal field
+			-- Log for undo tracking. The pre/post-source snapshots live in
+			-- details.scriptEdits — undo restores from preSource, redo from
+			-- postSource.
+			logAction(
+				"edit_script",
+				instancePath,
+				result._logSummary or "Script edited",
+				{
+					replacements = result.replacements,
+					scriptEdits = {
+						{
+							instancePath = instancePath,
+							preSource = result._preSource,
+							postSource = result._postSource,
+						},
+					},
+				}
+			)
+			result._logSummary = nil
+			result._preSource = nil
+			result._postSource = nil
+			-- Source-only change: Cancel CHS recording, keep tracked log.
+			result._isSourceEditOnly = true
 		end
 		return result
 	else
@@ -4321,6 +4481,10 @@ handlers.findAndReplaceInScripts = function(requestData)
 	local successCount = 0
 	local failCount = 0
 	local skippedCount = 0
+	-- Per-script pre/post-source snapshots. Used by the undo handler to
+	-- revert source-only edits (direct Source = is invisible to CHS — see
+	-- edit_script for the full explanation).
+	local scriptEdits = {}
 
 	for _, path in ipairs(paths) do
 		local instance = getInstanceByPath(path)
@@ -4343,33 +4507,56 @@ handlers.findAndReplaceInScripts = function(requestData)
 			else
 				local newSource = string.gsub(source, searchStr:gsub("([^%w])", "%%%1"), replaceStr)
 
+				-- Direct property assignment. Captured into scriptEdits so
+				-- the undo handler can revert it (CHS doesn't see Source
+				-- changes — see edit_script for the full rationale).
 				if validateAfter then
 					local isValid, syntaxErrors = validateLuaSyntax(newSource)
 					if not isValid then
 						table.insert(results, { path = path, success = false, error = "Would create invalid syntax", syntaxErrors = syntaxErrors })
 						failCount = failCount + 1
 					else
-						pcall(function()
-							ScriptEditorService:UpdateSourceAsync(instance, function() return newSource end)
+						local assignOk, assignErr = pcall(function()
+							instance.Source = newSource
 						end)
-						table.insert(results, { path = path, success = true, replacements = occurrences })
-						successCount = successCount + 1
+						if assignOk then
+							table.insert(results, { path = path, success = true, replacements = occurrences })
+							table.insert(scriptEdits, {
+								instancePath = path,
+								preSource = source,
+								postSource = newSource,
+							})
+							successCount = successCount + 1
+						else
+							table.insert(results, { path = path, success = false, error = "Source assignment failed: " .. tostring(assignErr) })
+							failCount = failCount + 1
+						end
 					end
 				else
-					pcall(function()
-						ScriptEditorService:UpdateSourceAsync(instance, function() return newSource end)
+					local assignOk, assignErr = pcall(function()
+						instance.Source = newSource
 					end)
-					table.insert(results, { path = path, success = true, replacements = occurrences })
-					successCount = successCount + 1
+					if assignOk then
+						table.insert(results, { path = path, success = true, replacements = occurrences })
+						table.insert(scriptEdits, {
+							instancePath = path,
+							preSource = source,
+							postSource = newSource,
+						})
+						successCount = successCount + 1
+					else
+						table.insert(results, { path = path, success = false, error = "Source assignment failed: " .. tostring(assignErr) })
+						failCount = failCount + 1
+					end
 				end
 			end
 		end
 	end
 
-	-- The /api/find-and-replace-in-scripts endpoint is in mutationEndpoints,
-	-- so the surrounding processRequest wrapper handles
-	-- TryBeginRecording/FinishRecording automatically — one waypoint for the
-	-- whole batch.
+	-- Source edits aren't captured by ChangeHistoryService (see edit_script
+	-- comment). The pre/post-source snapshots stored in details.scriptEdits
+	-- are what the undo handler uses to revert. processRequest sees
+	-- `_isSourceEditOnly = true` and Cancels the empty CHS recording.
 
 	-- Log to MCP action history for get_history visibility (only when at
 	-- least one script was actually modified)
@@ -4393,6 +4580,7 @@ handlers.findAndReplaceInScripts = function(requestData)
 				successful = successCount,
 				failed = failCount,
 				skipped = skippedCount,
+				scriptEdits = scriptEdits,
 			}
 		)
 	end
@@ -4405,7 +4593,13 @@ handlers.findAndReplaceInScripts = function(requestData)
 			successful = successCount,
 			failed = failCount,
 			skipped = skippedCount
-		}
+		},
+		-- Source-only edits: Cancel CHS (it doesn't see Source changes
+		-- anyway), keep tracked log so undo can restore from snapshots.
+		-- If nothing actually changed, fall back to _didNotMutate so the
+		-- log entry doesn't get committed either.
+		_isSourceEditOnly = (successCount > 0),
+		_didNotMutate = (successCount == 0),
 	}
 end
 
@@ -5098,11 +5292,42 @@ local function formatActionEntry(entry)
 	return entry.action .. " → " .. entry.target .. " (" .. entry.summary .. ")"
 end
 
+-- Helper: does this tracked entry represent a pure script-source edit?
+-- Pure script edits don't produce CHS waypoints (Studio's script editor has
+-- its own undo stack disjoint from CHS), so the entry will have an
+-- attached scriptEdits snapshot list AND no other tree/property mutation.
+-- For these we restore source manually and DO NOT call CHS:Undo() — that
+-- would skip past the next real waypoint and revert something unrelated.
+local function entryIsSourceOnly(entry)
+	if not entry or not entry.details or not entry.details.scriptEdits then
+		return false
+	end
+	return #entry.details.scriptEdits > 0
+end
+
+-- Restore each script's pre-edit source. Tolerates instances that have
+-- been re-parented or destroyed since the edit (skips with a warning so
+-- one missing script doesn't poison the whole undo).
+local function restoreScriptEdits(scriptEdits, useField)
+	for _, edit in ipairs(scriptEdits) do
+		local instance = getInstanceByPath(edit.instancePath)
+		if instance and instance:IsA("LuaSourceContainer") then
+			pcall(function()
+				instance.Source = edit[useField]
+			end)
+		end
+	end
+end
+
 -- Stepwise undo. Calls ChangeHistoryService:Undo() up to `count` times,
 -- popping one entry off actionHistory per step (matched into redoHistory).
 -- Studio's undo stack is the source of truth — we stop early if it runs out.
 -- `count` defaults to 1; agents pass higher values to roll back several
 -- recent operations in one call without N round-trips.
+--
+-- Special case: pure script-source edits (edit_script, find_and_replace,
+-- set_script_source via direct assignment) don't create CHS waypoints, so
+-- we restore from the snapshot in details.scriptEdits and SKIP CHS:Undo().
 handlers.undo = function(requestData)
 	local count = tonumber(requestData and requestData.count) or 1
 	if count < 1 then count = 1 end
@@ -5113,22 +5338,34 @@ handlers.undo = function(requestData)
 		local stoppedReason = nil
 
 		for i = 1, count do
-			-- Check Studio first — it's authoritative. If it can't undo, we
-			-- stop regardless of what's in actionHistory.
-			local canUndo = ChangeHistoryService:GetCanUndo()
-			if not canUndo then
-				stoppedReason = "no_more_studio_undo"
-				break
-			end
-
-			local entry = nil
-			if #actionHistory > 0 then
-				entry = table.remove(actionHistory)
+			-- Peek at the next tracked entry. If it's a pure source edit
+			-- we MUST handle it without calling CHS:Undo() (CHS has no
+			-- corresponding waypoint, so :Undo() would revert the wrong
+			-- thing).
+			local top = actionHistory[#actionHistory]
+			if entryIsSourceOnly(top) then
+				local entry = table.remove(actionHistory)
+				restoreScriptEdits(entry.details.scriptEdits, "preSource")
 				table.insert(redoHistory, entry)
-			end
+				table.insert(entries, entry)
+			else
+				-- Tree/property mutation (or unknown out-of-band waypoint):
+				-- defer to Studio's undo stack.
+				local canUndo = ChangeHistoryService:GetCanUndo()
+				if not canUndo then
+					stoppedReason = "no_more_studio_undo"
+					break
+				end
 
-			ChangeHistoryService:Undo()
-			table.insert(entries, entry)  -- may be nil for out-of-band waypoints
+				local entry = nil
+				if #actionHistory > 0 then
+					entry = table.remove(actionHistory)
+					table.insert(redoHistory, entry)
+				end
+
+				ChangeHistoryService:Undo()
+				table.insert(entries, entry)  -- may be nil for out-of-band waypoints
+			end
 		end
 
 		local primary = entries[1]
@@ -5180,20 +5417,30 @@ handlers.redo = function(requestData)
 		local stoppedReason = nil
 
 		for i = 1, count do
-			local canRedo = ChangeHistoryService:GetCanRedo()
-			if not canRedo then
-				stoppedReason = "no_more_studio_redo"
-				break
-			end
-
-			local entry = nil
-			if #redoHistory > 0 then
-				entry = table.remove(redoHistory)
+			-- Mirror of undo: pure source edits redo by re-applying the
+			-- postSource snapshot and SKIP CHS:Redo() (no waypoint to redo).
+			local top = redoHistory[#redoHistory]
+			if entryIsSourceOnly(top) then
+				local entry = table.remove(redoHistory)
+				restoreScriptEdits(entry.details.scriptEdits, "postSource")
 				table.insert(actionHistory, entry)
-			end
+				table.insert(entries, entry)
+			else
+				local canRedo = ChangeHistoryService:GetCanRedo()
+				if not canRedo then
+					stoppedReason = "no_more_studio_redo"
+					break
+				end
 
-			ChangeHistoryService:Redo()
-			table.insert(entries, entry)
+				local entry = nil
+				if #redoHistory > 0 then
+					entry = table.remove(redoHistory)
+					table.insert(actionHistory, entry)
+				end
+
+				ChangeHistoryService:Redo()
+				table.insert(entries, entry)
+			end
 		end
 
 		local primary = entries[1]
@@ -5499,11 +5746,12 @@ handlers.executeLua = function(requestData)
 		end
 	end
 
-	-- Log to MCP action history for get_history visibility. Truncated code
-	-- preview keeps the summary line cheap. Note: we log even when the user
-	-- code didn't mutate anything (we can't know that), so a benign
-	-- execute_lua entry may sit at the top of history without a matching
-	-- Studio waypoint. That's expected; the undo() tool tolerates this.
+	-- Log to MCP action history for get_history visibility. We can't know
+	-- whether arbitrary user code actually mutated the DataModel, so we
+	-- tag the result with `_mutatesUnknown=true` — processRequest uses
+	-- this sentinel to be conservative: if CHS state didn't visibly
+	-- advance (no canUndo flip, no canRedo clear), the pending log gets
+	-- DISCARDED instead of polluting actionHistory with a phantom entry.
 	local codeLines = 1
 	for _ in string.gmatch(code, "\n") do
 		codeLines = codeLines + 1
@@ -5521,7 +5769,8 @@ handlers.executeLua = function(requestData)
 		success = true,
 		result = serializeResult(execResult),
 		resultType = typeof(execResult),
-		message = "Code executed successfully"
+		message = "Code executed successfully",
+		_mutatesUnknown = true,  -- stripped by processRequest
 	}
 end
 

@@ -7,22 +7,66 @@ export const runtimeTools: ToolDef[] = [
   {
     name: 'undo',
     description:
-      'Undo the last change made in Roblox Studio. All MCP mutations are automatically recorded for undo support. Use this to revert mistakes.',
+      'Undo the last MCP mutation(s) in Roblox Studio. All MCP mutation tools (create, delete, set_property, edit_script, execute_lua, etc.) are automatically wrapped in ChangeHistoryService recordings, so each tool call = one Ctrl+Z. Pass `count` to undo multiple steps in one round-trip; stops early at the bottom of Studio\'s undo stack and reports `stopped_early: true` in that case. The response\'s `entries` array describes each action undone (most-recent first). Call `get_history` first if you want to peek without committing.',
     inputSchema: {
       type: 'object',
-      properties: {},
+      properties: {
+        count: {
+          type: 'number',
+          description:
+            'How many steps to undo (default 1, max 100). Each step is one MCP tool call worth of changes — e.g. mass_create_objects of 100 parts is ONE step. Stops early at the bottom of the undo stack.',
+          default: 1,
+          minimum: 1,
+          maximum: 100,
+        },
+      },
     },
-    handler: (_args, { tools }) => tools.undo(),
+    handler: (args, { tools }) => tools.undo(args?.count),
   },
 
   {
     name: 'redo',
-    description: 'Redo a previously undone change in Roblox Studio.',
+    description:
+      'Redo previously undone change(s) in Roblox Studio. Mirrors `undo`: pass `count` to redo multiple steps; stops early at the top of the redo stack and reports `stopped_early`. The redo stack is cleared whenever a new mutation is made (standard undo/redo semantics).',
     inputSchema: {
       type: 'object',
-      properties: {},
+      properties: {
+        count: {
+          type: 'number',
+          description: 'How many steps to redo (default 1, max 100).',
+          default: 1,
+          minimum: 1,
+          maximum: 100,
+        },
+      },
     },
-    handler: (_args, { tools }) => tools.redo(),
+    handler: (args, { tools }) => tools.redo(args?.count),
+  },
+
+  {
+    name: 'get_history',
+    description:
+      "Read-only view of the recent MCP undo/redo stacks. Use this to peek at what `undo` would revert before calling it, to recover situational awareness after a session resume, or to decide how far back (`count`) to roll an `undo` call.\n\nReturns Studio's authoritative `can_undo`/`can_redo` flags plus both stacks (most-recent first; `index: 0` is the next entry that `undo`/`redo` would consume). Each entry includes `action`, `target`, `summary`, `timestamp`, `age_seconds`. Pass `include_details: true` for the per-action `details` payload (omitted by default to keep responses small — mass operations have large details blobs).\n\nNote: Studio's undo stack is shared with the user's own Ctrl+Z edits. `can_undo` can be true even when `tracked_undo_count` is 0 (e.g. fresh session, or user made manual changes before the plugin connected).",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        limit: {
+          type: 'number',
+          description:
+            'Max entries to return per stack (default 20, max 100). The plugin retains the last 100 MCP actions.',
+          default: 20,
+          minimum: 1,
+          maximum: 100,
+        },
+        include_details: {
+          type: 'boolean',
+          description:
+            'Include the per-action `details` payload (e.g. property values, batch counts). Off by default to save context — turn on when you actually need the granular data.',
+          default: false,
+        },
+      },
+    },
+    handler: (args, { tools }) => tools.getHistory(args?.limit, args?.include_details),
   },
 
   {

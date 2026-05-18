@@ -179,9 +179,14 @@ graph TB
 ### Script Validation Tool (NEW in v1.9.0)
 - `validate_script` - Validate Lua/Luau syntax without running, includes deprecation warnings
 
-### Undo/Redo Tools (NEW in v1.10.0)
-- `undo` - Undo the last MCP operation in Studio's history
-- `redo` - Redo a previously undone operation
+### Undo/Redo Tools (expanded in v2.5.0)
+- `undo(count?)` - Undo the last MCP operation(s) in Studio's history. Pass `count` (default 1, max 100) to roll back several steps in one call. Returns an `entries` array describing each step undone; reports `stopped_early: true` if Studio's undo stack runs out.
+- `redo(count?)` - Mirror of `undo`. Redo previously undone change(s).
+- `get_history({ limit?, include_details? })` - **NEW.** Read-only peek at the MCP undo/redo stacks. Returns Studio's authoritative `can_undo`/`can_redo` flags plus the recent entries (default last 20, max 100) with action/target/summary/timestamp. Useful for "what am I about to undo?" before committing, or for situational awareness after a session resume.
+
+**Coverage:** Every mutation tool — including `execute_lua`, `edit_script`, and `find_and_replace_in_scripts` — is wrapped in a single ChangeHistoryService recording per call (one tool call = one Ctrl+Z). If a handler errors, the recording is canceled and Studio rolls back any partial mutations. The plugin keeps an in-memory log of the last 100 MCP actions for human-readable summaries; Studio's own undo stack is authoritative.
+
+**`execute_lua` caveat:** mutations performed inside `task.spawn`/`task.delay` callbacks that run AFTER the handler returns are not captured in the waypoint. Keep mutation work synchronous within the call for reliable undo.
 
 ### Claude Code-Style Script Editing ⭐
 String-based script editing that works just like Claude Code's Edit tool - no more line number guessing!
@@ -239,7 +244,7 @@ capture_screenshot() // → AI sees what it created! 👀
 
 **Supported angles:** `front`, `back`, `left`, `right`, `top`, `bottom`, `iso` (isometric), `iso_front`, `iso_back`, `low_angle`, `high_angle`, or custom `{pitch, yaw, roll}` angles.
 
-> **Note:** All mutation tools (set_property, create_object, delete_object, etc.) are now automatically wrapped in ChangeHistoryService recordings, making every AI change undoable via Ctrl+Z in Studio or the `undo` tool.
+> **Note:** All mutation tools — including arbitrary `execute_lua` execution and the script editing tools — are automatically wrapped in ChangeHistoryService recordings, making every AI change undoable via Ctrl+Z in Studio or the `undo` tool. Errors auto-rollback partial mutations. See the **Undo/Redo Tools** section above for `count` and `get_history`.
 
 > Note: Previous tools removed: `get_file_content`, `get_file_properties`, `get_selection`, `get_dependencies`, `validate_references`. Use Rojo/Argon workflows instead.
 
@@ -391,13 +396,26 @@ validate_script("game.ServerScriptService.MainScript")
 // Monitor game output after testing
 get_output({ limit: 50, messageTypes: ["MessageError", "MessageWarning"] })
 
-// === NEW in v1.10.0 ===
+// === Undo / Redo / History (expanded in v2.5.0) ===
 
-// Undo the last MCP operation
+// Peek at recent changes before undoing — non-destructive
+get_history({ limit: 5 })
+// → { can_undo: true, tracked_undo_count: 12,
+//     undo_stack: [{ index: 0, action: "set_property",
+//                    target: "game.Workspace.Part", summary: "Position = ...",
+//                    age_seconds: 3 }, ...] }
+
+// Undo the last MCP operation (one Ctrl+Z worth)
 undo()
 
-// Redo a previously undone operation
+// Roll back several steps in one round-trip
+undo({ count: 5 })
+// → { undone_count: 5, entries: [...], remaining_undos: 7,
+//     stopped_early: false }
+
+// Redo (mirror of undo)
 redo()
+redo({ count: 3 })
 ```
 
 ## Configuration

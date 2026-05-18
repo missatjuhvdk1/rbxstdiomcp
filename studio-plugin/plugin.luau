@@ -1923,6 +1923,14 @@ local mutationEndpoints = {
 	["/api/clone-instance"] = "Clone Instance",
 	["/api/move-instance"] = "Move Instance",
 	["/api/insert-asset"] = "Insert Asset",
+	-- Script editing: modern recording API (migrated from legacy SetWaypoint)
+	["/api/edit-script"] = "Edit Script",
+	["/api/find-and-replace-in-scripts"] = "Find and Replace in Scripts",
+	-- Arbitrary Lua: wraps the WHOLE execution in one waypoint. Auto-rolls
+	-- back on error via FinishRecording(Cancel). Mutations from yielded /
+	-- task.spawn'd code that runs AFTER the handler returns are NOT captured
+	-- (documented limitation).
+	["/api/execute-lua"] = "Execute Lua",
 }
 
 -- Endpoint to handler mapping (populated after handlers are defined below)
@@ -3839,12 +3847,12 @@ handlers.editScript = function(requestData)
 			end
 		end
 
-		-- Apply the change
+		-- Apply the change. The /api/edit-script endpoint is in
+		-- mutationEndpoints, so the surrounding processRequest wrapper
+		-- handles TryBeginRecording/FinishRecording automatically.
 		ScriptEditorService:UpdateSourceAsync(instance, function(oldContent)
 			return newSource
 		end)
-
-		ChangeHistoryService:SetWaypoint("Edit script: " .. instance.Name)
 
 		-- Prepare summary for logging
 		local shortOld = #searchStr > 30 and (string.sub(searchStr, 1, 30) .. "...") or searchStr
@@ -4358,8 +4366,35 @@ handlers.findAndReplaceInScripts = function(requestData)
 		end
 	end
 
+	-- The /api/find-and-replace-in-scripts endpoint is in mutationEndpoints,
+	-- so the surrounding processRequest wrapper handles
+	-- TryBeginRecording/FinishRecording automatically — one waypoint for the
+	-- whole batch.
+
+	-- Log to MCP action history for get_history visibility (only when at
+	-- least one script was actually modified)
 	if successCount > 0 then
-		ChangeHistoryService:SetWaypoint("Batch replace in " .. successCount .. " scripts")
+		local searchPreview = oldString
+		if #searchPreview > 30 then
+			searchPreview = string.sub(searchPreview, 1, 30) .. "..."
+		end
+		local replacePreview = newString
+		if #replacePreview > 30 then
+			replacePreview = string.sub(replacePreview, 1, 30) .. "..."
+		end
+		searchPreview = searchPreview:gsub("\n", "\\n")
+		replacePreview = replacePreview:gsub("\n", "\\n")
+		logAction(
+			"find_and_replace_in_scripts",
+			tostring(successCount) .. " scripts",
+			searchPreview .. " → " .. replacePreview,
+			{
+				total = #paths,
+				successful = successCount,
+				failed = failCount,
+				skipped = skippedCount,
+			}
+		)
 	end
 
 	return {
@@ -5053,28 +5088,73 @@ end
 -- UNDO/REDO HANDLERS (Enhanced with action tracking)
 -- ============================================
 
+-- Build a compact summary string for an action entry (used in `undone` /
+-- `redone` and in the `entries` array). Falls back gracefully when the entry
+-- came from outside MCP (action == nil).
+local function formatActionEntry(entry)
+	if not entry then
+		return "Unknown action (possibly manual change)"
+	end
+	return entry.action .. " → " .. entry.target .. " (" .. entry.summary .. ")"
+end
+
+-- Stepwise undo. Calls ChangeHistoryService:Undo() up to `count` times,
+-- popping one entry off actionHistory per step (matched into redoHistory).
+-- Studio's undo stack is the source of truth — we stop early if it runs out.
+-- `count` defaults to 1; agents pass higher values to roll back several
+-- recent operations in one call without N round-trips.
 handlers.undo = function(requestData)
+	local count = tonumber(requestData and requestData.count) or 1
+	if count < 1 then count = 1 end
+	if count > 100 then count = 100 end  -- safety clamp
+
 	local success, result = pcall(function()
-		-- Pop the last action from history
-		local lastAction = nil
-		if #actionHistory > 0 then
-			lastAction = table.remove(actionHistory)
-			-- Move it to redo history
-			table.insert(redoHistory, lastAction)
+		local entries = {}    -- actions actually undone, in undo order
+		local stoppedReason = nil
+
+		for i = 1, count do
+			-- Check Studio first — it's authoritative. If it can't undo, we
+			-- stop regardless of what's in actionHistory.
+			local canUndo = ChangeHistoryService:GetCanUndo()
+			if not canUndo then
+				stoppedReason = "no_more_studio_undo"
+				break
+			end
+
+			local entry = nil
+			if #actionHistory > 0 then
+				entry = table.remove(actionHistory)
+				table.insert(redoHistory, entry)
+			end
+
+			ChangeHistoryService:Undo()
+			table.insert(entries, entry)  -- may be nil for out-of-band waypoints
 		end
 
-		ChangeHistoryService:Undo()
-
+		local primary = entries[1]
 		return {
 			success = true,
-			undone = lastAction and (lastAction.action .. " → " .. lastAction.target .. " (" .. lastAction.summary .. ")") or "Unknown action (possibly manual change)",
-			action = lastAction and lastAction.action or nil,
-			target = lastAction and lastAction.target or nil,
-			summary = lastAction and lastAction.summary or nil,
-			details = lastAction and lastAction.details or nil,
+			undone_count = #entries,
+			requested_count = count,
+			-- Top-level fields describe the FIRST entry undone (for
+			-- backward compatibility with callers expecting one undo).
+			undone = formatActionEntry(primary),
+			action = primary and primary.action or nil,
+			target = primary and primary.target or nil,
+			summary = primary and primary.summary or nil,
+			details = primary and primary.details or nil,
+			-- Full ordered list of entries undone this call.
+			entries = entries,
 			remaining_undos = #actionHistory,
 			available_redos = #redoHistory,
-			message = lastAction and ("Undone: " .. lastAction.summary) or "Undo executed"
+			stopped_early = stoppedReason ~= nil,
+			stopped_reason = stoppedReason,
+			message = string.format(
+				"Undone %d/%d action(s)%s",
+				#entries,
+				count,
+				stoppedReason and (" (stopped: " .. stoppedReason .. ")") or ""
+			),
 		}
 	end)
 
@@ -5085,33 +5165,58 @@ handlers.undo = function(requestData)
 			success = false,
 			error = "Failed to undo: " .. tostring(result),
 			remaining_undos = #actionHistory,
-			available_redos = #redoHistory
+			available_redos = #redoHistory,
 		}
 	end
 end
 
 handlers.redo = function(requestData)
+	local count = tonumber(requestData and requestData.count) or 1
+	if count < 1 then count = 1 end
+	if count > 100 then count = 100 end
+
 	local success, result = pcall(function()
-		-- Pop the last undone action from redo history
-		local redoneAction = nil
-		if #redoHistory > 0 then
-			redoneAction = table.remove(redoHistory)
-			-- Move it back to action history
-			table.insert(actionHistory, redoneAction)
+		local entries = {}
+		local stoppedReason = nil
+
+		for i = 1, count do
+			local canRedo = ChangeHistoryService:GetCanRedo()
+			if not canRedo then
+				stoppedReason = "no_more_studio_redo"
+				break
+			end
+
+			local entry = nil
+			if #redoHistory > 0 then
+				entry = table.remove(redoHistory)
+				table.insert(actionHistory, entry)
+			end
+
+			ChangeHistoryService:Redo()
+			table.insert(entries, entry)
 		end
 
-		ChangeHistoryService:Redo()
-
+		local primary = entries[1]
 		return {
 			success = true,
-			redone = redoneAction and (redoneAction.action .. " → " .. redoneAction.target .. " (" .. redoneAction.summary .. ")") or "Unknown action",
-			action = redoneAction and redoneAction.action or nil,
-			target = redoneAction and redoneAction.target or nil,
-			summary = redoneAction and redoneAction.summary or nil,
-			details = redoneAction and redoneAction.details or nil,
+			redone_count = #entries,
+			requested_count = count,
+			redone = formatActionEntry(primary),
+			action = primary and primary.action or nil,
+			target = primary and primary.target or nil,
+			summary = primary and primary.summary or nil,
+			details = primary and primary.details or nil,
+			entries = entries,
 			remaining_undos = #actionHistory,
 			available_redos = #redoHistory,
-			message = redoneAction and ("Redone: " .. redoneAction.summary) or "Redo executed"
+			stopped_early = stoppedReason ~= nil,
+			stopped_reason = stoppedReason,
+			message = string.format(
+				"Redone %d/%d action(s)%s",
+				#entries,
+				count,
+				stoppedReason and (" (stopped: " .. stoppedReason .. ")") or ""
+			),
 		}
 	end)
 
@@ -5122,9 +5227,66 @@ handlers.redo = function(requestData)
 			success = false,
 			error = "Failed to redo: " .. tostring(result),
 			remaining_undos = #actionHistory,
-			available_redos = #redoHistory
+			available_redos = #redoHistory,
 		}
 	end
+end
+
+-- ============================================
+-- HISTORY INTROSPECTION
+-- ============================================
+
+-- Read-only view of the recent action history + Studio's authoritative
+-- can_undo/can_redo flags. Useful for agents that want to peek before calling
+-- undo/redo (e.g. "what am I about to undo?") or to recover state after a
+-- session resume.
+handlers.getHistory = function(requestData)
+	local limit = tonumber(requestData and requestData.limit) or 20
+	if limit < 1 then limit = 1 end
+	if limit > MAX_ACTION_HISTORY then limit = MAX_ACTION_HISTORY end
+	local includeDetails = requestData and requestData.includeDetails == true
+
+	local now = os.time()
+
+	-- Slice the top `limit` entries of each stack. Index 0 = the one that
+	-- would be popped next (top of stack); larger indices reach further back.
+	local function sliceStack(stack)
+		local out = {}
+		local n = #stack
+		local take = math.min(limit, n)
+		for i = 0, take - 1 do
+			local entry = stack[n - i]
+			if entry then
+				local sliced = {
+					index = i,
+					action = entry.action,
+					target = entry.target,
+					summary = entry.summary,
+					timestamp = entry.timestamp,
+					age_seconds = now - (entry.timestamp or now),
+				}
+				if includeDetails then
+					sliced.details = entry.details
+				end
+				table.insert(out, sliced)
+			end
+		end
+		return out
+	end
+
+	local canUndo = ChangeHistoryService:GetCanUndo()
+	local canRedo = ChangeHistoryService:GetCanRedo()
+
+	return {
+		success = true,
+		can_undo = canUndo,
+		can_redo = canRedo,
+		tracked_undo_count = #actionHistory,
+		tracked_redo_count = #redoHistory,
+		max_history = MAX_ACTION_HISTORY,
+		undo_stack = sliceStack(actionHistory),
+		redo_stack = sliceStack(redoHistory),
+	}
 end
 
 -- ============================================
@@ -5336,6 +5498,24 @@ handlers.executeLua = function(requestData)
 			return "<" .. t .. ">"
 		end
 	end
+
+	-- Log to MCP action history for get_history visibility. Truncated code
+	-- preview keeps the summary line cheap. Note: we log even when the user
+	-- code didn't mutate anything (we can't know that), so a benign
+	-- execute_lua entry may sit at the top of history without a matching
+	-- Studio waypoint. That's expected; the undo() tool tolerates this.
+	local codeLines = 1
+	for _ in string.gmatch(code, "\n") do
+		codeLines = codeLines + 1
+	end
+	local codePreview = code:gsub("^%s+", ""):gsub("\n.*$", "")
+	if #codePreview > 60 then
+		codePreview = string.sub(codePreview, 1, 60) .. "..."
+	end
+	logAction("execute_lua", "<inline>", codePreview, {
+		code_length = #code,
+		line_count = codeLines,
+	})
 
 	return {
 		success = true,
@@ -6420,6 +6600,7 @@ endpointHandlers = {
 	["/api/insert-asset"] = handlers.insertAsset,
 	["/api/undo"] = handlers.undo,
 	["/api/redo"] = handlers.redo,
+	["/api/get-history"] = handlers.getHistory,
 	-- Execute Lua
 	["/api/execute-lua"] = handlers.executeLua,
 	-- Playtest control

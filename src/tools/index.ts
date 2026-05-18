@@ -1035,27 +1035,59 @@ export class RobloxStudioTools {
   // UNDO/REDO TOOLS
   // ============================================
 
-  async undo() {
-    const response = await this.client.request('/api/undo', {});
+  async undo(count?: number) {
+    // Default + clamp client-side so the plugin can stay strict. Studio's
+    // own undo stack is the real source of truth; the plugin stops early if
+    // it runs out, regardless of what we ask for.
+    const safeCount =
+      typeof count === 'number' && Number.isFinite(count)
+        ? Math.max(1, Math.min(100, Math.floor(count)))
+        : 1;
+    const response = await this.client.request('/api/undo', { count: safeCount });
     return {
       content: [
         {
           type: 'text',
-          text: JSON.stringify(response, null, 2)
-        }
-      ]
+          text: JSON.stringify(response, null, 2),
+        },
+      ],
     };
   }
 
-  async redo() {
-    const response = await this.client.request('/api/redo', {});
+  async redo(count?: number) {
+    const safeCount =
+      typeof count === 'number' && Number.isFinite(count)
+        ? Math.max(1, Math.min(100, Math.floor(count)))
+        : 1;
+    const response = await this.client.request('/api/redo', { count: safeCount });
     return {
       content: [
         {
           type: 'text',
-          text: JSON.stringify(response, null, 2)
-        }
-      ]
+          text: JSON.stringify(response, null, 2),
+        },
+      ],
+    };
+  }
+
+  async getHistory(limit?: number, includeDetails?: boolean) {
+    // 20 is a sweet spot: enough for "what did I just do?" recall without
+    // bloating context. Plugin caps at MAX_ACTION_HISTORY (100).
+    const safeLimit =
+      typeof limit === 'number' && Number.isFinite(limit)
+        ? Math.max(1, Math.min(100, Math.floor(limit)))
+        : 20;
+    const response = await this.client.request('/api/get-history', {
+      limit: safeLimit,
+      includeDetails: includeDetails === true,
+    });
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify(response, null, 2),
+        },
+      ],
     };
   }
 

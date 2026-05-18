@@ -1,6 +1,9 @@
 import { promises as fs } from 'fs';
 import * as path from 'path';
 import { contentRoot } from './cache.js';
+import { getOrBuild } from './embeddings/manager.js';
+import { encodeOne, dot } from './embeddings/embedder.js';
+import type { DocsIndex } from './embeddings/index.js';
 
 /**
  * Pure-JS regex search over the cached docs tree.
@@ -34,6 +37,18 @@ export interface SearchHit {
    * surrounding context".
    */
   matchedTokens?: string[];
+  /**
+   * Hybrid mode only: aggregate score in [0, 1] used to rank this hit.
+   * Combines keyword token coverage and semantic similarity. Populated
+   * by `searchDocsHybrid`; absent in pure literal / token-AND modes.
+   */
+  score?: number;
+  /**
+   * Hybrid mode only: raw cosine similarity of the embedding of the
+   * passage containing this hit against the query embedding, in
+   * [-1, 1]. Useful for the model to gauge how "topical" the hit is.
+   */
+  semanticScore?: number;
 }
 
 export interface SearchOptions {
@@ -56,6 +71,24 @@ export interface SearchOptions {
    * single token (those fall back to literal substring search).
    */
   windowLines?: number;
+  /**
+   * Semantic rerank toggle. Defaults to true.
+   *
+   * When true AND the query is in token-AND mode (multi-token, not
+   * regex), the keyword hits are reranked by cosine similarity against
+   * a sentence-embedding index of the docs. This dramatically improves
+   * relevance for natural-language queries while preserving all the
+   * keyword guarantees (every returned hit still contains all tokens
+   * within `windowLines`).
+   *
+   * Set to false to force pure keyword mode — useful for deterministic
+   * tests or when the semantic index is unavailable / undesired.
+   *
+   * Has no effect in literal mode (single token, quoted phrase, regex)
+   * because those queries already have unambiguous ranking by file
+   * position.
+   */
+  semantic?: boolean;
 }
 
 export interface SearchSummary {
@@ -67,12 +100,32 @@ export interface SearchSummary {
   /** ms spent inside this call. */
   durationMs: number;
   /**
-   * "literal" = single-token / regex / single phrase.
+   * "literal"   = single-token / regex / single phrase.
    * "token-and" = multi-token AND-match within `windowLines`.
+   * "hybrid"    = token-AND filtering + semantic rerank.
    */
-  mode: 'literal' | 'token-and';
-  /** Tokens we actually searched for in token-and mode. */
+  mode: 'literal' | 'token-and' | 'hybrid';
+  /** Tokens we actually searched for in token-and / hybrid mode. */
   tokens?: string[];
+  /**
+   * Hybrid mode only: whether the semantic index was actually used. False
+   * means we wanted to rerank but the index was unavailable (first call
+   * before build finished, model download failure, etc.) and we fell
+   * back to plain keyword ranking. Lets the caller decide whether to
+   * retry, warm the cache, or just accept keyword results.
+   */
+  semanticUsed?: boolean;
+}
+
+/**
+ * Inputs passed to `searchDocs` *in addition to* the public options.
+ * Currently just the docs SHA so the hybrid path can locate the right
+ * vector index. Keeping this out of `SearchOptions` because it's
+ * server-internal — the LLM never sets it.
+ */
+export interface InternalSearchInputs {
+  /** Docs cache SHA, used to load/build the semantic index. */
+  docsSha?: string;
 }
 
 const DEFAULT_EXTENSIONS = ['md', 'yaml', 'yml'];
@@ -166,9 +219,14 @@ export async function searchDocs(
   cacheDir: string,
   pattern: string,
   options: SearchOptions = {},
+  internal: InternalSearchInputs = {},
 ): Promise<SearchSummary> {
   const tokens = options.useRegex ? [] : tokenize(pattern);
   if (!options.useRegex && tokens.length >= 2) {
+    const semantic = options.semantic ?? true;
+    if (semantic) {
+      return searchDocsHybrid(cacheDir, pattern, tokens, options, internal);
+    }
     return searchDocsTokenAnd(cacheDir, tokens, options);
   }
   // Literal mode: if the user wrapped the whole query in double-quotes
@@ -388,6 +446,169 @@ async function searchDocsTokenAnd(
     durationMs: Date.now() - t0,
     mode: 'token-and',
     tokens,
+  };
+}
+
+/**
+ * Hybrid search: token-AND keyword filter + semantic rerank.
+ *
+ * Pipeline:
+ *   1. Run the existing token-AND keyword search to get a high-recall
+ *      pool of candidate hits. We bump `maxHits` for this stage so we
+ *      have more room to rerank — the final user-facing cap is
+ *      applied after scoring.
+ *   2. Look up the chunk(s) that contain each hit's line. A hit
+ *      inherits the embedding of the chunk it falls in.
+ *   3. Embed the query (~5ms cold, ~1ms warm).
+ *   4. Score each hit:
+ *        finalScore = α · cosine(query, chunk)        // semantic
+ *                   + β · (matchedTokens / totalTokens) // keyword density
+ *                   + γ · pathBoost                    // reference > guide for API-ish queries
+ *      where α=0.7, β=0.2, γ=0.1. These were picked by eyeballing a
+ *      handful of golden queries — see test/golden-queries.test.ts.
+ *   5. Sort by finalScore, slice to `maxHits`, return.
+ *
+ * Fallbacks (any of which keep search usable):
+ *   - No SHA passed in → can't load index → return plain token-AND.
+ *   - Index load/build fails → return plain token-AND with semanticUsed=false.
+ *   - No candidate hits → return empty (semantic won't invent matches
+ *     that don't lexically exist; that's a feature, not a bug — we
+ *     guarantee every returned hit contains every query token).
+ */
+async function searchDocsHybrid(
+  cacheDir: string,
+  pattern: string,
+  tokensIn: string[],
+  options: SearchOptions,
+  internal: InternalSearchInputs,
+): Promise<SearchSummary> {
+  const t0 = Date.now();
+  const userMaxHits = Math.max(1, Math.min(options.maxHits ?? 200, 1000));
+  // High recall pool: rerank wants more to choose from, but we cap
+  // hard to avoid embedding 1000 hits for nothing.
+  const poolMaxHits = Math.min(Math.max(userMaxHits * 3, 50), 300);
+
+  // 1. Run keyword pass with a beefier cap.
+  const keyword = await searchDocsTokenAnd(cacheDir, tokensIn, {
+    ...options,
+    maxHits: poolMaxHits,
+  });
+
+  // No SHA / no candidate hits → bail out gracefully with the keyword
+  // result (truncated to the user's original cap).
+  if (keyword.hits.length === 0) {
+    return {
+      ...keyword,
+      hits: keyword.hits.slice(0, userMaxHits),
+      mode: 'hybrid',
+      semanticUsed: false,
+      durationMs: Date.now() - t0,
+    };
+  }
+
+  // 2. Load (or build) the semantic index. If unavailable, fall back.
+  let index: DocsIndex | null = null;
+  if (internal.docsSha) {
+    try {
+      index = await getOrBuild(cacheDir, internal.docsSha);
+    } catch {
+      index = null;
+    }
+  }
+  if (!index) {
+    return {
+      ...keyword,
+      hits: keyword.hits.slice(0, userMaxHits),
+      mode: 'hybrid',
+      semanticUsed: false,
+      durationMs: Date.now() - t0,
+    };
+  }
+
+  // 3. Embed query.
+  let qvec: Float32Array;
+  try {
+    qvec = await encodeOne(pattern);
+  } catch {
+    // Embedder failure — treat as no semantic index available.
+    return {
+      ...keyword,
+      hits: keyword.hits.slice(0, userMaxHits),
+      mode: 'hybrid',
+      semanticUsed: false,
+      durationMs: Date.now() - t0,
+    };
+  }
+
+  // Build path→chunks lookup so the hit→chunk join is O(hits + chunks),
+  // not O(hits × chunks).
+  const chunksByPath = new Map<string, { startLine: number; endLine: number; vec: Float32Array }[]>();
+  const dim = index.meta.dim;
+  for (let i = 0; i < index.chunks.length; i++) {
+    const c = index.chunks[i];
+    const vec = index.vectors.subarray(i * dim, (i + 1) * dim);
+    const arr = chunksByPath.get(c.path);
+    const entry = { startLine: c.startLine, endLine: c.endLine, vec };
+    if (arr) arr.push(entry);
+    else chunksByPath.set(c.path, [entry]);
+  }
+
+  // Heuristic: does the query look like an API name lookup? If so,
+  // boost reference/engine chunks. Cheap regex test: any PascalCase
+  // token (e.g. "Motor6D", "TweenService") triggers the boost.
+  const looksApiLike = tokensIn.some((t) => /^[A-Z][a-zA-Z0-9_]*$/.test(t));
+
+  // 4. Score every keyword hit.
+  const ALPHA = 0.7;
+  const BETA = 0.2;
+  const GAMMA = 0.1;
+  const tokenCount = Math.max(1, tokensIn.length);
+
+  type Scored = SearchHit & { score: number };
+  const scored: Scored[] = [];
+  for (const hit of keyword.hits) {
+    // Find the chunk(s) covering this line. A line can fall in at most
+    // one chunk for md (heading-bounded) but yaml has both a preamble
+    // and a member chunk that may overlap; take the highest-scoring.
+    const chunksForFile = chunksByPath.get(hit.path);
+    let semanticScore = 0;
+    if (chunksForFile) {
+      for (const ch of chunksForFile) {
+        if (hit.line < ch.startLine || hit.line > ch.endLine) continue;
+        const sim = dot(qvec, ch.vec);
+        if (sim > semanticScore) semanticScore = sim;
+      }
+      // Fallback if no chunk contains the line exactly (rare — chunker
+      // splits don't always align with hit anchor line in fallback
+      // mode): use the highest-scoring chunk in that file. Strictly
+      // worse than the precise match, but better than zero.
+      if (semanticScore === 0) {
+        for (const ch of chunksForFile) {
+          const sim = dot(qvec, ch.vec);
+          if (sim > semanticScore) semanticScore = sim;
+        }
+      }
+    }
+
+    const keywordDensity = (hit.matchedTokens?.length ?? 0) / tokenCount;
+    const pathBoost = looksApiLike && hit.path.includes('reference/engine') ? 1 : 0;
+    const finalScore = ALPHA * semanticScore + BETA * keywordDensity + GAMMA * pathBoost;
+    scored.push({ ...hit, score: finalScore, semanticScore });
+  }
+
+  // 5. Sort & trim.
+  scored.sort((a, b) => b.score - a.score);
+  const finalHits: SearchHit[] = scored.slice(0, userMaxHits);
+
+  return {
+    totalHits: keyword.totalHits,
+    truncated: keyword.totalHits > finalHits.length,
+    hits: finalHits,
+    filesScanned: keyword.filesScanned,
+    durationMs: Date.now() - t0,
+    mode: 'hybrid',
+    tokens: tokensIn.slice(0, 31),
+    semanticUsed: true,
   };
 }
 

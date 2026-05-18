@@ -1649,7 +1649,12 @@ export class RobloxStudioTools {
       throw new Error('query is required for search_roblox_docs');
     }
     const ensured = await ensureDocsCache();
-    const summary = await searchDocs(ensured.cacheDir, query, options);
+    // Plumb the docs SHA through so hybrid mode can locate / build the
+    // matching semantic index. Without this, hybrid mode degrades to
+    // pure keyword (semanticUsed=false in the response).
+    const summary = await searchDocs(ensured.cacheDir, query, options, {
+      docsSha: ensured.meta.sha,
+    });
     return {
       content: [
         {

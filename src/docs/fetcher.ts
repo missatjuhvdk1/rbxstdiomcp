@@ -13,6 +13,8 @@ import {
   writeMeta,
   type DocsMeta,
 } from './cache.js';
+import { clearIndex } from './embeddings/index.js';
+import { invalidate as invalidateSemanticIndex } from './embeddings/manager.js';
 
 /**
  * Mirror Roblox/creator-docs locally as a flat file tree, refreshed on
@@ -267,6 +269,19 @@ async function doDownload(
     bytesOnDisk,
   };
   await writeMeta(cacheDir, meta);
+
+  // Vectors are tied 1:1 to the file tree we just blew away. Drop the
+  // in-memory cache and the on-disk index so the next semantic query
+  // rebuilds from the fresh docs. (We don't proactively rebuild here
+  // — that would block this call for ~60s for a feature the caller
+  // might not even use.)
+  invalidateSemanticIndex();
+  try {
+    await clearIndex(cacheDir);
+  } catch {
+    // Best-effort — a stale index is annoying but not fatal; the
+    // schema/sha check inside loadIndex() will reject it next time.
+  }
 
   return {
     cacheDir,

@@ -19,10 +19,14 @@ export const docTools: ToolDef[] = [
     name: 'search_roblox_docs',
     description:
       "Search Roblox's official creator documentation (mirror of github.com/Roblox/creator-docs). " +
-      'Returns matching lines with file path, line number, and surrounding context. ' +
+      'Returns matching passages with file path, line number, surrounding context, and (in hybrid mode) a relevance score. ' +
       'Use this FIRST when you need authoritative info on a Roblox API, behavior, or guide topic — especially for things AI models commonly get wrong (animation, Motor6D C0/C1, R6/R15 rigs, AlignOrientation, etc.). ' +
-      '\n\n**Token-AND mode** (default for multi-word queries): the query is split on whitespace and every token must appear within `window_lines` (default 3) of the anchor line. So `"Motor6D C0"` finds any passage where Motor6D and C0 are mentioned together — even if the docs literally write `Motor6D.C0` or `Class.Motor6D.C0|C0`. This is what you almost always want; do NOT pre-mangle queries to match the docs\' exact punctuation. ' +
-      'Wrap a phrase in double quotes to force a literal match, e.g. `"Class.Motor6D.C0"` (one token). Single-token queries fall back to literal substring search. ' +
+      '\n\n**Hybrid mode** (default for multi-word queries): keyword token-AND filtering + semantic rerank. ' +
+      'The query is split on whitespace; every token must appear within `window_lines` (default 3) of the anchor line (so every returned hit is guaranteed to lexically contain all your terms), AND the surviving hits are reranked by sentence-embedding cosine similarity against your full query. ' +
+      'This means natural-language queries like `"how do I rotate a body part smoothly"` correctly surface AlignOrientation / Motor6D / tween passages, while exact-API queries like `"Motor6D C0"` still get the right reference page on top. ' +
+      'The first call after a fresh docs download triggers a one-time semantic index build (~30–90s + ~25MB model download); subsequent calls are sub-100ms. If the index isn\'t ready yet (or fails to build), the tool transparently falls back to plain keyword ranking and sets `semanticUsed: false` in the response. ' +
+      '\n\nWrap a phrase in double quotes to force a literal match, e.g. `"Class.Motor6D.C0"` (one token). Single-token queries fall back to literal substring search (no semantic rerank — single tokens already have an unambiguous ranking). ' +
+      'Pass `semantic: false` to force pure keyword mode if you want deterministic results. ' +
       '\n\nOn first use the tool downloads ~30MB of docs to a local cache (~5s). Subsequent calls hit the cache instantly and refresh from upstream at most once per 24h.',
     inputSchema: {
       type: 'object',
@@ -30,7 +34,7 @@ export const docTools: ToolDef[] = [
         query: {
           type: 'string',
           description:
-            'Search query. Multiple whitespace-separated words trigger token-AND mode (each token must appear within `window_lines` of the anchor). Use double quotes to force a phrase: `"Class.Motor6D"` is one token. Examples: "Motor6D C0", "AlignOrientation servo", "humanoid animation rig".',
+            'Search query. Multiple whitespace-separated words trigger hybrid mode (keyword token-AND + semantic rerank). Single tokens / regex / quoted phrases use literal substring search. Use double quotes to force a phrase: `"Class.Motor6D"` is one token. Examples: "Motor6D C0", "AlignOrientation servo", "how do I rotate a body part smoothly", "humanoid animation rig".',
         },
         scope: {
           type: 'string',
@@ -46,7 +50,7 @@ export const docTools: ToolDef[] = [
         use_regex: {
           type: 'boolean',
           description:
-            'Treat `query` as a single JS regex. Disables token-AND mode. Default false.',
+            'Treat `query` as a single JS regex. Disables hybrid mode (no token splitting, no semantic rerank). Default false.',
           default: false,
         },
         case_sensitive: {
@@ -57,19 +61,26 @@ export const docTools: ToolDef[] = [
         context_lines: {
           type: 'number',
           description:
-            'Lines of context before/after each hit (like grep -C). 0–10. Default 0 in literal mode; in token-AND mode the matched window is always emitted, and this widens it further if larger than `window_lines`.',
+            'Lines of context before/after each hit (like grep -C). 0–10. Default 0 in literal mode; in hybrid mode the matched token-AND window is always emitted, and this widens it further if larger than `window_lines`.',
           default: 0,
         },
         window_lines: {
           type: 'number',
           description:
-            'Token-AND mode only: how close (in lines) the tokens must appear to count as a hit. 1–10. Default 3. Lower = stricter (tokens on adjacent lines), higher = looser (tokens anywhere in a paragraph).',
+            'Hybrid / token-AND mode only: how close (in lines) the tokens must appear to count as a hit. 1–10. Default 3. Lower = stricter (tokens on adjacent lines), higher = looser (tokens anywhere in a paragraph).',
           default: 3,
         },
         max_hits: {
           type: 'number',
-          description: 'Cap on results returned. Default 200, max 1000.',
+          description:
+            'Cap on results returned. Default 200, max 1000. In hybrid mode, an internal high-recall pool of up to 3× this is generated for reranking, then the top `max_hits` by relevance are returned.',
           default: 200,
+        },
+        semantic: {
+          type: 'boolean',
+          description:
+            'Toggle semantic reranking for multi-token queries. Default true. Set to false to force plain keyword ranking (faster, deterministic, no model load). Has no effect on single-token / regex / quoted-phrase queries.',
+          default: true,
         },
       },
       required: ['query'],
@@ -85,6 +96,7 @@ export const docTools: ToolDef[] = [
           contextLines: args?.context_lines ?? 0,
           windowLines: args?.window_lines ?? 3,
           maxHits: args?.max_hits ?? 200,
+          semantic: args?.semantic ?? true,
         },
       ),
   },

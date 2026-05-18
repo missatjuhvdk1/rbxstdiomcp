@@ -21,12 +21,13 @@ export const docTools: ToolDef[] = [
       "Search Roblox's official creator documentation (mirror of github.com/Roblox/creator-docs). " +
       'Returns matching passages with file path, line number, surrounding context, and (in hybrid mode) a relevance score. ' +
       'Use this FIRST when you need authoritative info on a Roblox API, behavior, or guide topic — especially for things AI models commonly get wrong (animation, Motor6D C0/C1, R6/R15 rigs, AlignOrientation, etc.). ' +
-      '\n\n**Hybrid mode** (default for multi-word queries): keyword token-AND filtering + semantic rerank. ' +
-      'The query is split on whitespace; every token must appear within `window_lines` (default 3) of the anchor line (so every returned hit is guaranteed to lexically contain all your terms), AND the surviving hits are reranked by sentence-embedding cosine similarity against your full query. ' +
-      'This means natural-language queries like `"how do I rotate a body part smoothly"` correctly surface AlignOrientation / Motor6D / tween passages, while exact-API queries like `"Motor6D C0"` still get the right reference page on top. ' +
-      'The first call after a fresh docs download triggers a one-time semantic index build (~30–90s + ~25MB model download); subsequent calls are sub-100ms. If the index isn\'t ready yet (or fails to build), the tool transparently falls back to plain keyword ranking and sets `semanticUsed: false` in the response. ' +
+      '\n\n**Hybrid mode** (default for multi-word queries) has two stages:\n' +
+      '1) **Keyword-AND + semantic rerank** (preferred): English stopwords (`how`, `do`, `the`, `a`, etc.) are stripped, and the remaining "meaningful" tokens must all appear within `window_lines` (default 3) of the anchor line. Surviving hits are then reranked by sentence-embedding cosine similarity against your FULL original query (stopwords included — the embedder benefits from natural-language framing). Response has `keywordFiltered: true`; every hit lexically contains every meaningful token.\n' +
+      '2) **Pure-semantic fallback** (when stage 1 finds nothing): cosine top-K over the chunk index, no keyword guarantee. This is what makes queries like `"how do I rotate a body part smoothly"` surface AlignOrientation / Motor6D pages even when no single line contains every term. Response has `keywordFiltered: false` — treat hits as "topically relevant" rather than "lexically matching".\n' +
+      'Exact-API queries like `"Motor6D C0"` use stage 1 and get the right reference page on top. ' +
+      'The first call after a fresh docs download triggers a one-time semantic index build (~25MB model download + embedding ~19k chunks; measured at ~8 min on a single-CPU box, faster with multi-core / GPU). Subsequent process starts load from disk in <100ms. If the index isn\'t ready yet (or fails to build), the tool transparently falls back to plain keyword ranking and sets `semanticUsed: false` in the response. ' +
       '\n\nWrap a phrase in double quotes to force a literal match, e.g. `"Class.Motor6D.C0"` (one token). Single-token queries fall back to literal substring search (no semantic rerank — single tokens already have an unambiguous ranking). ' +
-      'Pass `semantic: false` to force pure keyword mode if you want deterministic results. ' +
+      'Pass `semantic: false` to force pure keyword mode if you want deterministic results (stopwords are still stripped from the AND filter). ' +
       '\n\nOn first use the tool downloads ~30MB of docs to a local cache (~5s). Subsequent calls hit the cache instantly and refresh from upstream at most once per 24h.',
     inputSchema: {
       type: 'object',

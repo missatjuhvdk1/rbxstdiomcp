@@ -115,6 +115,15 @@ export interface SearchSummary {
    * retry, warm the cache, or just accept keyword results.
    */
   semanticUsed?: boolean;
+  /**
+   * Hybrid mode only: whether the returned hits are guaranteed to
+   * contain every meaningful query token. True for the normal
+   * "keyword AND + semantic rerank" path. False when keyword filtering
+   * yielded zero candidates and we fell back to pure-semantic top-K
+   * over the chunk index — in that case the model should treat hits
+   * as "topically relevant" rather than "lexically matching".
+   */
+  keywordFiltered?: boolean;
 }
 
 /**
@@ -159,6 +168,58 @@ function tokenize(query: string): string[] {
     if (tok && tok.length > 0) tokens.push(tok);
   }
   return tokens;
+}
+
+/**
+ * Common English stopwords that wreck keyword AND-recall on natural-
+ * language queries like "how do I rotate a body part smoothly" — words
+ * like "how", "do", "I", "a" almost never appear together with the
+ * meaningful tokens in API docs, so requiring them in the AND filter
+ * zeroes out every hit.
+ *
+ * We strip these from the KEYWORD filter only — the semantic embedding
+ * still sees the full natural-language query (the model benefits from
+ * the question framing).
+ *
+ * Punctuation and short tokens (1 char) are also dropped because they
+ * don't carry meaning and dilute keyword density. Keep this list
+ * conservative: anything domain-specific (`set`, `get`, `play`, etc.)
+ * stays in — we'd rather under-strip than lose a Roblox-relevant term.
+ */
+const STOPWORDS = new Set([
+  'a', 'an', 'the',
+  'i', 'me', 'my', 'you', 'your', 'we', 'our', 'us', 'they', 'them', 'their', 'it', 'its',
+  'how', 'what', 'when', 'where', 'why', 'who', 'which', 'whose',
+  'do', 'does', 'did', 'doing',
+  'is', 'am', 'are', 'was', 'were', 'be', 'been', 'being',
+  'have', 'has', 'had', 'having',
+  'can', 'could', 'should', 'would', 'may', 'might', 'will', 'shall', 'must',
+  'to', 'of', 'for', 'in', 'on', 'at', 'by', 'with', 'from', 'as', 'into', 'onto', 'about',
+  'and', 'or', 'but', 'if', 'so', 'than', 'then', 'because',
+  'that', 'this', 'these', 'those',
+  'there', 'here',
+  'not', 'no',
+  'some', 'any', 'all', 'each', 'every',
+  'just', 'only', 'also', 'very', 'really', 'still',
+  'one', 'two',
+  'something',
+]);
+
+/**
+ * Strip stopwords (and 1-char garbage) from a token list, returning the
+ * "meaningful" tokens. Always preserves at least the longest input
+ * token even if it happens to be a stopword — better to AND on
+ * something than nothing.
+ */
+function meaningfulTokens(tokens: string[]): string[] {
+  const kept = tokens.filter(
+    (t) => t.length >= 2 && !STOPWORDS.has(t.toLowerCase()),
+  );
+  if (kept.length > 0) return kept;
+  // Degenerate: query was all stopwords (e.g. "what is the"). Fall
+  // back to the longest input token so something gets through.
+  const longest = tokens.slice().sort((a, b) => b.length - a.length)[0];
+  return longest ? [longest] : [];
 }
 
 function popcount(n: number): number {
@@ -225,9 +286,25 @@ export async function searchDocs(
   if (!options.useRegex && tokens.length >= 2) {
     const semantic = options.semantic ?? true;
     if (semantic) {
-      return searchDocsHybrid(cacheDir, pattern, tokens, options, internal);
+      // Hybrid uses the meaningful (stopword-stripped) tokens for the
+      // keyword AND filter but feeds the FULL original query to the
+      // embedder. This is the key to making natural-language queries
+      // like "how do I rotate a body part smoothly" actually surface
+      // anything: the AND filter only requires "rotate", "body",
+      // "part", "smoothly" to coexist (very plausible), while the
+      // semantic rerank still sees the full question form.
+      const keywordTokens = meaningfulTokens(tokens);
+      return searchDocsHybrid(cacheDir, pattern, tokens, keywordTokens, options, internal);
     }
-    return searchDocsTokenAnd(cacheDir, tokens, options);
+    // Pure keyword mode (semantic: false): apply the same stopword
+    // strip so deterministic keyword queries don't get nuked by
+    // "how do I" boilerplate either.
+    const keywordTokens = meaningfulTokens(tokens);
+    return searchDocsTokenAnd(
+      cacheDir,
+      keywordTokens.length >= 1 ? keywordTokens : tokens,
+      options,
+    );
   }
   // Literal mode: if the user wrapped the whole query in double-quotes
   // (one resulting token after tokenize), search for the unquoted phrase
@@ -478,7 +555,8 @@ async function searchDocsTokenAnd(
 async function searchDocsHybrid(
   cacheDir: string,
   pattern: string,
-  tokensIn: string[],
+  allTokens: string[],
+  keywordTokens: string[],
   options: SearchOptions,
   internal: InternalSearchInputs,
 ): Promise<SearchSummary> {
@@ -488,25 +566,31 @@ async function searchDocsHybrid(
   // hard to avoid embedding 1000 hits for nothing.
   const poolMaxHits = Math.min(Math.max(userMaxHits * 3, 50), 300);
 
-  // 1. Run keyword pass with a beefier cap.
-  const keyword = await searchDocsTokenAnd(cacheDir, tokensIn, {
-    ...options,
-    maxHits: poolMaxHits,
-  });
+  // 1. Run keyword pass with the STOPWORD-STRIPPED tokens and a
+  //    beefier cap. We can only AND on meaningful tokens — otherwise
+  //    "how do I rotate a body part" requires "how" + "do" + "I" + "a"
+  //    to all be present somewhere in docs, which zeroes out the pool
+  //    instantly.
+  const keyword =
+    keywordTokens.length >= 1
+      ? await searchDocsTokenAnd(cacheDir, keywordTokens, {
+          ...options,
+          maxHits: poolMaxHits,
+        })
+      : ({
+          // No usable keyword tokens at all (degenerate). Fake an empty
+          // keyword result and let the semantic fallback kick in.
+          totalHits: 0,
+          truncated: false,
+          hits: [],
+          filesScanned: 0,
+          durationMs: 0,
+          mode: 'token-and',
+          tokens: [],
+        } as SearchSummary);
 
-  // No SHA / no candidate hits → bail out gracefully with the keyword
-  // result (truncated to the user's original cap).
-  if (keyword.hits.length === 0) {
-    return {
-      ...keyword,
-      hits: keyword.hits.slice(0, userMaxHits),
-      mode: 'hybrid',
-      semanticUsed: false,
-      durationMs: Date.now() - t0,
-    };
-  }
-
-  // 2. Load (or build) the semantic index. If unavailable, fall back.
+  // 2. Load (or build) the semantic index. If unavailable, return what
+  //    keyword found (possibly empty) and let the caller deal with it.
   let index: DocsIndex | null = null;
   if (internal.docsSha) {
     try {
@@ -522,26 +606,50 @@ async function searchDocsHybrid(
       mode: 'hybrid',
       semanticUsed: false,
       durationMs: Date.now() - t0,
+      tokens: keywordTokens.slice(0, 31),
     };
   }
 
-  // 3. Embed query.
+  // 3. Embed query (full original pattern — model benefits from
+  //    natural-language framing, even though keyword filter dropped
+  //    stopwords).
   let qvec: Float32Array;
   try {
     qvec = await encodeOne(pattern);
   } catch {
-    // Embedder failure — treat as no semantic index available.
     return {
       ...keyword,
       hits: keyword.hits.slice(0, userMaxHits),
       mode: 'hybrid',
       semanticUsed: false,
       durationMs: Date.now() - t0,
+      tokens: keywordTokens.slice(0, 31),
     };
   }
 
-  // Build path→chunks lookup so the hit→chunk join is O(hits + chunks),
-  // not O(hits × chunks).
+  // 4. If keyword AND filter found nothing, fall back to PURE SEMANTIC
+  //    top-K from the chunk index. This is what makes natural-
+  //    language queries work — the user gets conceptually relevant
+  //    chunks even though no single line lexically contains all the
+  //    meaningful terms. Returned hits carry semanticScore but no
+  //    matchedTokens (since there's no keyword guarantee).
+  if (keyword.hits.length === 0) {
+    return semanticOnlyFallback(
+      cacheDir,
+      pattern,
+      allTokens,
+      keywordTokens,
+      qvec,
+      index,
+      options,
+      userMaxHits,
+      keyword.filesScanned,
+      t0,
+    );
+  }
+
+  // 5. Build path→chunks lookup so the hit→chunk join is O(hits + chunks),
+  //    not O(hits × chunks).
   const chunksByPath = new Map<string, { startLine: number; endLine: number; vec: Float32Array }[]>();
   const dim = index.meta.dim;
   for (let i = 0; i < index.chunks.length; i++) {
@@ -556,20 +664,17 @@ async function searchDocsHybrid(
   // Heuristic: does the query look like an API name lookup? If so,
   // boost reference/engine chunks. Cheap regex test: any PascalCase
   // token (e.g. "Motor6D", "TweenService") triggers the boost.
-  const looksApiLike = tokensIn.some((t) => /^[A-Z][a-zA-Z0-9_]*$/.test(t));
+  const looksApiLike = allTokens.some((t) => /^[A-Z][a-zA-Z0-9_]*$/.test(t));
 
-  // 4. Score every keyword hit.
+  // 6. Score every keyword hit.
   const ALPHA = 0.7;
   const BETA = 0.2;
   const GAMMA = 0.1;
-  const tokenCount = Math.max(1, tokensIn.length);
+  const tokenCount = Math.max(1, keywordTokens.length);
 
   type Scored = SearchHit & { score: number };
   const scored: Scored[] = [];
   for (const hit of keyword.hits) {
-    // Find the chunk(s) covering this line. A line can fall in at most
-    // one chunk for md (heading-bounded) but yaml has both a preamble
-    // and a member chunk that may overlap; take the highest-scoring.
     const chunksForFile = chunksByPath.get(hit.path);
     let semanticScore = 0;
     if (chunksForFile) {
@@ -578,10 +683,6 @@ async function searchDocsHybrid(
         const sim = dot(qvec, ch.vec);
         if (sim > semanticScore) semanticScore = sim;
       }
-      // Fallback if no chunk contains the line exactly (rare — chunker
-      // splits don't always align with hit anchor line in fallback
-      // mode): use the highest-scoring chunk in that file. Strictly
-      // worse than the precise match, but better than zero.
       if (semanticScore === 0) {
         for (const ch of chunksForFile) {
           const sim = dot(qvec, ch.vec);
@@ -596,7 +697,7 @@ async function searchDocsHybrid(
     scored.push({ ...hit, score: finalScore, semanticScore });
   }
 
-  // 5. Sort & trim.
+  // 7. Sort & trim.
   scored.sort((a, b) => b.score - a.score);
   const finalHits: SearchHit[] = scored.slice(0, userMaxHits);
 
@@ -607,8 +708,136 @@ async function searchDocsHybrid(
     filesScanned: keyword.filesScanned,
     durationMs: Date.now() - t0,
     mode: 'hybrid',
-    tokens: tokensIn.slice(0, 31),
+    tokens: keywordTokens.slice(0, 31),
     semanticUsed: true,
+    keywordFiltered: true,
+  };
+}
+
+/**
+ * Pure-semantic search over the chunk index. Used as a fallback when
+ * keyword AND-filtering would have killed recall (e.g. natural-language
+ * queries where no single line contains every meaningful term).
+ *
+ * Returns one SearchHit per top-K chunk:
+ *   - `path`: chunk path
+ *   - `line`: chunk startLine
+ *   - `text`: first non-empty line of the chunk (~best summary anchor)
+ *   - `context`: a few subsequent lines of the chunk so the model can
+ *     verify topical relevance
+ *   - `score` / `semanticScore`: cosine similarity (also written into
+ *     `score` because there's no keyword density component here)
+ *   - `matchedTokens`: omitted (no keyword guarantee)
+ *
+ * No keyword guarantee means a hit's `text` may not contain any token
+ * from the user's query. That's intentional and correct for queries
+ * like "how do I rotate a body part smoothly" — the relevant doc
+ * (`AlignOrientation`) doesn't use the word "rotate" in every line.
+ *
+ * `keywordFiltered: false` in the response signals this to the caller.
+ */
+async function semanticOnlyFallback(
+  cacheDir: string,
+  pattern: string,
+  allTokens: string[],
+  keywordTokens: string[],
+  qvec: Float32Array,
+  index: DocsIndex,
+  options: SearchOptions,
+  userMaxHits: number,
+  filesScanned: number,
+  t0: number,
+): Promise<SearchSummary> {
+  const dim = index.meta.dim;
+  const scope = options.scope;
+  const looksApiLike = allTokens.some((t) => /^[A-Z][a-zA-Z0-9_]*$/.test(t));
+
+  // Score every chunk (3k–20k floats x 384-dim dot product — ~5-15ms).
+  type ScoredChunk = { idx: number; score: number; semanticScore: number };
+  const scored: ScoredChunk[] = [];
+  for (let i = 0; i < index.chunks.length; i++) {
+    const c = index.chunks[i];
+    if (scope && !c.path.startsWith(scope)) continue;
+    const vec = index.vectors.subarray(i * dim, (i + 1) * dim);
+    const sem = dot(qvec, vec);
+    // Add a small path boost for API-ish queries — same idea as hybrid.
+    const pathBoost = looksApiLike && c.path.includes('reference/engine') ? 1 : 0;
+    const finalScore = 0.9 * sem + 0.1 * pathBoost;
+    scored.push({ idx: i, score: finalScore, semanticScore: sem });
+  }
+  if (scored.length === 0) {
+    return {
+      totalHits: 0,
+      truncated: false,
+      hits: [],
+      filesScanned,
+      durationMs: Date.now() - t0,
+      mode: 'hybrid',
+      tokens: keywordTokens.slice(0, 31),
+      semanticUsed: true,
+      keywordFiltered: false,
+    };
+  }
+  scored.sort((a, b) => b.score - a.score);
+
+  // Diversify: don't return 5 chunks from the same file.
+  const seenPath = new Map<string, number>();
+  const perPathCap = 2;
+  const picked: ScoredChunk[] = [];
+  for (const s of scored) {
+    const p = index.chunks[s.idx].path;
+    const used = seenPath.get(p) ?? 0;
+    if (used >= perPathCap) continue;
+    picked.push(s);
+    seenPath.set(p, used + 1);
+    if (picked.length >= userMaxHits) break;
+  }
+
+  const hits: SearchHit[] = picked.map((s) => {
+    const c = index.chunks[s.idx];
+    // Pick a representative anchor line: first non-empty, non-heading line.
+    const chunkLines = c.text.split(/\r?\n/);
+    let anchorOffset = 0;
+    let anchorText = chunkLines[0] ?? '';
+    for (let j = 0; j < chunkLines.length; j++) {
+      const t = chunkLines[j].trim();
+      if (!t) continue;
+      // Skip pure heading lines as anchors — the body is more informative.
+      if (j < chunkLines.length - 1 && /^#+\s/.test(t)) continue;
+      anchorOffset = j;
+      anchorText = chunkLines[j];
+      break;
+    }
+    // Provide a small slice of surrounding lines as context.
+    const ctxLines: { line: number; text: string }[] = [];
+    const ctxStart = Math.max(0, anchorOffset - 1);
+    const ctxEnd = Math.min(chunkLines.length, anchorOffset + 4);
+    for (let j = ctxStart; j < ctxEnd; j++) {
+      if (j === anchorOffset) continue;
+      const lineText = chunkLines[j].replace(/\s+$/, '');
+      if (!lineText) continue;
+      ctxLines.push({ line: c.startLine + j, text: lineText });
+    }
+    return {
+      path: c.path,
+      line: c.startLine + anchorOffset,
+      text: anchorText.replace(/\s+$/, ''),
+      context: ctxLines,
+      score: s.score,
+      semanticScore: s.semanticScore,
+    };
+  });
+
+  return {
+    totalHits: scored.length,
+    truncated: scored.length > hits.length,
+    hits,
+    filesScanned,
+    durationMs: Date.now() - t0,
+    mode: 'hybrid',
+    tokens: keywordTokens.slice(0, 31),
+    semanticUsed: true,
+    keywordFiltered: false,
   };
 }
 

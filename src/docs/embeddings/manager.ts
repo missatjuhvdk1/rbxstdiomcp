@@ -7,8 +7,8 @@ import { EMBED_MODEL } from './embedder.js';
  * Responsibilities:
  *   1. Lazy-load the index on first semantic query so plain keyword
  *      searches don't pay the cost.
- *   2. Cache the loaded index in memory (vectors are mmap-able and
- *      small; ~4.6MB for ~3k chunks).
+ *   2. Cache the loaded index in memory (packed Float32 vectors are
+ *      ~29MB for the measured ~19k chunks).
  *   3. Coalesce concurrent first-callers onto the same load/build
  *      promise so we don't run two builds in parallel.
  *   4. Rebuild on docs-SHA mismatch (the fetcher handed us a new
@@ -58,8 +58,10 @@ export interface GetOrBuildOptions {
  *   2. Otherwise try to loadIndex() from disk — if it matches the sha,
  *      cache + return it.
  *   3. Otherwise, if loadOnly: return null.
- *   4. Otherwise build a fresh index (heavy: 30–90s + 25MB model
- *      download on first ever call) and cache it.
+ *   4. Otherwise build a fresh index. Heavy: ~25MB model download +
+ *      embedding ~19k chunks. Measured at ~8 minutes on a single CPU
+ *      box; faster on multi-core / GPU. Subsequent process restarts
+ *      load from disk in <100ms.
  *
  * Errors during build are swallowed (returned as null) because we
  * don't want a semantic-index failure to break the keyword search.

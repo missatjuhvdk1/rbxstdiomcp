@@ -23,9 +23,11 @@ import { dot, encode, encodeOne, EMBED_DIM } from './embedder.js';
  *      is sub-10ms vs. parsing the same data out of JSON.
  *
  * Why flat cosine instead of HNSW / IVF?
- *   At ~3k chunks × 384 dims, brute-force takes <1ms in JS. HNSW would
- *   add a dependency and complexity to save microseconds we don't need.
- *   If the index grows past ~50k chunks we should reconsider.
+ *   At ~19k chunks × 384 dims (measured on the real docs tree),
+ *   brute-force takes ~5-15ms in JS — still well within "interactive"
+ *   for a tool call. HNSW would add a dependency and complexity for
+ *   savings that don't move the user-visible needle. If the index
+ *   grows past ~100k chunks we should reconsider.
  */
 
 const INDEX_SCHEMA_VERSION = 2;

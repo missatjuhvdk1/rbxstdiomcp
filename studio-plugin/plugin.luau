@@ -3949,6 +3949,217 @@ handlers.searchScript = function(requestData)
 	end
 end
 
+-- grep: Claude Code-style search across the instance tree.
+--
+-- Walks descendants of `path`, pre-filters by `type` (IsA) and `glob`
+-- (Lua pattern over Name), then scans script Source for `pattern` (either
+-- line-by-line or whole-source if `multiline`). Three output modes mirror
+-- `grep -l` / `grep` / `grep -c`.
+--
+-- Request shape:
+--   { pattern, path, glob?, type? (array), caseInsensitive?, after?, before?,
+--     context?, outputMode? ("files_with_matches"|"content"|"count"),
+--     headLimit?, multiline? }
+--
+-- Response shapes:
+--   files_with_matches: { mode, pattern, scanned, matches = [{path, className, name}] }
+--   content:            { mode, pattern, scanned, matches = [{path, className, name,
+--                          lines = [{lineNumber, content, context = [{lineNumber, content, type}]}]}],
+--                          totalMatches }
+--   count:              { mode, pattern, scanned, matches = [{path, className, name, count}], totalMatches }
+handlers.grep = function(requestData)
+	local pattern = requestData.pattern
+	if type(pattern) ~= "string" or #pattern == 0 then
+		return { error = "pattern is required (use \".*\" for name-only searches)" }
+	end
+
+	local rootPath = requestData.path
+	if type(rootPath) ~= "string" or #rootPath == 0 then
+		rootPath = "game"
+	end
+
+	local glob = requestData.glob
+	if type(glob) ~= "string" or #glob == 0 then glob = nil end
+
+	local typeFilter = requestData.type
+	if typeof(typeFilter) ~= "table" or #typeFilter == 0 then
+		typeFilter = { "LuaSourceContainer" }
+	end
+
+	local caseInsensitive = requestData.caseInsensitive == true
+	local outputMode = requestData.outputMode or "files_with_matches"
+	if outputMode ~= "files_with_matches" and outputMode ~= "content" and outputMode ~= "count" then
+		return { error = "outputMode must be one of: files_with_matches, content, count" }
+	end
+
+	local contextAround = tonumber(requestData.context) or 0
+	local contextAfter = tonumber(requestData.after) or 0
+	local contextBefore = tonumber(requestData.before) or 0
+	if contextAround > 0 then
+		-- -C overrides -A/-B, matching grep semantics
+		contextAfter = contextAround
+		contextBefore = contextAround
+	end
+
+	local headLimit = tonumber(requestData.headLimit) or 0
+	local multiline = requestData.multiline == true
+
+	-- Resolve the root instance.
+	local rootInstance
+	if rootPath == "game" or rootPath == "" then
+		rootInstance = game
+	else
+		rootInstance = getInstanceByPath(rootPath)
+		if not rootInstance then
+			return { error = "Path not found: " .. rootPath }
+		end
+	end
+
+	-- Helper: case-insensitive find/match by lowercasing both inputs. We
+	-- can't use a "(?i)" prefix in Lua patterns, so this is the standard
+	-- workaround. We keep the original case of the matched line in the
+	-- output for readability.
+	local function caseFold(s)
+		if caseInsensitive then return string.lower(s) else return s end
+	end
+
+	local patternFolded = caseFold(pattern)
+	local globFolded = glob and caseFold(glob) or nil
+
+	-- Walk descendants and apply filters.
+	local descendants = rootInstance:GetDescendants()
+	-- Include the root itself so e.g. grep on a specific Script path works.
+	table.insert(descendants, 1, rootInstance)
+
+	local scanned = 0
+	local matches = {}
+	local totalMatches = 0
+	local hitLimit = false
+
+	for _, inst in ipairs(descendants) do
+		-- Type filter: pass if `inst:IsA(name)` for ANY name in typeFilter.
+		local typeOk = false
+		for _, t in ipairs(typeFilter) do
+			local ok, isA = pcall(function() return inst:IsA(t) end)
+			if ok and isA then
+				typeOk = true
+				break
+			end
+		end
+		if not typeOk then continue end
+
+		-- Glob filter: Lua-pattern match against Name.
+		if globFolded then
+			local nameFolded = caseFold(inst.Name)
+			if not string.find(nameFolded, globFolded) then
+				continue
+			end
+		end
+
+		scanned += 1
+
+		-- Read Source only if applicable. Non-script instances that pass
+		-- the filters are reported as name-only hits (no line content).
+		local isScript = inst:IsA("LuaSourceContainer")
+		local sourceOk, source = false, ""
+		if isScript then
+			sourceOk, source = pcall(function() return inst.Source end)
+			if not sourceOk then source = "" end
+		end
+
+		-- Apply the content pattern.
+		local instMatchCount = 0
+		local lineHits = nil  -- only populated in "content" mode
+
+		if isScript and #source > 0 then
+			if multiline then
+				-- Whole-source match; report a single virtual line (line 1)
+				-- containing the start of the match for simplicity.
+				local hay = caseFold(source)
+				local s, e = string.find(hay, patternFolded)
+				if s then
+					instMatchCount = 1
+					if outputMode == "content" then
+						-- For multiline mode, return the matched substring
+						-- as the "line" content (truncated to keep payload sane).
+						local snippet = string.sub(source, s, math.min(e, s + 500))
+						lineHits = { { lineNumber = 1, content = snippet, context = {} } }
+					end
+				end
+			else
+				local lines, _ = splitLines(source)
+				for lineNum, line in ipairs(lines) do
+					local hay = caseFold(line)
+					if string.find(hay, patternFolded) then
+						instMatchCount += 1
+						if outputMode == "content" then
+							if not lineHits then lineHits = {} end
+							local hit = {
+								lineNumber = lineNum,
+								content = line,
+								context = {},
+							}
+							if contextBefore > 0 then
+								for i = math.max(1, lineNum - contextBefore), lineNum - 1 do
+									table.insert(hit.context, { lineNumber = i, content = lines[i], type = "before" })
+								end
+							end
+							if contextAfter > 0 then
+								for i = lineNum + 1, math.min(#lines, lineNum + contextAfter) do
+									table.insert(hit.context, { lineNumber = i, content = lines[i], type = "after" })
+								end
+							end
+							table.insert(lineHits, hit)
+						end
+					end
+				end
+			end
+		end
+
+		-- Decide whether this instance counts as a "hit".
+		-- For non-script instances that passed name/class filters, we treat
+		-- them as a name-only hit so callers can use grep as a unified search.
+		local isHit = (instMatchCount > 0) or (not isScript)
+		if not isHit then continue end
+
+		totalMatches += instMatchCount
+
+		local entry = {
+			path = getInstancePath(inst),
+			className = inst.ClassName,
+			name = inst.Name,
+		}
+		if outputMode == "content" then
+			entry.lines = lineHits or {}
+		elseif outputMode == "count" then
+			entry.count = instMatchCount
+		end
+		table.insert(matches, entry)
+
+		if headLimit > 0 and #matches >= headLimit then
+			hitLimit = true
+			break
+		end
+	end
+
+	local response = {
+		mode = outputMode,
+		pattern = pattern,
+		path = rootPath,
+		scanned = scanned,
+		matchCount = #matches,
+		matches = matches,
+	}
+	if outputMode ~= "files_with_matches" then
+		response.totalMatches = totalMatches
+	end
+	if hitLimit then
+		response.truncated = true
+		response.note = string.format("Output truncated at head_limit=%d. Increase head_limit or narrow with `glob`/`path`/`type`.", headLimit)
+	end
+	return response
+end
+
 -- get_script_function: Extract a specific function by name
 handlers.getScriptFunction = function(requestData)
 	local instancePath = requestData.instancePath
@@ -6189,6 +6400,8 @@ endpointHandlers = {
 	-- Claude Code-style script editing tools
 	["/api/edit-script"] = handlers.editScript,
 	["/api/search-script"] = handlers.searchScript,
+	-- Claude Code-style grep across the entire instance tree
+	["/api/grep"] = handlers.grep,
 	["/api/get-script-function"] = handlers.getScriptFunction,
 	["/api/find-and-replace-in-scripts"] = handlers.findAndReplaceInScripts,
 	["/api/get-attribute"] = handlers.getAttribute,

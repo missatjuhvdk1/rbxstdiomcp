@@ -8,6 +8,12 @@ import type { ToolDef } from '../types.js';
  * shift on every edit, the model has to count manually, and `edit_script`
  * does the same job more reliably with exact string matching + automatic
  * syntax validation.
+ *
+ * `search_script` was also removed: the `grep` tool (inspection.ts)
+ * supersedes it — passing a single script path as `grep`'s `path` does
+ * the exact same single-script search, plus everything `grep` adds
+ * (cross-file, glob/type filters, output modes, head limits). Keeping
+ * two near-identical tools just creates choice paralysis for the LLM.
  */
 export const scriptTools: ToolDef[] = [
   {
@@ -108,44 +114,6 @@ export const scriptTools: ToolDef[] = [
         args?.new_string,
         args?.replace_all ?? false,
         args?.validate_after ?? true,
-      ),
-  },
-
-  {
-    name: 'search_script',
-    description:
-      'Search for patterns within a script source code (like grep). Returns matching lines with line numbers and optional context.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        instancePath: {
-          type: 'string',
-          description:
-            'Roblox instance path to the script (e.g., "game.ServerScriptService.MainScript")',
-        },
-        pattern: {
-          type: 'string',
-          description: 'Search pattern (literal string or regex if use_regex is true)',
-        },
-        use_regex: {
-          type: 'boolean',
-          description: 'If true, treat pattern as a Lua regex pattern. Default false (literal match).',
-          default: false,
-        },
-        context_lines: {
-          type: 'number',
-          description: 'Number of lines to show before and after each match (like grep -C). Default 0.',
-          default: 0,
-        },
-      },
-      required: ['instancePath', 'pattern'],
-    },
-    handler: (args, { tools }) =>
-      tools.searchScript(
-        args?.instancePath,
-        args?.pattern,
-        args?.use_regex ?? false,
-        args?.context_lines ?? 0,
       ),
   },
 

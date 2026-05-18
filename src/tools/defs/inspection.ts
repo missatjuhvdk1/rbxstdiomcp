@@ -103,6 +103,112 @@ export const inspectionTools: ToolDef[] = [
   },
 
   {
+    name: 'grep',
+    description:
+      "Powerful grep over the Roblox instance tree — like Claude Code's Grep tool, but for the explorer instead of the filesystem.\n\n" +
+      'Walks descendants of `path` (default `game`), filters by `glob` (instance Name pattern) and `type` (ClassName / IsA), then searches script `Source` for `pattern`. ' +
+      'Use this as the FIRST move when the user mentions a script/instance you have not seen yet — much faster than browsing `get_project_structure` manually.\n\n' +
+      'Mapping to filesystem grep:\n' +
+      '  • path        → directory to search (instance subtree root)\n' +
+      '  • glob        → filename filter (Luau pattern matched against Instance.Name)\n' +
+      '  • type        → file-type filter (ClassName or `IsA` group, e.g. "LuaSourceContainer" matches all script kinds)\n' +
+      '  • pattern     → contents pattern (matched against script Source line-by-line, or whole-source if `multiline`)\n' +
+      '  • -i / -A / -B / -C / output_mode / head_limit / multiline → identical semantics to Claude Code Grep\n\n' +
+      'Returns one of three shapes depending on `output_mode`:\n' +
+      '  • "files_with_matches" (default): list of instance paths with hits — cheap, perfect for narrowing\n' +
+      '  • "content": matching lines with line numbers and optional context\n' +
+      '  • "count": per-instance match counts\n\n' +
+      "Tips:\n" +
+      "  • To find instances by Name only (no source search), pass `pattern: \".*\"` plus `glob: \"MyScript\"`.\n" +
+      "  • To search non-script instances by Name, pass `type: [\"Part\", \"Model\"]` etc. — Source is only read for `LuaSourceContainer` descendants.\n" +
+      "  • The default `type` is `[\"LuaSourceContainer\"]` (Script / LocalScript / ModuleScript) so common queries stay fast.\n" +
+      "  • Pattern is a Luau string pattern (similar to Lua patterns, NOT PCRE). Use `%.` to match a literal dot, `%(` for `(`, etc.",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        pattern: {
+          type: 'string',
+          description:
+            'The Luau pattern to search for in script Source. Matched line-by-line by default, or against the whole source if `multiline` is true. To do a name-only search, pass ".*" here and use `glob` to filter by Name.',
+        },
+        path: {
+          type: 'string',
+          description:
+            'Instance path to scope the search to (e.g. "game.ServerScriptService"). Defaults to "game" (the entire DataModel).',
+        },
+        glob: {
+          type: 'string',
+          description:
+            'Filter which instances to even consider by their Name (Luau pattern, e.g. "Damage.*", "PlayerHandler"). Analogous to glob in Claude Code Grep.',
+        },
+        type: {
+          type: 'array',
+          items: { type: 'string' },
+          description:
+            'Filter by ClassName(s) or IsA group(s). E.g. ["Script", "LocalScript"], or ["LuaSourceContainer"] (matches all script kinds), or ["GuiObject"] for any UI element. Defaults to ["LuaSourceContainer"]. Each entry is tested with `instance:IsA(name)` so abstract types work.',
+        },
+        '-i': {
+          type: 'boolean',
+          description:
+            'Case-insensitive matching. Applies to both `pattern` (Source) and `glob` (Name). Default false.',
+          default: false,
+        },
+        '-A': {
+          type: 'number',
+          description:
+            'Lines of context AFTER each match (like grep -A). Requires output_mode="content".',
+          default: 0,
+        },
+        '-B': {
+          type: 'number',
+          description:
+            'Lines of context BEFORE each match (like grep -B). Requires output_mode="content".',
+          default: 0,
+        },
+        '-C': {
+          type: 'number',
+          description:
+            'Lines of context BEFORE AND AFTER each match (like grep -C). Requires output_mode="content". Overrides -A/-B.',
+          default: 0,
+        },
+        output_mode: {
+          type: 'string',
+          enum: ['files_with_matches', 'content', 'count'],
+          description:
+            'Output format. "files_with_matches" (default) = paths only, like `grep -l`. "content" = matching lines with line numbers and context. "count" = match count per instance.',
+          default: 'files_with_matches',
+        },
+        head_limit: {
+          type: 'number',
+          description:
+            'Limit output to first N entries across all modes (like `| head -N`). 0 = unlimited (default).',
+          default: 0,
+        },
+        multiline: {
+          type: 'boolean',
+          description:
+            'When true, match the pattern against the entire source as one string (so `.` matches newlines, patterns can span lines). When false (default), match line-by-line.',
+          default: false,
+        },
+      },
+      required: ['pattern'],
+    },
+    handler: (args, { tools }) =>
+      tools.grep(args?.pattern, {
+        path: args?.path,
+        glob: args?.glob,
+        type: args?.type,
+        caseInsensitive: args?.['-i'] ?? false,
+        after: args?.['-A'] ?? 0,
+        before: args?.['-B'] ?? 0,
+        context: args?.['-C'] ?? 0,
+        outputMode: args?.output_mode ?? 'files_with_matches',
+        headLimit: args?.head_limit ?? 0,
+        multiline: args?.multiline ?? false,
+      }),
+  },
+
+  {
     name: 'get_output',
     description:
       'Read the Output window content from Roblox Studio. Captures print(), warn(), and error() messages. Use after play_solo to debug scripts.',

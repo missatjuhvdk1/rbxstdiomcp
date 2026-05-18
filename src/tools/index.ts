@@ -290,10 +290,10 @@ export class RobloxStudioTools {
 
   // Project Tools
   async getProjectStructure(path?: string, maxDepth?: number, scriptsOnly?: boolean) {
-    const response = await this.client.request('/api/project-structure', { 
-      path, 
-      maxDepth, 
-      scriptsOnly 
+    const response = await this.client.request('/api/project-structure', {
+      path,
+      maxDepth,
+      scriptsOnly
     });
     return {
       content: [
@@ -302,6 +302,56 @@ export class RobloxStudioTools {
           text: JSON.stringify(response, null, 2)
         }
       ]
+    };
+  }
+
+  /**
+   * grep — Claude Code-style search across the instance tree.
+   *
+   * Forwards to the Studio plugin which does a single `GetDescendants` walk
+   * scoped to `path`, filters by `type` (via `IsA`) and `glob` (Lua pattern
+   * over Name), then scans `Source` line-by-line (or full-source if
+   * `multiline`) for `pattern`. Designed to mirror the parameter surface of
+   * Claude Code's Grep tool 1:1 so the LLM can reuse muscle memory.
+   */
+  async grep(
+    pattern: string,
+    options: {
+      path?: string;
+      glob?: string;
+      type?: string[];
+      caseInsensitive?: boolean;
+      after?: number;
+      before?: number;
+      context?: number;
+      outputMode?: 'files_with_matches' | 'content' | 'count';
+      headLimit?: number;
+      multiline?: boolean;
+    } = {}
+  ) {
+    if (typeof pattern !== 'string' || pattern.length === 0) {
+      throw new Error('pattern is required for grep (use ".*" for name-only searches)');
+    }
+    const response = await this.client.request('/api/grep', {
+      pattern,
+      path: options.path ?? 'game',
+      glob: options.glob,
+      type: options.type ?? ['LuaSourceContainer'],
+      caseInsensitive: options.caseInsensitive ?? false,
+      after: options.after ?? 0,
+      before: options.before ?? 0,
+      context: options.context ?? 0,
+      outputMode: options.outputMode ?? 'files_with_matches',
+      headLimit: options.headLimit ?? 0,
+      multiline: options.multiline ?? false,
+    });
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify(response, null, 2),
+        },
+      ],
     };
   }
 

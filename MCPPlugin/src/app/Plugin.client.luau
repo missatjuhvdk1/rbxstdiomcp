@@ -8,33 +8,61 @@
 -- register ONE plugin.Unloading handler whose entire body is
 -- `janitor:Destroy()`.
 --
--- Phase 2 scope:
---   - Builds a typed Context via Runtime.new (was a stub in Phase 1).
---   - Wires the button to start/stop the polling loop (was widget-toggle
---     only in Phase 1; we keep widget toggle on a separate click).
---   - Registers a single inline `/api/ping` handler (the Phase 2 verification
---     hook) that returns `{ ok = true }`. Phase 3 replaces this with a
---     real Dispatcher that owns handler registration.
+-- Phase 3 scope:
+--   - Builds a typed Context via Runtime.new (Phase 2 stable).
+--   - Wires the button to start/stop the polling loop (Phase 2 stable).
+--   - Replaces the Phase 2 inline `/api/ping` closure with the real
+--     Dispatcher (domain/handler/Dispatcher.luau), which routes every
+--     endpoint declared in HandlerRegistry — including a real /api/ping
+--     supplied by PlaceHandlers. The bootstrap no longer enumerates
+--     endpoints; it just hands the polling loop a dispatch closure that
+--     forwards to ctx.bridge:dispatch (where bridge IS the Dispatcher).
 --   - Wires Settings:changed to push the server URL the user typed into
 --     a future-Phase 6 text input (no UI yet; the value comes from
 --     persisted settings or the default).
 --
--- Out of Phase 2 scope (deliberately deferred):
+-- Out of Phase 3 scope (deliberately deferred):
 --   - The 11-section dock-widget UI: Phase 6. Until then the widget shows
---     a simple TextLabel ("Phase 2 — polling started") so the user has a
---     hint the plugin is alive.
---   - Real handler dispatch beyond /api/ping: Phase 3.
+--     a simple TextLabel ("Phase 3 — N handlers registered") so the user
+--     has a hint the plugin is alive.
+--   - Mutating handlers (edit_script, set_property, create_object, …): Phase 4.
 --   - Test-companion injection / playSolo: Phase 4-5.
+--
+-- ============================================================================
+-- WHY THE DISPATCHER IS BUILT AFTER Runtime.new
+-- ============================================================================
+-- The Runtime constructor takes a `dispatch: (HandlerRequest) -> any`
+-- callback (the polling loop's request flow needs it before the loop is
+-- constructed), but the Dispatcher needs the FULL Context to inject into
+-- handlers. Classic chicken-and-egg.
+--
+-- Resolution: forward-declare a local `dispatcher` variable, pass a
+-- closure that reads it (Runtime.new accepts the closure), build the
+-- Context, then assign the real Dispatcher into the local + the
+-- ctx.bridge slot. Until the assignment lands, the closure refuses
+-- requests with an error — but Runtime.new doesn't dispatch anything
+-- synchronously, so the racing window is empty.
 
 local Janitor = require(script.Parent.Parent.Packages.Janitor)
 local Runtime = require(script.Parent.Parent.runtime.Runtime)
 local Constants = require(script.Parent.Parent.runtime.Constants)
 local PluginHandles = require(script.Parent.Parent.runtime.PluginHandles)
+local Dispatcher = require(script.Parent.Parent.domain.handler.Dispatcher)
+local HandlerRegistry = require(script.Parent.Parent.domain.handler.HandlerRegistry)
 
 -- One frozen constants table read once at bootstrap; we use a few of its
 -- fields (UI strings, widget id) directly here. The Context's `.constants`
 -- is the same table, available to every other layer.
 local constants = Constants.new()
+
+-- Count of registered endpoints. Computed once at boot so the status label
+-- below can render an accurate "Phase 3 — N handlers registered" line
+-- without us hardcoding the number; as Phase 4+ extends HandlerRegistry the
+-- label stays honest automatically.
+local handlerCount = 0
+for _ in HandlerRegistry do
+	handlerCount += 1
+end
 
 -- ============================================================================
 -- 1. ROOT TEARDOWN SCOPE
@@ -79,12 +107,16 @@ janitor:Add(widget, "Destroy")
 -- which state the polling loop is in. This is the ONLY UI Instance the
 -- bootstrap creates pre-Phase 6.
 local statusLabel = Instance.new("TextLabel")
-statusLabel.Name = "Phase2StatusLabel"
+statusLabel.Name = "Phase3StatusLabel"
 statusLabel.Size = UDim2.new(1, -20, 1, -20)
 statusLabel.Position = UDim2.new(0, 10, 0, 10)
 statusLabel.BackgroundColor3 = Color3.fromRGB(17, 24, 39)
 statusLabel.BorderSizePixel = 0
-statusLabel.Text = "MCP " .. constants.PLUGIN_VERSION .. "\nClick the toolbar button to connect."
+statusLabel.Text = string.format(
+	"MCP %s\nPhase 3 — %d read-only handlers registered.\nClick the toolbar button to connect.",
+	constants.PLUGIN_VERSION,
+	handlerCount
+)
 statusLabel.TextColor3 = Color3.fromRGB(229, 231, 235)
 statusLabel.TextWrapped = true
 statusLabel.TextSize = 14
@@ -100,46 +132,29 @@ statusLabel.Parent = widget
 local handles = PluginHandles.new(plugin, toolbar, button, widget, janitor)
 
 -- ============================================================================
--- 5. INLINE DISPATCH (Phase 2 placeholder)
+-- 5. DISPATCHER FORWARD-DECLARATION
 -- ============================================================================
--- Phase 2 ships one handler: /api/ping. Phase 3 will introduce the
--- Dispatcher in domain/handler/Dispatcher.luau, which takes over the role
--- this closure plays. The CONTRACT (signature) is the same — that's the
--- whole point of Runtime accepting a `Dispatch` callback rather than
--- knowing about the Dispatcher type directly: the swap from inline to
--- real-dispatcher will be a one-line change.
+-- See the header comment block "WHY THE DISPATCHER IS BUILT AFTER Runtime.new"
+-- for the full rationale. Short version: Runtime.new wants a Dispatch callback
+-- NOW, the Dispatcher wants a fully-built Context to inject into handlers,
+-- and the Context has a `bridge` field the Dispatcher will fill. We resolve
+-- the cycle by forward-declaring the dispatcher local, passing a closure that
+-- reads it, then assigning the real Dispatcher after Runtime.new returns.
 --
--- The handler table is kept here (rather than scattered in modules) so the
--- inline placeholder remains a single, easy-to-delete block when Phase 3
--- lands.
-local inlineHandlers: { [string]: (data: any) -> any } = {
-	["/api/ping"] = function(_data)
-		-- Sanity payload: the bridge's `ping` MCP tool surfaces ok=true,
-		-- version, and a timestamp so the user can confirm the plugin is
-		-- the version they think it is.
-		return {
-			ok = true,
-			version = constants.PLUGIN_VERSION,
-			timestamp = os.time(),
-		}
-	end,
-}
+-- The closure refuses requests with an error until the assignment lands, but
+-- Runtime.new does not synchronously dispatch anything (the polling loop is
+-- inert until ctx.polling:start() is called from setActive below), so the
+-- racing window is empty in practice. The guard is defensive only.
+local dispatcher: Dispatcher.Dispatcher? = nil
 
 local function dispatch(request: Runtime.HandlerRequest): any
-	local handler = inlineHandlers[request.endpoint]
-	if handler == nil then
-		return {
-			error = "Unknown endpoint: " .. tostring(request.endpoint),
-			phase = "Phase 2 — only /api/ping is registered",
-		}
+	if dispatcher == nil then
+		-- Unreachable in practice (see comment above); kept as a hard guard
+		-- so a future refactor that DOES dispatch synchronously from inside
+		-- Runtime.new fails loud rather than NPE'ing inside the closure.
+		return { error = "Dispatcher not yet wired" }
 	end
-	-- pcall is defensive even for the trivial /api/ping handler: a future
-	-- typo here must not crash the polling loop.
-	local ok, result = pcall(handler, request.data)
-	if not ok then
-		return { error = "Handler crashed: " .. tostring(result) }
-	end
-	return result
+	return dispatcher:dispatch(request)
 end
 
 -- ============================================================================
@@ -148,7 +163,19 @@ end
 local ctx = Runtime.new(plugin, handles, janitor, dispatch)
 
 -- ============================================================================
--- 7. STATUS LABEL UPDATE (Phase 2 placeholder UI feedback)
+-- 6b. DISPATCHER WIRING — now that ctx exists, build the real dispatcher and
+--     close the forward-declaration cycle by populating ctx.bridge.
+-- ============================================================================
+-- HandlerRegistry is the single greppable catalogue of MCP endpoints (one
+-- row per endpoint, see domain/handler/HandlerRegistry.luau). Passing it
+-- explicitly (rather than letting Dispatcher.new re-require it internally)
+-- keeps test seams open: a future test can build a Dispatcher with a stub
+-- registry of one handler.
+dispatcher = Dispatcher.new(ctx, HandlerRegistry)
+ctx.bridge = dispatcher
+
+-- ============================================================================
+-- 7. STATUS LABEL UPDATE (Phase 3 placeholder UI feedback)
 -- ============================================================================
 -- Bridge the typed status signal to the placeholder TextLabel. Phase 6
 -- will replace this listener with the proper React state binding. We use

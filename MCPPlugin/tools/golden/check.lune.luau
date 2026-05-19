@@ -52,13 +52,58 @@ local FORBIDDEN_TOKENS = {
 --     the returned function — it just inspects whether one was produced.
 --     The alternative (a from-scratch Luau parser) would be 10000+ lines
 --     that drift from Studio's actual parser version.
+--
+--   src/runtime/testsession/ServerCompanion.luau
+--   src/runtime/testsession/ClientCompanion.luau
+--     Source-as-string-constant modules: they hold the verbatim companion
+--     script bodies inside a `[==[ ... ]==]` long string. The companions
+--     run as in-game Script / LocalScript instances (NOT as plugin code)
+--     and legitimately need `loadstring` / `setfenv` / `_G` to implement
+--     the `run_live_lua` eval surface the MCP bridge exposes inside the
+--     test DataModel. Because those tokens appear inside a string literal
+--     they would still trip the grep-based gate; whitelisting these two
+--     specific files is the principled exception. The plugin runtime
+--     itself NEVER calls loadstring/setfenv on the companion bodies —
+--     it just hands the string off as a Script.Source.
 local FORBIDDEN_TOKEN_WHITELIST = {
 	["src/domain/handlers/ExecuteLuaHandler.luau"] = true,
 	["src/runtime/script/Validator.luau"] = true,
+	["src/runtime/testsession/ServerCompanion.luau"] = true,
+	["src/runtime/testsession/ClientCompanion.luau"] = true,
 }
 
 -- §16 service quarantine.
 local SERVICE_QUARANTINE_FILE = "src/runtime/Services.luau"
+
+-- Additional files exempt from the service quarantine. EACH entry must have
+-- a written justification in this comment block:
+--
+--   src/runtime/testsession/ServerCompanion.luau
+--   src/runtime/testsession/ClientCompanion.luau
+--     The companion bodies inside the `[==[ ... ]==]` long string are
+--     in-game script source (Script and LocalScript respectively). They
+--     run inside the play-test DataModel, NOT as plugin code, so the §4.3
+--     "one place may call game:GetService" rule does not apply — the
+--     companions have no Context bag they could read services from. The
+--     grep-based gate cannot tell long-string contents from plugin code,
+--     so we whitelist the two source-as-string modules wholesale.
+--
+--   src/domain/handlers/ExecuteLuaHandler.luau
+--     ExecuteLua's sandbox env is, by definition, a curated mirror of
+--     Studio services exposed to user-supplied code. The exact list of
+--     names (Players, ReplicatedStorage, etc.) is part of the legacy
+--     wire-format contract with bridge clients — renaming or routing
+--     them through the Context bag would break MCP tools that the host
+--     pre-baked against the legacy names. The §4.3 rule applies to
+--     "services the *plugin* uses"; here the services are the handler's
+--     *output*, not its input. Same principled-exception pattern as the
+--     FORBIDDEN_TOKEN_WHITELIST entry already granted to this file for
+--     `loadstring` / `setfenv` / `_G`.
+local SERVICE_QUARANTINE_WHITELIST = {
+	["src/runtime/testsession/ServerCompanion.luau"] = true,
+	["src/runtime/testsession/ClientCompanion.luau"] = true,
+	["src/domain/handlers/ExecuteLuaHandler.luau"] = true,
+}
 
 -- §16 UI quarantine — these GUI Instance classes are UI-layer-only.
 local GUI_CLASSES = {
@@ -76,6 +121,24 @@ local GUI_CLASSES = {
 	"UIAspectRatioConstraint",
 	"ImageLabel",
 	"ImageButton",
+}
+
+-- Whitelisted non-UI files that may still create GUI Instance classes. EACH
+-- entry must have a written justification in this comment block:
+--
+--   src/runtime/render/Viewport.luau
+--     The off-screen render pipeline creates a transient ScreenGui under
+--     CoreGui to host a ViewportFrame for `render_object_view`. The
+--     ScreenGui is NOT user-facing UI — it exists only to satisfy the
+--     parenting requirement of ViewportFrame (CaptureService cannot
+--     capture an unparented frame) and is :Destroy()'d before the
+--     handler returns. The render module is conceptually screenshot
+--     pipeline (legacy plugin.luau L6483 parented under CoreGui for the
+--     same reason) and lives under runtime/render/ to keep the
+--     §4.3 service quarantine + §4.4 UI quarantine *both* honoured —
+--     this whitelist is the one principled crossing.
+local UI_QUARANTINE_WHITELIST = {
+	["src/runtime/render/Viewport.luau"] = true,
 }
 
 -- §15 A6: decompiler banner regex.
@@ -190,6 +253,9 @@ local function checkServiceQuarantine(file: string, lines: { string })
 	if file == SERVICE_QUARANTINE_FILE then
 		return
 	end
+	if SERVICE_QUARANTINE_WHITELIST[file] then
+		return
+	end
 	for i, line in lines do
 		local code = line:gsub("%-%-.*$", "")
 		if code:find("game:GetService%(") then
@@ -209,6 +275,9 @@ end
 
 local function checkUiQuarantine(file: string, lines: { string })
 	if isUiOrAppFile(file) then
+		return
+	end
+	if UI_QUARANTINE_WHITELIST[file] then
 		return
 	end
 	for i, line in lines do

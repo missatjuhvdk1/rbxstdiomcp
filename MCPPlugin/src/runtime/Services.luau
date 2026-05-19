@@ -27,6 +27,24 @@
 -- it for OpenScriptDocumentAsync / change-via-editor flows. Listing it here
 -- now keeps the eventual Phase 4 PR a one-line addition to handler code,
 -- not a runtime/ shape change.
+--
+-- Phase 5 added three more (render + off-screen viewport pipelines):
+--   - captureService    — CaptureService:CaptureScreenshot(...) for both
+--                          /api/capture-screenshot and /api/render-object-view.
+--                          Centralised here so the §4.3 quarantine still
+--                          holds; render handlers consume it via the bag.
+--   - assetService      — AssetService:CreateEditableImage(Async)(...) for
+--                          the resize/crop pipeline that finalises both the
+--                          full-screen capture and the viewport render.
+--   - coreGui           — CoreGui is the parent for the temporary ScreenGui
+--                          that hosts the off-screen ViewportFrame (legacy
+--                          L6483). Parenting under PlayerGui would race with
+--                          the user's UI; CoreGui is plugin-owned and
+--                          isolated. Even though CoreGui *is* a GUI host, the
+--                          render module is conceptually screenshot
+--                          pipeline (not user-facing UI), so it lives under
+--                          runtime/render/ and reads coreGui from the bag —
+--                          the ui-quarantine gate (§4.4) does not apply.
 
 export type Services = {
 	httpService: HttpService,
@@ -37,6 +55,18 @@ export type Services = {
 	scriptEditorService: ScriptEditorService,
 	collectionService: CollectionService,
 	logService: LogService,
+	captureService: any, -- CaptureService; typed `any` because the typed-
+	-- Roblox global lags the live API surface in some Studio releases
+	-- (CaptureScreenshot signature evolves). Treated as opaque, validated
+	-- at runtime via pcall inside the render handlers.
+	assetService: AssetService,
+	coreGui: CoreGui,
+	-- Companion-injection targets. These are the two service containers the
+	-- play-solo flow drops Script/LocalScript instances into; we pre-resolve
+	-- them so Companions.inject/cleanup doesn't reach for `game:GetService`
+	-- (which would breach §4.3).
+	serverScriptService: ServerScriptService,
+	starterPlayer: StarterPlayer,
 	studioTestService: any?, -- typed `any?` because it may legitimately not exist
 }
 
@@ -62,6 +92,11 @@ function Services.new(): Services
 		scriptEditorService = game:GetService("ScriptEditorService"),
 		collectionService = game:GetService("CollectionService"),
 		logService = game:GetService("LogService"),
+		captureService = game:GetService("CaptureService"),
+		assetService = game:GetService("AssetService"),
+		coreGui = game:GetService("CoreGui"),
+		serverScriptService = game:GetService("ServerScriptService"),
+		starterPlayer = game:GetService("StarterPlayer"),
 		-- StudioTestService is the modern playtest control service. The
 		-- legacy plugin.luau (L11-18) intentionally probed via pcall because
 		-- older Studio versions lacked it — keep that defensiveness here.

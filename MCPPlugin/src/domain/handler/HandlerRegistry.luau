@@ -51,6 +51,13 @@ local HistoryHandlers = require(script.Parent.Parent.handlers.HistoryHandlers)
 local PropertyHandlers = require(script.Parent.Parent.handlers.PropertyHandlers)
 local CreationHandlers = require(script.Parent.Parent.handlers.CreationHandlers)
 local HierarchyHandlers = require(script.Parent.Parent.handlers.HierarchyHandlers)
+-- Phase 5: heavy handlers (test sessions, execute_lua, render pipelines).
+-- Each lives in its own module — see the per-module headers for the legacy
+-- line ranges they port from and the §15 token-gate whitelist entries they
+-- require.
+local PlaytestHandlers = require(script.Parent.Parent.handlers.PlaytestHandlers)
+local ExecuteLuaHandler = require(script.Parent.Parent.handlers.ExecuteLuaHandler)
+local RenderHandlers = require(script.Parent.Parent.handlers.RenderHandlers)
 
 -- ============================================================================
 -- THE REGISTRY
@@ -172,6 +179,37 @@ local registry: { [Handler.EndpointName]: Handler.Handler } = {
 	-- module header for the full rationale.
 	["/api/undo"] = HistoryHandlers.undo,
 	["/api/redo"] = HistoryHandlers.redo,
+
+	-- ========================================================================
+	-- HEAVY ENDPOINTS (Phase 5)
+	-- ========================================================================
+	-- Test sessions, execute_lua, and the render pipelines all share an
+	-- elevated risk profile (loadstring, off-thread spawns, off-screen
+	-- DataModel writes) so their per-module headers document the legacy
+	-- mapping and audit boundaries in detail. The registry just lists them.
+
+	-- ----- PlaytestHandlers (legacy L5870-5993) ---------------------------
+	-- play_solo injects companion scripts + spawns ExecutePlayModeAsync on
+	-- a separate thread; stop_play is a deprecated stub kept for backward
+	-- compatibility with older bridges. RecordResult = nil on both (test
+	-- session state is per-session, not part of Edit-DataModel undo).
+	["/api/play-solo"] = PlaytestHandlers.playSolo,
+	["/api/stop-play"] = PlaytestHandlers.stopPlay,
+
+	-- ----- ExecuteLuaHandler (legacy L5543-5775) --------------------------
+	-- The only place in the plugin that calls loadstring/setfenv on
+	-- caller-supplied code. Returns mutatesUnknown=true so the Dispatcher
+	-- decides commit-vs-cancel via #game:GetDescendants() delta.
+	["/api/execute-lua"] = ExecuteLuaHandler.executeLua,
+
+	-- ----- RenderHandlers (legacy L6045-6802) -----------------------------
+	-- capture-screenshot and focus-camera are read-only as far as the
+	-- DataModel is concerned. render-object-view clones the target under
+	-- CoreGui's transient ScreenGui and destroys it before returning.
+	-- All three return RecordResult = nil.
+	["/api/capture-screenshot"] = RenderHandlers.captureScreenshot,
+	["/api/render-object-view"] = RenderHandlers.renderObjectView,
+	["/api/focus-camera"] = RenderHandlers.focusCamera,
 }
 
 return registry

@@ -1,11 +1,9 @@
 --!strict
 -- runtime/testsession/Companions.luau
 --
--- Phase 4 STUB of the LLM-stomp prevention helper. The full module (full
--- injection + cleanup + tagging of test-companion scripts during play-solo)
--- ships in Phase 5; Phase 4 only needs the read-only refusal predicate so
--- destructive mutation handlers can hard-refuse on companion-tagged or
--- companion-named instances.
+-- Phase 4 shipped the read-only refusal predicate (isProtected /
+-- refuseIfProtected). Phase 5 grew this module to its full responsibility:
+-- *injecting* and *cleaning up* the test companions that drive play-solo.
 --
 -- ============================================================================
 -- WHY THIS LIVES IN runtime/ AND NOT domain/
@@ -13,45 +11,56 @@
 -- The protection check is a runtime concern (it consults
 -- CollectionService:HasTag + name equality) and is used by handlers in
 -- multiple modules (delete_object, set_property, edit_script,
--- set_script_source, move_instance, find_and_replace_in_scripts). Putting it
--- in domain/ would either force a domain → domain require (handlers can't
--- import each other; the registry is the only inter-handler link) or
--- duplicate the helper into each handler module. runtime/ is the right
--- home: it's stateless, layer-correct (domain may import runtime), and the
--- same module will grow the injection + cleanup APIs in Phase 5.
+-- set_script_source, move_instance, find_and_replace_in_scripts). The
+-- injection/cleanup path is the same concern from the other direction: it
+-- *creates* the very instances those handlers refuse to mutate. Co-locating
+-- inject + cleanup + isProtected in one runtime module guarantees that the
+-- name/tag triplet is sourced from ONE place — Constants — and the three
+-- code paths can never get out of sync.
 --
 -- ============================================================================
--- LEGACY GAP THIS CLOSES
+-- LEGACY PARITY
 -- ============================================================================
--- Legacy plugin.luau L48-53 documents the intent ("destructive MCP tools
--- refuse to operate on instances bearing TEST_COMPANION_TAG or matching
--- TEST_COMPANION_NAME") but a full audit of the legacy file shows the
--- refusal was NEVER actually implemented in any destructive handler. This
--- is a real, latent bug in the legacy plugin: an over-eager AI could ask
--- delete_object on the test companion mid-playtest and tear down the very
--- script streaming play-solo logs back to it.
+-- The injection code mirrors legacy plugin.luau L1050-1144 exactly:
+--   1. cleanupTestCompanions() first — guarantees ≤1 of each name exists.
+--   2. Build server companion from ServerCompanion.source with both
+--      __MCP_SERVER_URL__ and __MCP_SESSION_ID__ substituted; parent under
+--      ServerScriptService; tag it; Archivable=true (see below).
+--   3. Build client companion from ClientCompanion.source (no placeholders,
+--      it talks to the server companion via Remotes); parent under
+--      StarterPlayer.StarterPlayerScripts; tag it.
 --
--- Phase 4 closes the gap. Every destructive handler that takes an instance
--- path checks `Companions.isProtected(ctx, instance)` before mutating; if
--- protected, it returns a structured error (with a hint suggesting
--- cleanupTestCompanions) and writes NO action-log entry.
+-- IMPORTANT: Archivable MUST stay true. ExecutePlayModeAsync builds the
+-- test DataModel by Clone()-ing the Edit DataModel, and Instance:Clone()
+-- silently returns nil for any instance with Archivable=false. We previously
+-- tried Archivable=false as "safety" against saving the companion into the
+-- user's place file — but the side effect was that the companion never made
+-- it into the test session at all (no log streaming, no end-command path).
+-- Three cleanup sweeps (plugin activate, before each test, after each test)
+-- keep companions out of the saved file instead.
 --
 -- ============================================================================
--- THE PREDICATE
+-- WHY plainReplace, NOT string.gsub
 -- ============================================================================
--- An instance is "protected" iff:
---   1. It carries the TEST_COMPANION_TAG (CollectionService:HasTag), OR
---   2. Its Name matches TEST_COMPANION_NAME exactly, OR
---   3. Its Name matches TEST_COMPANION_NAME_CLIENT exactly, OR
---   4. ANY ancestor up the parent chain to game satisfies (1)-(3).
+-- The serverUrl can legitimately contain `%` characters in some hosting
+-- setups (proxies, encoded paths). string.gsub treats `%` as a pattern
+-- escape in the replacement string, which would silently corrupt the URL.
+-- We use string.find(plain=true) to slice and table.concat to splice —
+-- byte-for-byte literal replacement, no pattern interpretation anywhere.
 --
--- The ancestor walk matters because an LLM might ask to delete a child of
--- the companion (a child Script under the LocalScript companion folder,
--- for example) rather than the companion itself. Refusing only direct hits
--- would leave a backdoor.
+-- ============================================================================
+-- WHY THE Deps BAG GREW
+-- ============================================================================
+-- Phase 4's predicate needed only services + constants. Phase 5's inject
+-- also needs ServerCompanion / ClientCompanion (for the .source field).
+-- We pass them in the Deps bag rather than `require`-ing siblings so a
+-- test can provide a stubbed companion source (e.g. for a unit test of
+-- the substitution logic without actually exercising the real bodies).
 
 local Constants = require(script.Parent.Parent.Constants)
 local Services = require(script.Parent.Parent.Services)
+local ServerCompanion = require(script.Parent.ServerCompanion)
+local ClientCompanion = require(script.Parent.ClientCompanion)
 
 -- ============================================================================
 -- TYPES
@@ -74,8 +83,16 @@ export type Deps = {
 	constants: Constants.Constants,
 }
 
+export type InjectResult = {
+	serverScript: Script,
+	-- The client companion is a `LocalScript` per legacy. Marked optional
+	-- because the pcall'd parent-resolution path can legitimately bail
+	-- without throwing on a misconfigured place (StarterPlayer missing).
+	clientScript: LocalScript?,
+}
+
 -- ============================================================================
--- THE HELPER
+-- THE PREDICATE
 -- ============================================================================
 
 local Companions = {}
@@ -163,6 +180,172 @@ function Companions.refuseIfProtected(deps: Deps, instance: Instance?): { [strin
 		hint = "MCP test companions are auto-managed during play-solo sessions. "
 			.. "If you need to inspect them, use read-only handlers. To remove them, "
 			.. "stop the test session.",
+	}
+end
+
+-- ============================================================================
+-- PLAIN-STRING SUBSTITUTION
+-- ============================================================================
+-- string.gsub's replacement string supports `%` patterns (e.g. `%0` = whole
+-- match, `%1`-`%9` = captures, `%%` = literal `%`). The serverUrl we splice
+-- in is opaque user-provided text and could contain `%`, which would silently
+-- corrupt the URL. plainReplace uses string.find with plain=true to slice
+-- byte-for-byte; no pattern interpretation anywhere.
+local function plainReplace(haystack: string, needle: string, replacement: string): string
+	local result: { string } = {}
+	local i = 1
+	while true do
+		local s, e = string.find(haystack, needle, i, true)
+		if not s then
+			table.insert(result, string.sub(haystack, i))
+			break
+		end
+		table.insert(result, string.sub(haystack, i, s - 1))
+		table.insert(result, replacement)
+		i = (e :: number) + 1
+	end
+	return table.concat(result)
+end
+
+-- ============================================================================
+-- CLEANUP
+-- ============================================================================
+-- Sweep ALL companion instances out of the Edit DataModel. Returns the
+-- number of instances removed. Idempotent — calling on a clean place
+-- returns 0. Called:
+--   1. On plugin activate (handle leftovers from a Studio crash).
+--   2. Before every play-solo (defensive double-clean).
+--   3. After play-solo ends (the normal path).
+function Companions.cleanup(deps: Deps): number
+	local services = deps.services
+	local constants = deps.constants
+
+	local count = 0
+
+	-- Path 1: anything that still carries the tag, regardless of where it
+	-- lives. This is the canonical sweep and catches descendants we may
+	-- have parented under unusual containers.
+	pcall(function()
+		local tagged = services.collectionService:GetTagged(constants.TEST_COMPANION_TAG)
+		for _, inst in tagged do
+			pcall(function()
+				inst:Destroy()
+			end)
+			count += 1
+		end
+	end)
+
+	-- Path 2: belt-and-suspenders sweep of ServerScriptService by NAME, in
+	-- case the tag was somehow stripped (third-party plugin, manual edit).
+	pcall(function()
+		for _, child in services.serverScriptService:GetChildren() do
+			if child.Name == constants.TEST_COMPANION_NAME or child.Name == constants.TEST_COMPANION_NAME_CLIENT then
+				pcall(function()
+					child:Destroy()
+				end)
+				count += 1
+			end
+		end
+	end)
+
+	-- Path 3: same belt-and-suspenders sweep but under
+	-- StarterPlayer.StarterPlayerScripts (where the client companion
+	-- lives). StarterPlayerScripts may not exist in empty places — skip
+	-- silently if so; nothing to clean up.
+	pcall(function()
+		local sps = services.starterPlayer:FindFirstChild("StarterPlayerScripts")
+		if sps then
+			for _, child in sps:GetChildren() do
+				if
+					child.Name == constants.TEST_COMPANION_NAME
+					or child.Name == constants.TEST_COMPANION_NAME_CLIENT
+				then
+					pcall(function()
+						child:Destroy()
+					end)
+					count += 1
+				end
+			end
+		end
+	end)
+
+	return count
+end
+
+-- ============================================================================
+-- INJECT
+-- ============================================================================
+-- Create exactly one server companion (Script under ServerScriptService) and
+-- one client companion (LocalScript under StarterPlayer.StarterPlayerScripts)
+-- with serverUrl/sessionId substituted into the server template.
+--
+-- Always cleans up first to guarantee at most one of each companion exists
+-- — calling inject() twice with different sessionIds *replaces* the running
+-- companion rather than duplicating it.
+function Companions.inject(deps: Deps, serverUrl: string, sessionId: string): InjectResult
+	-- Defensive sweep before creating. This is the third of the three
+	-- cleanup points (see CLEANUP block above); cheap and idempotent.
+	Companions.cleanup(deps)
+
+	local services = deps.services
+	local constants = deps.constants
+
+	-- ----- SERVER companion ----------------------------------------------
+	-- Substitute placeholders. plainReplace is order-independent because
+	-- neither placeholder appears in the other's value (they're literal
+	-- sentinel tokens chosen for exactly that property).
+	local serverSource = ServerCompanion.source
+	serverSource = plainReplace(serverSource, ServerCompanion.SERVER_URL_PLACEHOLDER, serverUrl)
+	serverSource = plainReplace(serverSource, ServerCompanion.SESSION_ID_PLACEHOLDER, sessionId)
+
+	local serverScript = Instance.new("Script")
+	serverScript.Name = constants.TEST_COMPANION_NAME
+	serverScript.Source = serverSource
+	-- Archivable=true is REQUIRED. ExecutePlayModeAsync clones the Edit
+	-- DataModel to build the test DataModel; Instance:Clone() returns nil
+	-- for Archivable=false instances. We rely on the cleanup sweeps to
+	-- keep companions out of the saved place file instead — see top-of-
+	-- file comment.
+	serverScript.Archivable = true
+	serverScript.Parent = services.serverScriptService
+	pcall(function()
+		services.collectionService:AddTag(serverScript, constants.TEST_COMPANION_TAG)
+	end)
+
+	-- ----- CLIENT companion ----------------------------------------------
+	-- LocalScripts in StarterPlayer.StarterPlayerScripts auto-clone into
+	-- each Player's PlayerScripts on join, so this one LocalScript yields
+	-- one client companion per player in the test session.
+	--
+	-- Wrapped in pcall because pathological place files can ship without
+	-- StarterPlayerScripts. We do NOT try to `Instance.new` the container:
+	-- StarterPlayerScripts is service-bound and cannot be constructed
+	-- from scripts (Studio enforces a singleton). Studio creates one
+	-- automatically as a child of StarterPlayer; if it's missing, we
+	-- skip the client companion silently — the server companion still
+	-- works for target="server" eval, just no `target="client"` route.
+	local clientScript: LocalScript? = nil
+	pcall(function()
+		local sps: Instance? = services.starterPlayer:FindFirstChild("StarterPlayerScripts")
+		if sps == nil then
+			-- Pathological place file. Skip client companion silently.
+			return
+		end
+
+		local ls = Instance.new("LocalScript")
+		ls.Name = constants.TEST_COMPANION_NAME_CLIENT
+		ls.Source = ClientCompanion.source
+		ls.Archivable = true
+		ls.Parent = sps
+		pcall(function()
+			services.collectionService:AddTag(ls, constants.TEST_COMPANION_TAG)
+		end)
+		clientScript = ls
+	end)
+
+	return {
+		serverScript = serverScript,
+		clientScript = clientScript,
 	}
 end
 

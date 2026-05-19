@@ -38,8 +38,23 @@ local FORBIDDEN_TOKENS = {
 	"setfenv",
 	"loadstring",
 }
+-- Whitelisted files may use the otherwise-forbidden tokens above. EACH entry
+-- must have a written justification in this comment block:
+--
+--   src/domain/handlers/ExecuteLuaHandler.luau
+--     The user-requested arbitrary-Lua execution endpoint. loadstring IS
+--     its product; refusing it would defeat the feature. Architectural
+--     containment: every other file is checked.
+--
+--   src/runtime/script/Validator.luau
+--     Lua syntax validation needs to invoke the real Roblox parser, which
+--     loadstring is the only public surface for. The validator NEVER calls
+--     the returned function — it just inspects whether one was produced.
+--     The alternative (a from-scratch Luau parser) would be 10000+ lines
+--     that drift from Studio's actual parser version.
 local FORBIDDEN_TOKEN_WHITELIST = {
 	["src/domain/handlers/ExecuteLuaHandler.luau"] = true,
+	["src/runtime/script/Validator.luau"] = true,
 }
 
 -- §16 service quarantine.

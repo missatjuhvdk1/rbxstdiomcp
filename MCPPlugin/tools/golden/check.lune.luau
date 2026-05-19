@@ -317,40 +317,51 @@ end
 -- CI will. Print a clear note instead.
 -- ---------------------------------------------------------------------------
 
-local function tryRun(program: string, args: { string }): (boolean, string)
-	local ok, result = pcall(function()
-		return process.spawn(program, args, { cwd = "." })
+-- Lune 0.10's process API: `process.exec(program, args, options)` returns
+-- a result table `{ ok, code, stdout, stderr }`. It throws if the binary
+-- itself cannot be located (ENOENT), which we catch via pcall.
+type ExecResult = {
+	ok: boolean,
+	code: number,
+	stdout: string,
+	stderr: string,
+}
+
+local function tryRun(program: string, args: { string }): (boolean, string, boolean)
+	-- Returns (success, output, wasFound). wasFound=false means the binary
+	-- is not on $PATH — we treat that as a soft skip, not a gate failure.
+	local ok, result = pcall(function(): ExecResult
+		return (process :: any).exec(program, args, { cwd = "." })
 	end)
 	if not ok then
-		return false, tostring(result)
+		local err = tostring(result)
+		local missing = err:find("not found", 1, true) ~= nil
+			or err:find("ENOENT", 1, true) ~= nil
+			or err:find("No such file", 1, true) ~= nil
+			or err:find("os error 2", 1, true) ~= nil
+		return false, err, not missing
 	end
 	if not result.ok then
-		return false, result.stdout .. result.stderr
+		return false, result.stdout .. result.stderr, true
 	end
-	return true, result.stdout
+	return true, result.stdout, true
 end
 
 local function runExternalGates()
-	-- stylua --check src/
-	do
-		local ok, out = tryRun("stylua", { "--check", SRC_DIR })
-		if not ok then
-			if out:find("not found", 1, true) or out:find("ENOENT", 1, true) then
-				stdio.write("  · stylua not on PATH — skipping (install via `aftman install`)\n")
-			else
-				fail("Format", "<stylua>", nil, "stylua --check failed:\n" .. out)
-			end
-		end
-	end
-	-- selene src/
-	do
-		local ok, out = tryRun("selene", { SRC_DIR })
-		if not ok then
-			if out:find("not found", 1, true) or out:find("ENOENT", 1, true) then
-				stdio.write("  · selene not on PATH — skipping (install via `aftman install`)\n")
-			else
-				fail("Lint", "<selene>", nil, "selene failed:\n" .. out)
-			end
+	local gates = {
+		{ name = "Format", program = "stylua", args = { "--check", SRC_DIR } },
+		{ name = "Lint", program = "selene", args = { SRC_DIR } },
+	}
+	for _, gate in gates do
+		local ok, out, wasFound = tryRun(gate.program, gate.args)
+		if ok then
+			stdio.write(string.format("  · %s green\n", gate.program))
+		elseif not wasFound then
+			stdio.write(
+				string.format("  · %s not on PATH — skipping (install via `aftman install`)\n", gate.program)
+			)
+		else
+			fail(gate.name, "<" .. gate.program .. ">", nil, gate.program .. " failed:\n" .. out)
 		end
 	end
 end

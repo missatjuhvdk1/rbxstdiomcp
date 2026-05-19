@@ -1,0 +1,3 @@
+# Committed icon binaries ONLY (tool icons referenced by Tool.icon as
+# rbxassetid). This is the single exception to the pure-source rule
+# (ARCHITECTURE.md §2). No code, no .rbxm models here.

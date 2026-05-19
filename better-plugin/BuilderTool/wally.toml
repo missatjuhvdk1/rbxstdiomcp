@@ -1,0 +1,20 @@
+# BuilderTool dependency manifest.
+#
+# Restored with `wally install` into Packages/ (git-ignored — see root
+# .gitignore; the lockfile `wally.lock` IS tracked once generated).
+#
+# These are the same React-lua / Janitor / ReactSpring packages proven in
+# this repo's ResurfacePlugin example. Pin exact versions; bump deliberately,
+# never floating.
+
+[package]
+name = "buildertool/buildertool"
+version = "0.1.0"
+registry = "https://github.com/UpliftGames/wally-index"
+realm = "shared"
+
+[dependencies]
+React = "jsdotlua/react@17.1.0"
+ReactRoblox = "jsdotlua/react-roblox@17.1.0"
+Janitor = "howmanysmall/janitor@1.18.1"
+ReactSpring = "chriscerie/react-spring@2.0.0"

@@ -1,0 +1,6 @@
+# Concrete tools live here: domain/tools/<Name>Tool.luau
+#
+# Each returns a value satisfying domain/tool/Tool.luau's `Tool` type and is
+# registered in domain/tool/ToolRegistry.luau. See ARCHITECTURE.md §6.4 for
+# the canonical "add a tool" recipe. No tool is scaffolded yet (this delivery
+# is doc + skeleton, not a sample tool).

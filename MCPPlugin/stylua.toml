@@ -1,0 +1,11 @@
+# StyLua config — matches BuilderTool's house style verbatim
+# (ARCHITECTURE §2: tabs, width 4, column 120, AutoPreferDouble quotes, no
+# collapsing). Settings are NOT overridable per file.
+
+column_width = 120
+line_endings = "Unix"
+indent_type = "Tabs"
+indent_width = 4
+quote_style = "AutoPreferDouble"
+call_parentheses = "Always"
+collapse_simple_statement = "Never"

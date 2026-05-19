@@ -1,0 +1,20 @@
+# MCPPlugin dependency manifest.
+#
+# Restored with `wally install` into Packages/ (git-ignored — see
+# MCPPlugin/.gitignore). `wally.lock` IS tracked once generated so builds are
+# reproducible (per REFACTOR_PLAN §7.1 Q2).
+#
+# Versions match BuilderTool's reference manifest. We omit ReactSpring for now —
+# the MCP plugin's animation surface (the pulse dot) is small enough that we
+# defer that choice to Phase 6 when the UI lands.
+
+[package]
+name = "mcpplugin/mcpplugin"
+version = "0.1.0"
+registry = "https://github.com/UpliftGames/wally-index"
+realm = "shared"
+
+[dependencies]
+React = "jsdotlua/react@17.1.0"
+ReactRoblox = "jsdotlua/react-roblox@17.1.0"
+Janitor = "howmanysmall/janitor@1.18.1"

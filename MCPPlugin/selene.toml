@@ -1,0 +1,9 @@
+# Selene config. `roblox` std is required to know about Instance/services/etc.
+# Generate the std file with: `selene generate-roblox-std` (only needed once).
+
+std = "roblox"
+
+# We allow mixed table types because Roblox APIs (e.g. RaycastParams,
+# Properties tables) commonly mix array and dictionary keys.
+[lints]
+mixed_table = "allow"

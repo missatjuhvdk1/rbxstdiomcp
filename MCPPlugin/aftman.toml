@@ -1,0 +1,12 @@
+# MCPPlugin tooling.
+#
+# Pinned exactly. Bump deliberately, never floating. These versions match the
+# BuilderTool reference (better-plugin/BuilderTool) so the same `aftman install`
+# bootstraps both packages without conflict.
+
+[tools]
+rojo = "rojo-rbx/rojo@7.7.0-rc.1"
+lune = "lune-org/lune@0.10.4"
+selene = "Kampfkarren/selene@0.28.0"
+stylua = "JohnnyMorganz/StyLua@2.0.2"
+wally = "UpliftGames/wally@0.3.2"

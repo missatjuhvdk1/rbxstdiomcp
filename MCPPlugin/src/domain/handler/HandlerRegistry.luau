@@ -33,8 +33,11 @@
 -- via the RecordResult their run() function returns (Handler.luau). One
 -- source of truth, owned by the handler.
 --
--- Phase 3 ships READ-ONLY handlers (no mutations). Phase 4 will add the
--- mutating handlers as additional rows in this table.
+-- Phase 4 adds the mutating handlers (property writes, creation/deletion,
+-- hierarchy, attribute/tag writes, script edits, undo/redo) as additional
+-- rows below the Phase-3 reads. Read AND write halves of each handler group
+-- share a module so a reviewer reading "what does the AttributeHandlers
+-- module do?" sees both sides at once.
 
 local Handler = require(script.Parent.Handler)
 
@@ -45,6 +48,9 @@ local AttributeHandlers = require(script.Parent.Parent.handlers.AttributeHandler
 local TagHandlers = require(script.Parent.Parent.handlers.TagHandlers)
 local ScriptHandlers = require(script.Parent.Parent.handlers.ScriptHandlers)
 local HistoryHandlers = require(script.Parent.Parent.handlers.HistoryHandlers)
+local PropertyHandlers = require(script.Parent.Parent.handlers.PropertyHandlers)
+local CreationHandlers = require(script.Parent.Parent.handlers.CreationHandlers)
+local HierarchyHandlers = require(script.Parent.Parent.handlers.HierarchyHandlers)
 
 -- ============================================================================
 -- THE REGISTRY
@@ -55,10 +61,17 @@ local HistoryHandlers = require(script.Parent.Parent.handlers.HistoryHandlers)
 -- handler self-describing (which is what the type system requires for the
 -- explicit-define helper Handler.define(name, run) to enforce).
 --
--- Phase 3 registers the Phase-3 read-only set ONLY. Each comment block
--- below names the legacy line range the handler ports from, so a reviewer
--- can diff old-vs-new behaviour without grepping.
+-- Phase 4 adds the mutating endpoints below the Phase-3 read-only set.
+-- Each comment block names the legacy line range the handler ports from
+-- so a reviewer can diff old-vs-new behaviour without grepping. Read and
+-- write halves of the same group (AttributeHandlers / TagHandlers /
+-- ScriptHandlers / HistoryHandlers) are split into two comment blocks so
+-- the read/write boundary is visible from this catalogue alone.
 local registry: { [Handler.EndpointName]: Handler.Handler } = {
+	-- ========================================================================
+	-- READ-ONLY ENDPOINTS (Phase 3)
+	-- ========================================================================
+
 	-- ----- FileTreeHandlers (legacy L2131-2213, 2590-2741) ----------------
 	["/api/file-tree"] = FileTreeHandlers.getFileTree,
 	["/api/search-files"] = FileTreeHandlers.searchFiles,
@@ -101,6 +114,64 @@ local registry: { [Handler.EndpointName]: Handler.Handler } = {
 	-- think it is. The implementation lives in PlaceHandlers so we don't
 	-- need a one-handler module.
 	["/api/ping"] = PlaceHandlers.ping,
+
+	-- ========================================================================
+	-- MUTATING ENDPOINTS (Phase 4)
+	-- ========================================================================
+	-- Each handler below returns a RecordResult that drives the Dispatcher's
+	-- CHS recording + ActionLog commit decisions. Source-only edits return
+	-- isSourceEditOnly=true + scriptEdits so undo can restore .Source
+	-- directly (decoupled from CHS waypoints). Undo/redo themselves are in
+	-- Dispatcher.RECORDING_BYPASS — they short-circuit the recording
+	-- lifecycle because CHS:Undo/Redo inside an open recording is undefined.
+
+	-- ----- PropertyHandlers (legacy L2745-2861, 3211-3415, 3417-3471,
+	--       3473-3552, 3554-3629) ------------------------------------------
+	["/api/set-property"] = PropertyHandlers.setProperty,
+	["/api/mass-set-property"] = PropertyHandlers.massSetProperty,
+	["/api/mass-get-property"] = PropertyHandlers.massGetProperty,
+	["/api/set-calculated-property"] = PropertyHandlers.setCalculatedProperty,
+	["/api/set-relative-property"] = PropertyHandlers.setRelativeProperty,
+
+	-- ----- CreationHandlers (legacy L2863-2974, 2976-3072, 3074-3209,
+	--       4467-4500, 4503-4604, 5040-5152, 5154-5278) --------------------
+	["/api/create-object"] = CreationHandlers.createObject,
+	["/api/mass-create-objects"] = CreationHandlers.massCreateObjects,
+	["/api/mass-create-objects-with-properties"] = CreationHandlers.massCreateObjectsWithProperties,
+	["/api/delete-object"] = CreationHandlers.deleteObject,
+	["/api/smart-duplicate"] = CreationHandlers.smartDuplicate,
+	["/api/mass-duplicate"] = CreationHandlers.massDuplicate,
+	["/api/insert-asset"] = CreationHandlers.insertAsset,
+
+	-- ----- HierarchyHandlers (legacy L5540-5612, 5614-5680) ---------------
+	["/api/clone-instance"] = HierarchyHandlers.cloneInstance,
+	["/api/move-instance"] = HierarchyHandlers.moveInstance,
+
+	-- ----- AttributeHandlers (write part, legacy L4654-4708, 4766-4799) ---
+	["/api/set-attribute"] = AttributeHandlers.setAttribute,
+	["/api/delete-attribute"] = AttributeHandlers.deleteAttribute,
+
+	-- ----- TagHandlers (write part, legacy L4831-4868, 4870-4898) ---------
+	["/api/add-tag"] = TagHandlers.addTag,
+	["/api/remove-tag"] = TagHandlers.removeTag,
+
+	-- ----- ScriptHandlers (write part, legacy L3733-3812, 3815-3955,
+	--       3957-4047, 4464-4520) ------------------------------------------
+	-- All four return isSourceEditOnly=true + scriptEdits where applicable
+	-- so source restores happen via .Source assignment, bypassing CHS.
+	-- validateScript is read-only (loadstring probe) but lives here because
+	-- it shares the script-resolution helpers with the write handlers.
+	["/api/set-script-source"] = ScriptHandlers.setScriptSource,
+	["/api/edit-script"] = ScriptHandlers.editScript,
+	["/api/find-and-replace-in-scripts"] = ScriptHandlers.findAndReplaceInScripts,
+	["/api/validate-script"] = ScriptHandlers.validateScript,
+
+	-- ----- HistoryHandlers (write part, legacy L5283-5380, 5382-5481) -----
+	-- Both endpoints are in Dispatcher.RECORDING_BYPASS so the dispatcher
+	-- does NOT open a CHS recording around them. See HistoryHandlers.luau
+	-- module header for the full rationale.
+	["/api/undo"] = HistoryHandlers.undo,
+	["/api/redo"] = HistoryHandlers.redo,
 }
 
 return registry

@@ -1,15 +1,66 @@
 --!strict
 -- domain/handlers/ScriptHandlers.luau
 --
--- Script-source inspection. Phase 3 ships the READ half only:
---   - getScriptSource    ← legacy plugin.luau L3632-3731
---   - searchScript       ← legacy plugin.luau L4050-4118
---   - grep               ← legacy plugin.luau L4120-4329
---   - getScriptFunction  ← legacy plugin.luau L4331-4460
+-- Script-source inspection AND mutation. Eight endpoints:
+--   - getScriptSource             ← legacy plugin.luau L3632-3731 (read, Phase 3)
+--   - searchScript                ← legacy plugin.luau L4050-4118 (read, Phase 3)
+--   - grep                        ← legacy plugin.luau L4120-4329 (read, Phase 3)
+--   - getScriptFunction           ← legacy plugin.luau L4331-4460 (read, Phase 3)
+--   - setScriptSource             ← legacy plugin.luau L3733-3865 (write, Phase 4)
+--   - editScript                  ← legacy plugin.luau L3904-4049 (write, Phase 4)
+--   - findAndReplaceInScripts     ← legacy plugin.luau L4462-4606 (write, Phase 4)
+--   - validateScript              ← legacy plugin.luau L5156-5280 (read, Phase 4)
 --
--- The mutating siblings (editScript, setScriptSource, findAndReplaceInScripts,
--- runScriptCode — legacy L3733-4050, L4462-4604) ship in Phase 4 and will
--- live in this same module so the read/write pair is co-located.
+-- ============================================================================
+-- WHY THIS MODULE IS >400 LINES
+-- ============================================================================
+-- The architecture guide's "soft cap" is 400 lines per module. This module
+-- legitimately exceeds it because the read AND write halves of script
+-- handling SHARE the Lines.split contract, the Lua-pattern function-extract
+-- heuristic, and the LuaSourceContainer:IsA gating. Splitting into a
+-- separate ScriptMutationHandlers.luau would either:
+--   (a) duplicate those helpers across two modules (drift risk), or
+--   (b) extract them to a `domain/handlers/script_internal.luau` shared
+--       module — but domain/handlers/ may not import each other, and
+--       runtime/script/ already owns the genuinely-shared helpers
+--       (Lines, Validator). The remaining shared state is purely "I know
+--       how to detect a script" which doesn't justify a separate file.
+-- Keep them together. The line-count is in service of "one greppable owner
+-- of script handling".
+--
+-- ============================================================================
+-- THE SOURCE-EDIT UNDO DECOUPLING (Phase 4 Bug 1 fix)
+-- ============================================================================
+-- Roblox CHS does NOT capture .Source assignments. If we just wrote Source
+-- in a recording window, the user's Ctrl+Z would skip past our source edit
+-- and revert some unrelated waypoint underneath ours. The fix is the
+-- isSourceEditOnly RecordResult flag (Handler.luau): for every handler
+-- here that ONLY changes .Source, we return
+--   { isSourceEditOnly = true, scriptEdits = { ... } }
+-- where each scriptEdit carries { instancePath, preSource, postSource }.
+-- The Dispatcher then:
+--   1. Cancels the CHS recording (no waypoint to keep).
+--   2. Commits the ActionLog entry (which carries scriptEdits in details).
+-- The plugin-side undo path (ActionLog:undo) detects entries with
+-- non-empty scriptEdits and restores .Source manually, BYPASSING CHS.
+-- Net: Ctrl+Z reverts our edit, real undo, no collateral damage.
+--
+-- ============================================================================
+-- LLM-STOMP PROTECTION
+-- ============================================================================
+-- Every mutating handler in this module checks Companions.refuseIfProtected
+-- against the resolved target instance. The companion scripts are the
+-- single most expensive thing for an LLM to overwrite — it's how the
+-- play-solo log pipeline gets to the AI, and a corrupted companion source
+-- means a play-solo session with no diagnostics. Refusal is mandatory here.
+--
+-- ============================================================================
+-- WHY validateScript IS READ-ONLY
+-- ============================================================================
+-- validateScript probes loadstring; it never assigns .Source. So it
+-- returns (response, nil) and the dispatcher skips CHS and ActionLog
+-- entirely. The reason it's grouped here is the typical caller is
+-- "I'm about to set_script_source; let me check syntax first".
 --
 -- ============================================================================
 -- WHY ALL FOUR USE Lines.split, NOT THEIR OWN PARSER
@@ -50,6 +101,8 @@
 local Handler = require(script.Parent.Parent.handler.Handler)
 local Path = require(script.Parent.Parent.Parent.runtime.instance.Path)
 local Lines = require(script.Parent.Parent.Parent.runtime.script.Lines)
+local Validator = require(script.Parent.Parent.Parent.runtime.script.Validator)
+local Companions = require(script.Parent.Parent.Parent.runtime.testsession.Companions)
 
 -- ============================================================================
 -- TYPED REQUEST/RESPONSE SHAPES
@@ -85,6 +138,34 @@ type GrepRequest = {
 type GetScriptFunctionRequest = {
 	instancePath: string?,
 	functionName: string?,
+}
+
+type SetScriptSourceRequest = {
+	instancePath: string?,
+	source: string?,
+}
+
+type EditScriptRequest = {
+	instancePath: string?,
+	operation: string?, -- "replace_lines" | "insert_lines" | "delete_lines"
+	startLine: number?,
+	endLine: number?,
+	newContent: string?,
+}
+
+type FindAndReplaceInScriptsRequest = {
+	path: string?,
+	findText: string?,
+	replaceText: string?,
+	useRegex: boolean?,
+	caseInsensitive: boolean?,
+	dryRun: boolean?,
+	scriptPaths: { string }?,
+}
+
+type ValidateScriptRequest = {
+	instancePath: string?,
+	source: string?,
 }
 
 -- ============================================================================
@@ -664,6 +745,533 @@ ScriptHandlers.getScriptFunction = Handler.define(
 		else
 			return { error = "Failed to get function: " .. tostring(result) }, nil
 		end
+	end
+)
+
+-- ============================================================================
+-- MUTATION HANDLERS (Phase 4)
+-- ============================================================================
+-- Every handler below returns isSourceEditOnly = true with the scriptEdits
+-- list of pre/post snapshots, so the Dispatcher cancels the CHS recording
+-- (no waypoint exists for .Source assignments) and commits the ActionLog
+-- entry — which is what powers the plugin-side undo/redo of script edits.
+
+-- Internal: convenience to resolve a script-or-error in one place. Returns
+-- (LuaSourceContainer, nil) on success or (nil, errorTable) on failure.
+local function resolveScript(instancePath: string?): (LuaSourceContainer?, { [string]: any }?)
+	if instancePath == nil then
+		return nil, { error = "Instance path is required" }
+	end
+	local instance = Path.getInstanceByPath(instancePath)
+	if instance == nil then
+		return nil, { error = "Instance not found: " .. instancePath }
+	end
+	if not instance:IsA("LuaSourceContainer") then
+		return nil, { error = "Instance is not a script: " .. instance.ClassName }
+	end
+	return instance :: LuaSourceContainer, nil
+end
+
+-- setScriptSource: overwrite the entire .Source of one script.
+-- Legacy L3733-3865.
+ScriptHandlers.setScriptSource = Handler.define(
+	"/api/set-script-source",
+	function(ctx, data: SetScriptSourceRequest): (any, Handler.RecordResult?)
+		local instancePath = data.instancePath
+		local newSource = data.source
+
+		if newSource == nil then
+			return { error = "source is required" }, nil
+		end
+
+		local instance, err = resolveScript(instancePath)
+		if err ~= nil then
+			return err, nil
+		end
+		local script = instance :: LuaSourceContainer
+
+		-- LLM-stomp: refuse to overwrite a companion's source.
+		local refusal = Companions.refuseIfProtected({
+			services = ctx.services,
+			constants = ctx.constants,
+		}, script)
+		if refusal ~= nil then
+			return refusal, nil
+		end
+
+		local preSource = script.Source
+		local newSourceStr = newSource :: string
+
+		-- No-op when source hasn't changed: didMutate=false so the
+		-- dispatcher cancels CHS and discards the (un-staged) log entry.
+		if preSource == newSourceStr then
+			return {
+				success = true,
+				instancePath = instancePath,
+				message = "Source unchanged; no edit applied",
+				charactersBefore = #preSource,
+				charactersAfter = #newSourceStr,
+			}, {
+				name = "Set Script Source",
+				didMutate = false,
+			}
+		end
+
+		local okWrite, writeErr = pcall(function()
+			script.Source = newSourceStr
+		end)
+		if not okWrite then
+			return {
+				error = "Failed to set source: " .. tostring(writeErr),
+				instancePath = instancePath,
+			},
+				nil
+		end
+
+		ctx.actionLog:stage(
+			"set_script_source",
+			instancePath :: string,
+			string.format("Replaced %d chars with %d chars in %s", #preSource, #newSourceStr, instancePath :: string),
+			{
+				scriptEdits = {
+					{
+						instancePath = instancePath :: string,
+						preSource = preSource,
+						postSource = newSourceStr,
+					},
+				},
+			}
+		)
+
+		return {
+			success = true,
+			instancePath = instancePath,
+			charactersBefore = #preSource,
+			charactersAfter = #newSourceStr,
+			message = "Source replaced",
+		}, {
+			name = "Set Script Source",
+			didMutate = true,
+			isSourceEditOnly = true,
+			scriptEdits = {
+				{
+					instancePath = instancePath :: string,
+					preSource = preSource,
+					postSource = newSourceStr,
+				},
+			},
+		}
+	end
+)
+
+-- editScript: line-range surgery (replace/insert/delete) on ONE script.
+-- Legacy L3904-4049.
+ScriptHandlers.editScript = Handler.define(
+	"/api/edit-script",
+	function(ctx, data: EditScriptRequest): (any, Handler.RecordResult?)
+		local instancePath = data.instancePath
+		local operation = data.operation
+		local startLine = data.startLine
+		local endLine = data.endLine
+		local newContent = data.newContent
+
+		if operation == nil then
+			return { error = "operation is required (replace_lines | insert_lines | delete_lines)" }, nil
+		end
+		if operation ~= "replace_lines" and operation ~= "insert_lines" and operation ~= "delete_lines" then
+			return {
+				error = "operation must be one of: replace_lines, insert_lines, delete_lines",
+			}, nil
+		end
+
+		local instance, err = resolveScript(instancePath)
+		if err ~= nil then
+			return err, nil
+		end
+		local script = instance :: LuaSourceContainer
+
+		local refusal = Companions.refuseIfProtected({
+			services = ctx.services,
+			constants = ctx.constants,
+		}, script)
+		if refusal ~= nil then
+			return refusal, nil
+		end
+
+		local preSource = script.Source
+		local lines, hadTrailingNewline = Lines.split(preSource)
+		local totalLines = #lines
+
+		-- Per-operation argument validation + slice/insert logic.
+		if operation == "replace_lines" then
+			if startLine == nil or endLine == nil or newContent == nil then
+				return { error = "replace_lines requires startLine, endLine, and newContent" }, nil
+			end
+			local s = math.max(1, startLine :: number)
+			local e = math.min(totalLines, endLine :: number)
+			if s > e then
+				return { error = string.format("Invalid line range: startLine=%d > endLine=%d", s, e) }, nil
+			end
+			local newLines: { string } = {}
+			-- Keep lines BEFORE the slice.
+			for i = 1, s - 1 do
+				table.insert(newLines, lines[i])
+			end
+			-- Insert the replacement lines.
+			for _, nl in Lines.split(newContent :: string) do
+				table.insert(newLines, nl)
+			end
+			-- Keep lines AFTER the slice.
+			for i = e + 1, totalLines do
+				table.insert(newLines, lines[i])
+			end
+			lines = newLines
+		elseif operation == "insert_lines" then
+			if startLine == nil or newContent == nil then
+				return { error = "insert_lines requires startLine and newContent" }, nil
+			end
+			local s = math.max(1, startLine :: number)
+			s = math.min(s, totalLines + 1)
+			local newLines: { string } = {}
+			for i = 1, s - 1 do
+				table.insert(newLines, lines[i])
+			end
+			for _, nl in Lines.split(newContent :: string) do
+				table.insert(newLines, nl)
+			end
+			for i = s, totalLines do
+				table.insert(newLines, lines[i])
+			end
+			lines = newLines
+		else -- delete_lines
+			if startLine == nil or endLine == nil then
+				return { error = "delete_lines requires startLine and endLine" }, nil
+			end
+			local s = math.max(1, startLine :: number)
+			local e = math.min(totalLines, endLine :: number)
+			if s > e then
+				return { error = string.format("Invalid line range: startLine=%d > endLine=%d", s, e) }, nil
+			end
+			local newLines: { string } = {}
+			for i = 1, s - 1 do
+				table.insert(newLines, lines[i])
+			end
+			for i = e + 1, totalLines do
+				table.insert(newLines, lines[i])
+			end
+			lines = newLines
+			-- An empty file still has one (empty) row — preserve Lines.split contract.
+			if #lines == 0 then
+				table.insert(lines, "")
+			end
+		end
+
+		local postSource = Lines.join(lines, hadTrailingNewline)
+
+		if preSource == postSource then
+			return {
+				success = true,
+				instancePath = instancePath,
+				message = "Source unchanged after edit; no-op",
+				operation = operation,
+			}, {
+				name = "Edit Script: " .. (operation :: string),
+				didMutate = false,
+			}
+		end
+
+		local okWrite, writeErr = pcall(function()
+			script.Source = postSource
+		end)
+		if not okWrite then
+			return {
+				error = "Failed to set source: " .. tostring(writeErr),
+				instancePath = instancePath,
+			},
+				nil
+		end
+
+		ctx.actionLog:stage(
+			"edit_script",
+			instancePath :: string,
+			string.format(
+				"%s on %s (lines %s-%s)",
+				operation :: string,
+				instancePath :: string,
+				tostring(startLine),
+				tostring(endLine)
+			),
+			{
+				operation = operation,
+				startLine = startLine,
+				endLine = endLine,
+				scriptEdits = {
+					{
+						instancePath = instancePath :: string,
+						preSource = preSource,
+						postSource = postSource,
+					},
+				},
+			}
+		)
+
+		return {
+			success = true,
+			instancePath = instancePath,
+			operation = operation,
+			startLine = startLine,
+			endLine = endLine,
+			linesBefore = totalLines,
+			linesAfter = #lines,
+		}, {
+			name = "Edit Script: " .. (operation :: string),
+			didMutate = true,
+			isSourceEditOnly = true,
+			scriptEdits = {
+				{
+					instancePath = instancePath :: string,
+					preSource = preSource,
+					postSource = postSource,
+				},
+			},
+		}
+	end
+)
+
+-- findAndReplaceInScripts: text/regex replace across many scripts.
+-- Legacy L4462-4606. Returns isSourceEditOnly + scriptEdits per script
+-- actually changed, so undo restores all of them in one Ctrl+Z.
+-- dryRun = true returns the same shape but skips the .Source assignment.
+ScriptHandlers.findAndReplaceInScripts = Handler.define(
+	"/api/find-and-replace-in-scripts",
+	function(ctx, data: FindAndReplaceInScriptsRequest): (any, Handler.RecordResult?)
+		local rootPath = data.path or "game"
+		local findText = data.findText
+		local replaceText = data.replaceText
+		local useRegex = data.useRegex == true
+		local caseInsensitive = data.caseInsensitive == true
+		local dryRun = data.dryRun == true
+		local scriptPathsFilter = data.scriptPaths
+
+		if findText == nil or replaceText == nil then
+			return { error = "findText and replaceText are required" }, nil
+		end
+
+		-- Resolve the set of candidate scripts. Two modes:
+		--   1. scriptPaths array provided — operate only on those.
+		--   2. otherwise — walk descendants of `path`.
+		local candidates: { LuaSourceContainer } = {}
+
+		if scriptPathsFilter ~= nil and #(scriptPathsFilter :: { string }) > 0 then
+			for _, p in scriptPathsFilter :: { string } do
+				local inst = Path.getInstanceByPath(p)
+				if inst ~= nil and inst:IsA("LuaSourceContainer") then
+					table.insert(candidates, inst :: LuaSourceContainer)
+				end
+			end
+		else
+			local rootInstance: Instance?
+			if rootPath == "game" or rootPath == "" then
+				rootInstance = game
+			else
+				rootInstance = Path.getInstanceByPath(rootPath)
+				if rootInstance == nil then
+					return { error = "Path not found: " .. rootPath }, nil
+				end
+			end
+			for _, inst in (rootInstance :: Instance):GetDescendants() do
+				if inst:IsA("LuaSourceContainer") then
+					table.insert(candidates, inst :: LuaSourceContainer)
+				end
+			end
+		end
+
+		local deps = { services = ctx.services, constants = ctx.constants }
+
+		-- caseInsensitive fold helper. We can't use a Lua-pattern flag for
+		-- this, so we lowercase both haystack and needle when set.
+		local needle = findText :: string
+		if caseInsensitive and not useRegex then
+			needle = string.lower(needle)
+		end
+
+		local fileChanges: { any } = {}
+		local scriptEdits: { Handler.ScriptEdit } = {}
+		local totalReplacements = 0
+
+		for _, script in candidates do
+			local scriptPath = Path.getInstancePath(script)
+
+			-- LLM-stomp: skip companions (don't error — find/replace is
+			-- typically a bulk op and one refusal shouldn't blow up the
+			-- whole batch; reported in fileChanges).
+			local protection = Companions.isProtected(deps, script)
+			if protection.protected then
+				table.insert(fileChanges, {
+					path = scriptPath,
+					skipped = true,
+					reason = protection.reason,
+				})
+				continue
+			end
+
+			local okRead, source = pcall(function()
+				return script.Source
+			end)
+			if not okRead or source == nil then
+				table.insert(fileChanges, { path = scriptPath, error = "Failed to read source" })
+				continue
+			end
+
+			local original = source :: string
+			local replaced: string
+			local count: number
+
+			if useRegex then
+				-- Lua-pattern replace. case-insensitive is NOT supported in
+				-- regex mode (Lua patterns have no inline (?i) flag).
+				replaced, count = string.gsub(original, findText :: string, replaceText :: string)
+			else
+				-- Plain-text replace (NO Lua-pattern interpretation). We
+				-- can't use string.gsub here because gsub always treats
+				-- its pattern as a Lua pattern — `.` and `(` would be
+				-- magic. Roll our own with string.find(..., plain=true).
+				-- This also gives us the natural place to fold case if
+				-- caseInsensitive is set.
+				local haystack = if caseInsensitive then string.lower(original) else original
+				local out = ""
+				local idx = 1
+				local replacements = 0
+				while true do
+					local s, e = string.find(haystack, needle, idx, true)
+					if s == nil then
+						out ..= string.sub(original, idx)
+						break
+					end
+					out ..= string.sub(original, idx, (s :: number) - 1)
+					out ..= replaceText :: string
+					idx = (e :: number) + 1
+					replacements += 1
+				end
+				replaced = out
+				count = replacements
+			end
+
+			if count == 0 then
+				continue
+			end
+
+			totalReplacements += count
+			table.insert(fileChanges, {
+				path = scriptPath,
+				replacements = count,
+				charactersBefore = #original,
+				charactersAfter = #replaced,
+			})
+
+			if not dryRun then
+				local okWrite, writeErr = pcall(function()
+					script.Source = replaced
+				end)
+				if not okWrite then
+					fileChanges[#fileChanges].error = tostring(writeErr)
+					continue
+				end
+				table.insert(scriptEdits, {
+					instancePath = scriptPath,
+					preSource = original,
+					postSource = replaced,
+				})
+			end
+		end
+
+		local didChangeAnything = (#scriptEdits > 0)
+
+		if not dryRun and didChangeAnything then
+			ctx.actionLog:stage(
+				"find_and_replace_in_scripts",
+				rootPath,
+				string.format(
+					"Replaced %d occurrence%s across %d script%s",
+					totalReplacements,
+					(if totalReplacements == 1 then "" else "s"),
+					#scriptEdits,
+					(if #scriptEdits == 1 then "" else "s")
+				),
+				{
+					findText = findText,
+					replaceText = replaceText,
+					useRegex = useRegex,
+					caseInsensitive = caseInsensitive,
+					scriptEdits = scriptEdits,
+				}
+			)
+		end
+
+		local response = {
+			success = true,
+			dryRun = dryRun,
+			findText = findText,
+			replaceText = replaceText,
+			path = rootPath,
+			filesChanged = fileChanges,
+			totalReplacements = totalReplacements,
+			scriptsAffected = #scriptEdits,
+		}
+
+		if dryRun then
+			-- Dry-run: never mutate; no record result needed.
+			return response, { name = "Find & Replace (dry-run)", didMutate = false }
+		end
+
+		if not didChangeAnything then
+			return response, { name = "Find & Replace", didMutate = false }
+		end
+
+		return response,
+			{
+				name = string.format(
+					"Find & Replace: %d replacement%s",
+					totalReplacements,
+					(if totalReplacements == 1 then "" else "s")
+				),
+				didMutate = true,
+				isSourceEditOnly = true,
+				scriptEdits = scriptEdits,
+			}
+	end
+)
+
+-- validateScript: probe-only Lua syntax check. READ-ONLY. Legacy L5156-5280.
+-- Accepts EITHER an instancePath (reads .Source) OR a raw `source` string,
+-- so callers can validate before set_script_source.
+ScriptHandlers.validateScript = Handler.define(
+	"/api/validate-script",
+	function(_ctx, data: ValidateScriptRequest): (any, Handler.RecordResult?)
+		local instancePath = data.instancePath
+		local source = data.source
+
+		local sourceToValidate: string
+		if source ~= nil then
+			sourceToValidate = source :: string
+		elseif instancePath ~= nil then
+			local instance, err = resolveScript(instancePath)
+			if err ~= nil then
+				return err, nil
+			end
+			sourceToValidate = (instance :: LuaSourceContainer).Source
+		else
+			return { error = "Either instancePath or source is required" }, nil
+		end
+
+		local result = Validator.validate(sourceToValidate)
+		return {
+			valid = result.valid,
+			errors = result.errors,
+			sourceLength = #sourceToValidate,
+			instancePath = instancePath,
+		},
+			nil
 	end
 )
 

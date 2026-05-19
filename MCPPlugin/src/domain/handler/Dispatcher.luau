@@ -48,6 +48,23 @@ local Handler = require(script.Parent.Handler)
 local HandlerRegistry = require(script.Parent.HandlerRegistry)
 
 -- ============================================================================
+-- RECORDING-BYPASS SET
+-- ============================================================================
+-- A small allowlist of endpoints whose handler does its OWN CHS lifecycle
+-- and must NOT be wrapped in an outer recording. The only members are the
+-- undo/redo handlers: their bodies call `actionLog:undo()` which in turn
+-- calls `CHS:Undo()` — and calling Undo inside an open recording is
+-- undefined behaviour at the Studio API surface. Mirrors the legacy
+-- "these endpoints aren't in mutationEndpoints" treatment.
+--
+-- Adding to this set requires explicit justification — the read-only and
+-- normal-mutator paths cover everything else.
+local RECORDING_BYPASS: { [string]: boolean } = {
+	["/api/undo"] = true,
+	["/api/redo"] = true,
+}
+
+-- ============================================================================
 -- TYPES
 -- ============================================================================
 
@@ -183,6 +200,18 @@ function Dispatcher.dispatch(self: Internal, request: Handler.HandlerRequest): a
 		-- Mirrors legacy L1978-1980 — same error shape so the TS bridge
 		-- doesn't have to special-case a renamed field.
 		return { error = "Unknown endpoint: " .. tostring(endpoint) }
+	end
+
+	-- Bypass-recording short-circuit: undo/redo handlers manage CHS
+	-- themselves. We just call the handler directly and return its
+	-- response; the ActionLog lifecycle is the handler's responsibility
+	-- and CHS is never opened on this path. See RECORDING_BYPASS header.
+	if RECORDING_BYPASS[endpoint] then
+		local okBypass, retBypass = pcall(handler.run, self._ctx, data)
+		if not okBypass then
+			return { error = "Handler error: " .. tostring(retBypass) }
+		end
+		return retBypass
 	end
 
 	-- Snapshot the tree size BEFORE the handler runs, but only if any

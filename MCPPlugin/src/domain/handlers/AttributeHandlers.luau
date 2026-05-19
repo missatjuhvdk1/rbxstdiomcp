@@ -1,14 +1,33 @@
 --!strict
 -- domain/handlers/AttributeHandlers.luau
 --
--- Phase 3 ships the READ half only:
---   - getAttribute   ← legacy plugin.luau L4607-4652
---   - getAttributes  ← legacy plugin.luau L4710-4764
+-- Attribute read + write. Four endpoints:
+--   - getAttribute     ← legacy plugin.luau L4607-4652  (read, Phase 3)
+--   - getAttributes    ← legacy plugin.luau L4710-4764  (read, Phase 3)
+--   - setAttribute     ← legacy plugin.luau L4654-4708  (write, Phase 4)
+--   - deleteAttribute  ← legacy plugin.luau L4766-4799  (write, Phase 4)
 --
--- The mutating siblings (setAttribute, deleteAttribute — legacy L4654-4708,
--- L4766-4799) ship in Phase 4 alongside the rest of the destructive
--- handlers; they'll live in this same module so the read/write pair is
--- co-located.
+-- Read and write pairs are co-located so the wire-format quirks (legacy
+-- `_type` discriminator vs Serialize's `type`, see below) are documented
+-- once and respected by both halves.
+--
+-- ============================================================================
+-- PHASE 4 WRITE-SIDE NOTES
+-- ============================================================================
+-- setAttribute / deleteAttribute use Convert.fromWire for incoming values
+-- (same coercion as set_property). Attribute APIs accept the same value
+-- shapes the property APIs do — { 1, 2, 3 } → Vector3, etc. — so we route
+-- through the existing Convert pipeline rather than duplicating shape
+-- detection.
+--
+-- LLM-stomp: neither handler refuses companion-protected instances.
+-- Attribute changes are recoverable (the editor shows them in the
+-- properties panel and an undo reverts them) and the AI legitimately wants
+-- to read/inspect companion-tagged metadata during debugging.
+--
+-- ActionLog: both write handlers stage a single entry. Unlike property
+-- writes, attribute changes are individually meaningful (each attribute is
+-- a named user-facing knob) so they appear in get_history.
 --
 -- ============================================================================
 -- WHY ATTRIBUTES USE A DIFFERENT WIRE FORMAT THAN PROPERTY VALUES
@@ -43,6 +62,7 @@
 
 local Handler = require(script.Parent.Parent.handler.Handler)
 local Path = require(script.Parent.Parent.Parent.runtime.instance.Path)
+local Convert = require(script.Parent.Parent.Parent.runtime.instance.Convert)
 
 -- ============================================================================
 -- TYPED REQUEST/RESPONSE SHAPES
@@ -55,6 +75,17 @@ type GetAttributeRequest = {
 
 type GetAttributesRequest = {
 	instancePath: string?,
+}
+
+type SetAttributeRequest = {
+	instancePath: string?,
+	attributeName: string?,
+	attributeValue: any,
+}
+
+type DeleteAttributeRequest = {
+	instancePath: string?,
+	attributeName: string?,
 }
 
 -- ============================================================================
@@ -180,6 +211,149 @@ AttributeHandlers.getAttributes = Handler.define(
 		else
 			return { error = "Failed to get attributes: " .. tostring(result) }, nil
 		end
+	end
+)
+
+-- setAttribute: write one named attribute on one Instance. Legacy L4654-4708.
+-- Routes wire-shape values through Convert.fromWire so { X = .., Y = ..,
+-- Z = .. } → Vector3 etc. matches the property-write coercion behaviour.
+AttributeHandlers.setAttribute = Handler.define(
+	"/api/set-attribute",
+	function(ctx, data: SetAttributeRequest): (any, Handler.RecordResult?)
+		local instancePath = data.instancePath
+		local attributeName = data.attributeName
+		local attributeValue = data.attributeValue
+
+		if instancePath == nil or attributeName == nil then
+			return { error = "Instance path and attribute name are required" }, nil
+		end
+
+		local instance = Path.getInstanceByPath(instancePath)
+		if instance == nil then
+			return { error = "Instance not found: " .. instancePath }, nil
+		end
+
+		-- Capture the previous value for the action-log details bag — gives
+		-- get_history enough info to describe the change.
+		local okOld, oldValue = pcall(function()
+			return instance:GetAttribute(attributeName :: string)
+		end)
+		local previousValue: any = if okOld then oldValue else nil
+
+		-- Convert.fromWire wants a property name for type inference. For
+		-- attributes there is no fixed-typed slot to probe, so we pass the
+		-- attribute name; the inference falls through to the name-hint
+		-- table (Position / Size / Color etc.) and otherwise returns the
+		-- value verbatim. That's the correct legacy behaviour.
+		local converted = Convert.fromWire(instance, attributeName :: string, attributeValue)
+		if converted == nil then
+			converted = attributeValue
+		end
+
+		local ok, err = pcall(function()
+			instance:SetAttribute(attributeName :: string, converted)
+		end)
+		if not ok then
+			return {
+				error = "Failed to set attribute: " .. tostring(err),
+				instancePath = instancePath,
+				attributeName = attributeName,
+			},
+				nil
+		end
+
+		ctx.actionLog:stage(
+			"set_attribute",
+			instancePath,
+			string.format("Set attribute %s on %s", attributeName :: string, instancePath),
+			{
+				attributeName = attributeName,
+				newValue = serializeAttributeValue(converted),
+				previousValue = serializeAttributeValue(previousValue),
+			}
+		)
+
+		return {
+			success = true,
+			instancePath = instancePath,
+			attributeName = attributeName,
+			attributeValue = attributeValue,
+			message = "Attribute set successfully",
+		}, {
+			name = "Set Attribute: " .. (attributeName :: string),
+			didMutate = true,
+		}
+	end
+)
+
+-- deleteAttribute: clear one named attribute. Legacy L4766-4799.
+-- Roblox's API is SetAttribute(name, nil) for deletion.
+AttributeHandlers.deleteAttribute = Handler.define(
+	"/api/delete-attribute",
+	function(ctx, data: DeleteAttributeRequest): (any, Handler.RecordResult?)
+		local instancePath = data.instancePath
+		local attributeName = data.attributeName
+
+		if instancePath == nil or attributeName == nil then
+			return { error = "Instance path and attribute name are required" }, nil
+		end
+
+		local instance = Path.getInstanceByPath(instancePath)
+		if instance == nil then
+			return { error = "Instance not found: " .. instancePath }, nil
+		end
+
+		-- No-op if the attribute doesn't exist — return didMutate=false so
+		-- the dispatcher cancels both CHS and the (un-staged) action log
+		-- entry. This matches the find_and_replace zero-match pattern.
+		local okProbe, probed = pcall(function()
+			return instance:GetAttribute(attributeName :: string)
+		end)
+		if okProbe and probed == nil then
+			return {
+				success = true,
+				instancePath = instancePath,
+				attributeName = attributeName,
+				message = "Attribute did not exist; no change made",
+			}, {
+				name = "Delete Attribute: " .. (attributeName :: string),
+				didMutate = false,
+			}
+		end
+
+		local previousValue: any = if okProbe then probed else nil
+
+		local ok, err = pcall(function()
+			instance:SetAttribute(attributeName :: string, nil)
+		end)
+		if not ok then
+			return {
+				error = "Failed to delete attribute: " .. tostring(err),
+				instancePath = instancePath,
+				attributeName = attributeName,
+			},
+				nil
+		end
+
+		ctx.actionLog:stage(
+			"delete_attribute",
+			instancePath,
+			string.format("Deleted attribute %s from %s", attributeName :: string, instancePath),
+			{
+				attributeName = attributeName,
+				previousValue = serializeAttributeValue(previousValue),
+			}
+		)
+
+		return {
+			success = true,
+			instancePath = instancePath,
+			attributeName = attributeName,
+			message = "Attribute deleted successfully",
+		}, {
+			name = "Delete Attribute: " .. (attributeName :: string),
+			didMutate = true,
+		}
 	end
 )
 

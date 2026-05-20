@@ -1,4 +1,9 @@
-# Roblox Studio MCP Plugin Installation Guide
+# Roblox Studio MCP Plugin Installation Guide (LEGACY)
+
+> ⚠️ **Deprecated as of v3.0.0.** This guide covers the legacy single-file
+> plugin in `studio-plugin-legacy/plugin.luau`. For the current plugin, see
+> the root `README.md` "Studio Plugin Setup" section, which builds from
+> `studio-plugin/` via Rojo.
 
 Complete your AI assistant integration with this easy-to-install Studio plugin. Works with Claude Code, Claude Desktop, and any MCP-compatible AI.
 

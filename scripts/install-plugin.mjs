@@ -1,23 +1,33 @@
 #!/usr/bin/env node
-// Wrap studio-plugin/plugin.luau as an .rbxmx and drop it into Studio's Plugins
-// folder so Studio loads the latest source on next plugin reload.
+// Build the Studio plugin from `studio-plugin/` via rojo and drop the
+// resulting .rbxm into Studio's Plugins folder so Studio loads it on next
+// plugin reload.
 //
 // Usage:
-//   node scripts/install-plugin.mjs           # auto-detect Plugins folder
-//   node scripts/install-plugin.mjs <path>    # explicit Plugins-folder path
+//   node scripts/install-plugin.mjs               # auto-detect Plugins folder
+//   node scripts/install-plugin.mjs <plugins-dir> # explicit Plugins-folder path
+//
+// Requirements:
+//   - rojo on PATH (we pin 7.7.0-rc.1 in studio-plugin/aftman.toml; `aftman install`
+//     once in studio-plugin/ provisions it)
+//   - wally on PATH and `wally install` has been run inside studio-plugin/ at
+//     least once so studio-plugin/Packages/ exists
 //
 // In Studio after running: open the Plugins tab, right-click the MCP plugin,
 // click "Reload" — or just close & reopen Studio.
 
-import { readFileSync, writeFileSync, existsSync, statSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { copyFileSync, existsSync, statSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { randomBytes } from "node:crypto";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const ROOT     = join(__dirname, "..");
-const SOURCE   = join(ROOT, "studio-plugin", "plugin.luau");
-const FILENAME = "mcpserver.rbxmx"; // matches the user's existing Local Plugin
+const ROOT          = join(__dirname, "..");
+const PLUGIN_DIR    = join(ROOT, "studio-plugin");
+const PROJECT_FILE  = join(PLUGIN_DIR, "rbxstudio-plugin.project.json");
+const PACKAGES_DIR  = join(PLUGIN_DIR, "Packages");
+const BUILD_OUTPUT  = join(PLUGIN_DIR, "MCPPlugin.rbxm");
+const INSTALL_NAME  = "MCPPlugin.rbxm"; // matches the v3.0.0 binary name
 
 // Candidate Plugins-folder paths, in priority order.
 const CANDIDATES = [
@@ -36,6 +46,21 @@ function isExistingDir(p) {
   try { return statSync(p).isDirectory(); } catch { return false; }
 }
 
+function die(msg) {
+  console.error(`✗ ${msg}`);
+  process.exit(1);
+}
+
+if (!existsSync(PROJECT_FILE)) {
+  die(`Rojo project not found: ${PROJECT_FILE}`);
+}
+
+if (!existsSync(PACKAGES_DIR)) {
+  console.error("✗ studio-plugin/Packages/ is missing.");
+  console.error("  Run `cd studio-plugin && wally install` once first.");
+  process.exit(1);
+}
+
 const pluginsDir = CANDIDATES.find(isExistingDir);
 if (!pluginsDir) {
   console.error("✗ Could not find Roblox Plugins folder. Tried:");
@@ -44,49 +69,25 @@ if (!pluginsDir) {
   process.exit(1);
 }
 
-if (!existsSync(SOURCE)) {
-  console.error(`✗ Source file not found: ${SOURCE}`);
-  process.exit(1);
+// 1. Build with rojo.
+const build = spawnSync(
+  "rojo",
+  ["build", PROJECT_FILE, "-o", BUILD_OUTPUT],
+  { stdio: "inherit" }
+);
+if (build.error && build.error.code === "ENOENT") {
+  die("`rojo` not found on PATH. Install via aftman: `cd studio-plugin && aftman install`.");
+}
+if (build.status !== 0) {
+  die(`rojo build failed (exit ${build.status})`);
 }
 
-const luau = readFileSync(SOURCE, "utf8");
+// 2. Drop into the Plugins folder.
+const dest = join(pluginsDir, INSTALL_NAME);
+copyFileSync(BUILD_OUTPUT, dest);
 
-// Defensively escape `]]>` in the source so it doesn't terminate the CDATA.
-// Standard XML trick: replace ]]> with ]]]]><![CDATA[> which yields ]]> in text.
-const safe = luau.replace(/\]\]>/g, "]]]]><![CDATA[>");
-
-const referent = "RBX" + randomBytes(16).toString("hex").toUpperCase();
-const guid = [4, 2, 2, 2, 6]
-  .map((n) => randomBytes(n).toString("hex").toUpperCase())
-  .join("-");
-
-const xml = `<roblox xmlns:xmime="http://www.w3.org/2005/05/xmlmime" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://www.roblox.com/roblox.xsd" version="4">
-\t<External>null</External>
-\t<External>nil</External>
-\t<Item class="Script" referent="${referent}">
-\t\t<Properties>
-\t\t\t<ProtectedString name="Source"><![CDATA[${safe}]]></ProtectedString>
-\t\t\t<bool name="Disabled">false</bool>
-\t\t\t<Content name="LinkedSource"><null></null></Content>
-\t\t\t<token name="RunContext">0</token>
-\t\t\t<string name="ScriptGuid">{${guid}}</string>
-\t\t\t<BinaryString name="AttributesSerialize"></BinaryString>
-\t\t\t<SecurityCapabilities name="Capabilities">0</SecurityCapabilities>
-\t\t\t<bool name="DefinesCapabilities">false</bool>
-\t\t\t<string name="Name">MCPServer</string>
-\t\t\t<int64 name="SourceAssetId">-1</int64>
-\t\t\t<BinaryString name="Tags"></BinaryString>
-\t\t</Properties>
-\t</Item>
-</roblox>`;
-
-const dest = join(pluginsDir, FILENAME);
-writeFileSync(dest, xml, "utf8");
-
-const lines = luau.split("\n").length;
-const sizeKB = Math.round(xml.length / 1024);
-
-console.log(`✓ Installed plugin (${lines} lines source, ${sizeKB} KB rbxmx)`);
+const sizeKB = Math.round(statSync(BUILD_OUTPUT).size / 1024);
+console.log(`✓ Installed plugin (${sizeKB} KB)`);
 console.log(`  → ${dest}`);
 console.log("");
 console.log("In Studio:");

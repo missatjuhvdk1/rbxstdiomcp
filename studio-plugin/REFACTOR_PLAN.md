@@ -1,9 +1,19 @@
 # MCP Plugin — Clean-Sheet Refactor Plan
 
-> Status: **proposal**. No code written yet. Once approved, this becomes the
-> living plan for the refactor. Each phase has a clear deliverable, a
-> verification step, and references to both the **legacy source** and the
-> **golden-rules reference**.
+> Status: **complete (Phases 1–7).** This document is now historical. The
+> `studio-plugin/` you are reading this from is the cutover target of Phase
+> 7; before cutover the folder was `MCPPlugin/`. Path references below still
+> read `MCPPlugin/` — mentally substitute `studio-plugin/` (and
+> `studio-plugin/plugin.luau` references mean `studio-plugin-legacy/plugin.luau`).
+>
+> Kept in-tree because §8 is a useful per-module index from new module ↔
+> legacy line range ↔ BuilderTool reference. Treat the phase tables as an
+> archaeology aid, not a roadmap.
+
+> Original status note (preserved): **proposal**. No code written yet. Once
+> approved, this becomes the living plan for the refactor. Each phase has a
+> clear deliverable, a verification step, and references to both the **legacy
+> source** and the **golden-rules reference**.
 
 ---
 

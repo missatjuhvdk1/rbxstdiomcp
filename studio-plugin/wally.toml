@@ -1,12 +1,12 @@
-# MCPPlugin dependency manifest.
+# MCPPlugin (studio-plugin/) dependency manifest.
 #
 # Restored with `wally install` into Packages/ (git-ignored — see
-# MCPPlugin/.gitignore). `wally.lock` IS tracked once generated so builds are
+# studio-plugin/.gitignore). `wally.lock` IS tracked so builds are
 # reproducible (per REFACTOR_PLAN §7.1 Q2).
 #
-# Versions match BuilderTool's reference manifest. We omit ReactSpring for now —
-# the MCP plugin's animation surface (the pulse dot) is small enough that we
-# defer that choice to Phase 6 when the UI lands.
+# Versions match BuilderTool's reference manifest. We omit ReactSpring — the
+# plugin's animation surface (the pulse dot) is small enough to drive from
+# `useEffect`/Heartbeat without a tweening dependency.
 
 [package]
 name = "mcpplugin/mcpplugin"

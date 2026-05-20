@@ -4,7 +4,7 @@
 -- The §16 CI gate, executable. Run with:
 --   lune run tools/golden/check.lune.luau
 --
--- This is the mechanical enforcement of MCPPlugin/ARCHITECTURE.md's §4 layer
+-- This is the mechanical enforcement of studio-plugin/ARCHITECTURE.md's §4 layer
 -- invariants and §15 forbidden-pattern catalogue. It is intentionally simple
 -- and grep-based — the goal is *no false negatives*, not perfect parsing.
 -- Reviewers still read code; this script catches the things humans miss.
@@ -455,11 +455,11 @@ end
 -- ---------------------------------------------------------------------------
 
 local function main()
-	stdio.write("MCPPlugin golden-rules CI gate (ARCHITECTURE §16)\n")
-	stdio.write("=================================================\n")
+	stdio.write("studio-plugin golden-rules CI gate (ARCHITECTURE §16)\n")
+	stdio.write("=====================================================\n")
 
 	if not fs.isDir(SRC_DIR) then
-		fail("Setup", SRC_DIR, nil, "src/ directory not found — run from MCPPlugin/")
+		fail("Setup", SRC_DIR, nil, "src/ directory not found — run from studio-plugin/")
 		return
 	end
 

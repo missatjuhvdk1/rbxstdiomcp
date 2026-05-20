@@ -1,35 +1,40 @@
-# Agent rules for `MCPPlugin/`
+# Agent rules for `studio-plugin/`
 
 > If you are an LLM editing files under this folder, read this first. It is
 > the condensed contract; the full document is `ARCHITECTURE.md` in this
-> directory, and the rolling plan is `REFACTOR_PLAN.md`.
+> directory.
+>
+> `REFACTOR_PLAN.md` is historical (the seven-phase rebuild that produced
+> this folder, Phases 1–7 complete). The "studio-plugin/" you are now in is
+> the destination of that plan's Phase 7 cutover; before cutover it lived at
+> `MCPPlugin/`. Path references in the plan still read `MCPPlugin/` —
+> mentally substitute `studio-plugin/`.
 
 ## The two source-of-truth documents
 
-- **`MCPPlugin/ARCHITECTURE.md`** — the frozen engineering contract.
+- **`studio-plugin/ARCHITECTURE.md`** — the frozen engineering contract.
   Invariants, layer rules, the `Context` shape, the `Handler` contract, the
   forbidden-pattern catalogue, the CI gates. Code implements this document;
   it does not silently redesign it. A needed change is a dated amendment
   note in that file, not an undocumented divergence.
-- **`MCPPlugin/REFACTOR_PLAN.md`** — the seven-phase rebuild plan.
-  Which modules land in which phase, what verifies each phase, the legacy
-  source line ranges (`studio-plugin/plugin.luau`) and the golden-rules
-  references (`better-plugin/BuilderTool/`) for every module.
+- **`studio-plugin/REFACTOR_PLAN.md`** — historical record of the seven-phase
+  rebuild. Useful for archaeology (which legacy lines map to which new
+  module). Don't treat as a future plan.
 
 ## Reference repos in this workspace
 
 | Folder | Role | Touch? |
 |---|---|---|
-| `studio-plugin/` | Legacy plugin — the **behavioural specification**. "What does this endpoint return?" → check here. | **Read-only.** Never modify. |
+| `studio-plugin-legacy/` | The 7,022-line single-file plugin — the **behavioural specification**. "What did this endpoint return?" → check here. | **Read-only.** Going away one release after v3.0.0. |
 | `better-plugin/BuilderTool/` | Golden-rules reference — the **structural specification**. "How is this kind of thing structured?" → check here. | **Read-only.** Never modify. |
-| `MCPPlugin/` | The new plugin. Where all real work happens. | This is the only writable plugin folder until Phase 7 cutover. |
+| `studio-plugin/` | The active plugin. Where all real work happens. | This is the writable plugin folder. |
 | `src/` | TypeScript MCP server. Unchanged throughout the refactor. | Don't touch unless explicitly asked. |
 
 ## Non-negotiables (carry from commit #1)
 
 1. **`--!strict` on line 1** of every `.luau` file. Always.
 2. **No globals.** No `_G`, `shared`, `getfenv`, `setfenv`, `loadstring` in
-   `MCPPlugin/src/`. State flows through the one typed `Context`.
+   `studio-plugin/src/`. State flows through the one typed `Context`.
 3. **Layer direction is one-way:** `app → ui → domain → runtime`. No upward
    `require`s, no cycles. `runtime/` depends on Roblox + `Packages/` only.
 4. **`game:GetService(...)` only in `runtime/Services.luau`.**
@@ -62,7 +67,7 @@
 ## Before commit
 
 ```bash
-# from MCPPlugin/
+# from studio-plugin/
 stylua --check src/
 selene src/
 lune run tools/golden/check.lune.luau
@@ -75,7 +80,8 @@ step proves the plugin still packages.
 ## When in doubt
 
 - Behaviour question → re-read the relevant lines of
-  `studio-plugin/plugin.luau`. The legacy file is the spec.
+  `studio-plugin-legacy/plugin.luau`. The legacy file is the spec until it
+  is removed in the next minor release.
 - Structure question → re-read the relevant module of
   `better-plugin/BuilderTool/`. That is the pattern.
 - Both at once → re-read `REFACTOR_PLAN.md §8` (the reference index that

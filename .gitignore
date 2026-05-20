@@ -23,9 +23,10 @@ dist/
 
 # Development files (keep local only)
 CLAUDE.md
-# Exception: MCPPlugin/ ships its own committed agent pointer alongside
-# ARCHITECTURE.md (REFACTOR_PLAN.md Phase 1 deliverable).
-!MCPPlugin/CLAUDE.md
+# Exception: studio-plugin/ ships its own committed agent pointer alongside
+# ARCHITECTURE.md (REFACTOR_PLAN.md Phase 1 deliverable; pre-cutover this
+# lived at MCPPlugin/CLAUDE.md).
+!studio-plugin/CLAUDE.md
 MCP_Server_Plan.md
 test-*.js
 example-*.json
@@ -65,3 +66,12 @@ forum-title.txt
 
 # npm credentials
 .npmrc
+
+# Studio plugin build outputs / restored deps (REFACTOR_PLAN Phase 7).
+# studio-plugin/.gitignore has its own copy; we mirror at root so anyone
+# running git from the project root never accidentally commits build output.
+studio-plugin/Packages/
+studio-plugin/*.rbxm
+studio-plugin/*.rbxmx
+studio-plugin/sourcemap.json
+studio-plugin/.lune/

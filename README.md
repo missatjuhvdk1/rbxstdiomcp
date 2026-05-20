@@ -51,15 +51,31 @@ If you encounter issues, you may need to run it through `cmd`. Update your confi
 
 ## Studio Plugin Setup (Required)
 
-The MCP server requires a companion Roblox Studio plugin:
+The MCP server requires a companion Roblox Studio plugin. As of **v3.0.0** the
+plugin is a multi-module Rojo project — `studio-plugin/` — and ships as a
+`.rbxm` instead of the old single-file `.rbxmx`.
 
-   - Download [MCPPlugin.rbxmx](https://github.com/boshyxd/robloxstudio-mcp/releases/latest/download/MCPPlugin.rbxmx)
-   - Save to your `%LOCALAPPDATA%/Roblox/Plugins` folder
+**Recommended: download the prebuilt artifact**
+   - Download [MCPPlugin.rbxm](https://github.com/boshyxd/robloxstudio-mcp/releases/latest/download/MCPPlugin.rbxm) from the latest GitHub Release
+   - Save to your `%LOCALAPPDATA%/Roblox/Plugins` folder (macOS: `~/Documents/Roblox/Plugins`)
+
+**Or build from source (developers):**
+```bash
+cd studio-plugin
+aftman install            # provisions rojo, lune, selene, stylua
+wally install             # populates Packages/
+
+# from repo root:
+npm run plugin:install    # builds via rojo and drops MCPPlugin.rbxm into Studio's Plugins folder
+```
 
 **After installation:**
 - Enable "Allow HTTP Requests" in Game Settings > Security
 - Click the "MCP Server" button in the Plugins toolbar
 - Status should show "Connected" when working
+
+> Looking for the old single-file plugin? It's archived (read-only) in
+> `studio-plugin-legacy/` for one release. See its `DEPRECATED.md`.
 
 ## Architecture Overview
 

@@ -3,7 +3,7 @@
 > Status: **frozen contract**. Code implements this document; it does not
 > silently redesign it. A needed change is a dated amendment note in this
 > file, not an undocumented divergence. Every reviewer and every agent reads
-> this before touching `MCPPlugin/src/`.
+> this before touching `studio-plugin/src/`.
 >
 > Modelled on `better-plugin/BuilderTool/ARCHITECTURE.md`. Where the two
 > documents disagree, this one wins for the MCP plugin; where they agree, the
@@ -42,7 +42,7 @@ zero leaked instances, connections, settings corruption, or orphan
 
 ## 2. Toolchain & tech stack
 
-Managed by **aftman** (`MCPPlugin/aftman.toml`). Versions are pinned exactly;
+Managed by **aftman** (`studio-plugin/aftman.toml`). Versions are pinned exactly;
 bump deliberately, never floating:
 
 | Tool | Version | Role |
@@ -75,7 +75,7 @@ collapsing; selene = `roblox` std. Run both before every commit.
 The plugin is one self-contained package:
 
 ```
-MCPPlugin/
+studio-plugin/
 ├── ARCHITECTURE.md          ← this file (the contract)
 ├── CLAUDE.md                ← condensed rules for agents (points here)
 ├── REFACTOR_PLAN.md         ← the rolling refactor plan (Phases 1–7)
@@ -100,7 +100,7 @@ MCPPlugin/
         └── check.lune.luau  ← §16 CI gate, executable
 ```
 
-Build (from `MCPPlugin/`):
+Build (from `studio-plugin/`):
 
 ```bash
 wally install                                                   # restores Packages/
@@ -142,7 +142,7 @@ runtime = leaf: depends on Roblox + Packages only, nothing in the package
 1. **No upward edges.** `domain/` never requires `ui/`; `runtime/` requires
    nothing in the package. Cycles are a design error, not a TODO.
 2. **No globals.** `_G`/`shared`/`getfenv`/`setfenv`/`loadstring` are
-   forbidden in `MCPPlugin/src/`. The one principled exception is the
+   forbidden in `studio-plugin/src/`. The one principled exception is the
    `execute_lua` sandbox closure inside
    `domain/handlers/ExecuteLuaHandler.luau`, which deliberately constructs a
    user-code environment (the §15 rule applies to *our* code, not to the
@@ -680,3 +680,9 @@ every PR.
   ActionLog/source-edit decoupling, companion-tag LLM-stomp protections) are
   documented above and trace one-to-one to the corresponding sections of
   REFACTOR_PLAN §3.
+- *2026-05-19* — **Phase 7 cutover.** `MCPPlugin/` renamed to `studio-plugin/`;
+  the legacy single-file plugin moved to `studio-plugin-legacy/` (read-only,
+  removed in the next minor release). Path references in this document
+  updated; the binary still ships as `MCPPlugin.rbxm` to match the published
+  asset name. See root README "Studio Plugin Setup" for the user-facing
+  install flow.

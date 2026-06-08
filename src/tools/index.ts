@@ -1658,6 +1658,103 @@ export class RobloxStudioTools {
     };
   }
 
+  /**
+   * render_gui - Render a 2D GUI (ScreenGui / GuiObject) to a PNG image.
+   *
+   * ViewportFrame is 3D-only, so GUIs are captured plugin-side by cloning the
+   * target's real ScreenGui into CoreGui (faithful placement), taking a
+   * full-screen CaptureService screenshot, then cropping. region "element"
+   * (default) crops tight to the element's rect; "screen" returns the whole
+   * viewport so on-screen placement can be verified. Here we just convert the
+   * returned RGBA to PNG, mirroring renderObjectView.
+   */
+  async renderGui(
+    instancePath: string,
+    options?: {
+      region?: 'element' | 'screen';
+      maxWidth?: number;
+      maxHeight?: number;
+    }
+  ) {
+    if (!instancePath) {
+      throw new Error('Instance path is required for render_gui');
+    }
+
+    const response = await this.client.request('/api/render-gui', {
+      instancePath,
+      region: options?.region || 'element',
+      maxWidth: options?.maxWidth,
+      maxHeight: options?.maxHeight,
+    });
+
+    const responseData = response as any;
+    if (responseData.success && responseData.base64) {
+      try {
+        const rgbaBuffer = Buffer.from(responseData.base64, 'base64');
+        const width = responseData.width;
+        const height = responseData.height;
+
+        const expectedSize = width * height * 4;
+        if (rgbaBuffer.length !== expectedSize) {
+          throw new Error(
+            `Buffer size mismatch: got ${rgbaBuffer.length}, expected ${expectedSize}`
+          );
+        }
+
+        const pngBuffer = createPNG(rgbaBuffer, width, height);
+        const pngBase64 = pngBuffer.toString('base64');
+
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify(
+                {
+                  success: true,
+                  message: responseData.message,
+                  guiInfo: responseData.guiInfo,
+                  format: 'PNG',
+                },
+                null,
+                2
+              ),
+            },
+            {
+              type: 'image',
+              data: pngBase64,
+              mimeType: 'image/png',
+            },
+          ],
+        };
+      } catch (err) {
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify(
+                {
+                  success: false,
+                  error: `PNG conversion failed: ${err instanceof Error ? err.message : String(err)}`,
+                },
+                null,
+                2
+              ),
+            },
+          ],
+        };
+      }
+    }
+
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify(response, null, 2),
+        },
+      ],
+    };
+  }
+
   // ============================================
   // CAMERA CONTROL SYSTEM
   // ============================================

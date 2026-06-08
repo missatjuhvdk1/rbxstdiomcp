@@ -19,16 +19,10 @@ export const docTools: ToolDef[] = [
     name: 'search_roblox_docs',
     description:
       "Search Roblox's official creator documentation (mirror of github.com/Roblox/creator-docs). " +
-      'Returns matching passages with file path, line number, surrounding context, and (in hybrid mode) a relevance score. ' +
-      'Use this FIRST when you need authoritative info on a Roblox API, behavior, or guide topic — especially for things AI models commonly get wrong (animation, Motor6D C0/C1, R6/R15 rigs, AlignOrientation, etc.). ' +
-      '\n\n**Hybrid mode** (default for multi-word queries) has two stages:\n' +
-      '1) **Keyword-AND + semantic rerank** (preferred): English stopwords (`how`, `do`, `the`, `a`, etc.) are stripped, and the remaining "meaningful" tokens must all appear within `window_lines` (default 3) of the anchor line. Surviving hits are then reranked by sentence-embedding cosine similarity against your FULL original query (stopwords included — the embedder benefits from natural-language framing). Response has `keywordFiltered: true`; every hit lexically contains every meaningful token.\n' +
-      '2) **Pure-semantic fallback** (when stage 1 finds nothing): cosine top-K over the chunk index, no keyword guarantee. This is what makes queries like `"how do I rotate a body part smoothly"` surface AlignOrientation / Motor6D pages even when no single line contains every term. Response has `keywordFiltered: false` — treat hits as "topically relevant" rather than "lexically matching".\n' +
-      'Exact-API queries like `"Motor6D C0"` use stage 1 and get the right reference page on top. ' +
-      'The first call after a fresh docs download triggers a one-time semantic index build (~25MB model download + embedding ~19k chunks; measured at ~8 min on a single-CPU box, faster with multi-core / GPU). Subsequent process starts load from disk in <100ms. If the index isn\'t ready yet (or fails to build), the tool transparently falls back to plain keyword ranking and sets `semanticUsed: false` in the response. ' +
-      '\n\nWrap a phrase in double quotes to force a literal match, e.g. `"Class.Motor6D.C0"` (one token). Single-token queries fall back to literal substring search (no semantic rerank — single tokens already have an unambiguous ranking). ' +
-      'Pass `semantic: false` to force pure keyword mode if you want deterministic results (stopwords are still stripped from the AND filter). ' +
-      '\n\nOn first use the tool downloads ~30MB of docs to a local cache (~5s). Subsequent calls hit the cache instantly and refresh from upstream at most once per 24h.',
+      'Returns matching passages with file path, line number, and surrounding context (plus a relevance score in hybrid mode). ' +
+      'Use this FIRST for authoritative info on a Roblox API or behavior — especially things models get wrong (animation, Motor6D C0/C1, R6/R15 rigs, AlignOrientation, etc.). ' +
+      '\n\nMulti-word queries use **hybrid mode**: meaningful tokens (stopwords stripped) must all appear within `window_lines` of each other, then hits are reranked by semantic similarity to your full query (`keywordFiltered: true`). If that finds nothing it falls back to pure-semantic top-K (`keywordFiltered: false` — topically relevant, not guaranteed to contain every term). Single tokens, regex, and quoted phrases use literal substring search. Wrap a phrase in double quotes to force one literal token, e.g. `"Class.Motor6D.C0"`. Pass `semantic: false` for deterministic keyword-only ranking. ' +
+      '\n\nFirst use downloads ~30MB of docs (~5s) and builds a one-time semantic index (~25MB model + embeds ~19k chunks; minutes on a single CPU). Until the index is ready the tool falls back to keyword ranking and sets `semanticUsed: false`. Subsequent calls hit the cache instantly (refreshed at most once per 24h).',
     inputSchema: {
       type: 'object',
       properties: {
@@ -125,9 +119,7 @@ export const docTools: ToolDef[] = [
   {
     name: 'list_roblox_docs',
     description:
-      'List directory contents within the cached Roblox docs tree (like `ls`). Use to discover what reference docs or guides exist before searching/reading. ' +
-      'Pass an empty path to see top-level locales (just "en-us" today). ' +
-      '\n\n**Paginated**: large directories (engine `classes/` has ~1000 entries) are paginated at 100 items by default. The response includes `totalEntries`, `offset`, `limit`, and `truncated`. Bump `offset` to page through, or raise `limit` (max 1000) if you genuinely need everything in one shot — but you almost never do; prefer `search_roblox_docs` or `get_roblox_api_reference` to find a specific entry.',
+      'List directory contents within the cached Roblox docs tree (like `ls`) to discover what reference docs or guides exist. An empty path lists top-level locales ("en-us"). Paginated at 100 (response has totalEntries/offset/limit/truncated; max limit 1000) — but prefer search_roblox_docs or get_roblox_api_reference to find a specific entry.',
     inputSchema: {
       type: 'object',
       properties: {

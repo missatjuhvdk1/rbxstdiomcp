@@ -1,4 +1,5 @@
 import type { ToolDef } from '../types.js';
+import { INSTRUMENT_OVER_PLAYTEST, RUN_LIVE_LUA_NUDGE } from '../nudges.js';
 
 /**
  * Studio runtime tools: undo/redo and Play Solo session control.
@@ -46,7 +47,7 @@ export const runtimeTools: ToolDef[] = [
   {
     name: 'get_history',
     description:
-      "Read-only view of the recent MCP undo/redo stacks. Use this to peek at what `undo` would revert before calling it, to recover situational awareness after a session resume, or to decide how far back (`count`) to roll an `undo` call.\n\nReturns Studio's authoritative `can_undo`/`can_redo` flags plus both stacks (most-recent first; `index: 0` is the next entry that `undo`/`redo` would consume). Each entry includes `action`, `target`, `summary`, `timestamp`, `age_seconds`. Pass `include_details: true` for the per-action `details` payload (omitted by default to keep responses small — mass operations have large details blobs).\n\nNote: Studio's undo stack is shared with the user's own Ctrl+Z edits. `can_undo` can be true even when `tracked_undo_count` is 0 (e.g. fresh session, or user made manual changes before the plugin connected).",
+      "Read-only view of the recent MCP undo/redo stacks. Use it to peek at what `undo` would revert, to recover awareness after a session resume, or to choose how far back to roll an `undo`.\n\nReturns Studio's `can_undo`/`can_redo` flags plus both stacks (most-recent first; index 0 is what undo/redo consumes next). Each entry has action, target, summary, timestamp, age_seconds; pass include_details:true for the per-action payload (off by default to keep responses small). Note: the undo stack is shared with the user's own Ctrl+Z, so can_undo may be true even when tracked_undo_count is 0.",
     inputSchema: {
       type: 'object',
       properties: {
@@ -77,6 +78,7 @@ export const runtimeTools: ToolDef[] = [
       type: 'object',
       properties: {},
     },
+    nudge: INSTRUMENT_OVER_PLAYTEST,
     handler: (_args, { tools }) => tools.playSolo(),
   },
 
@@ -116,6 +118,7 @@ export const runtimeTools: ToolDef[] = [
         },
       },
     },
+    nudge: INSTRUMENT_OVER_PLAYTEST,
     handler: (args, { tools }) =>
       tools.getPlaytestOutput(args?.sinceSeq, args?.limit, args?.messageTypes),
   },
@@ -123,7 +126,7 @@ export const runtimeTools: ToolDef[] = [
   {
     name: 'run_live_lua',
     description:
-      'Execute Lua/Luau code INSIDE a running play test (started via play_solo). Runs in the test\'s Server DataModel with full access to running game state — fire RemoteEvents, query Players, read Workspace state at the current physics tick, mutate the live world, etc. This is different from execute_lua (which runs in the Edit-mode plugin context).\n\n**target="server" is the primary mode.** Server requires `Game Settings → Security → LoadString` to be enabled (place-level toggle) since execution uses `loadstring`. **target="client" is currently engine-blocked** — Roblox permanently disables `loadstring` in LocalScripts regardless of the LoadStringEnabled flag, so client eval will always return `loadstring_disabled`. The relay infrastructure for client eval is wired up (client registration + log streaming work) but actual code execution on the client requires a future workaround. For now, drive client behavior from the server via Remotes.\n\nNever throws — every failure path is reported in the response body as { success: false, error: <enum>, message }. Possible error enums: "no_playtest" (call play_solo first), "playtest_ended" (start a new test), "companion_not_ready" (wait briefly), "loadstring_disabled" (server: enable LoadStringEnabled in Game Settings; client: engine-blocked), "no_clients_connected" / "multiple_clients" / "no_such_player" (client targeting), "compile_error", "runtime_error", "timeout", "companion_error" (often caused by a previous spinloop wedging the companion — restart play_solo).\n\nReturns ALL Lua return values packed into `values` (an array — single-return becomes length-1, no-return becomes empty). If captureLogs=true, prints/warns/errors emitted by the executed code are returned in `logs`. Errors include `traceback` from debug.traceback. **Avoid `while true do end` without a `task.wait()`** — the engine kills the offending coroutine but leaves the companion in a degraded state; use `task.wait` or set a sane `timeoutMs`.',
+      'Execute Lua/Luau INSIDE a running play test (call play_solo first). Runs in the test\'s live DataModel with full access to running game state — fire RemoteEvents, query Players, read Workspace at the current physics tick, mutate the world. Different from execute_lua, which runs in the Edit-mode plugin context.\n\ntarget="server" (default) is the primary mode and needs `Game Settings → Security → LoadString` enabled (execution uses loadstring). target="client" is currently engine-blocked (Roblox disables loadstring in LocalScripts) and always returns loadstring_disabled — drive client behavior from the server via Remotes instead.\n\nNever throws: failures come back as { success: false, error, message } with an error enum (e.g. no_playtest, loadstring_disabled, compile_error, runtime_error, timeout). On success returns ALL Lua returns in `values` (array), plus `logs` when captureLogs=true and a `traceback` on error. Avoid `while true do end` without a task.wait() — it wedges the companion; bound long work with task.wait or timeoutMs.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -161,6 +164,7 @@ export const runtimeTools: ToolDef[] = [
       },
       required: ['code'],
     },
+    nudge: RUN_LIVE_LUA_NUDGE,
     handler: (args, { tools }) =>
       tools.runLiveLua(
         args?.code,

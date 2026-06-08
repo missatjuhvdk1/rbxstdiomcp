@@ -282,6 +282,20 @@ const handlerCases: HandlerCase[] = [
     ],
   },
   {
+    name: 'render_gui',
+    args: {
+      instancePath: 'game.StarterGui.MainMenu',
+      region: 'screen',
+      maxWidth: 512,
+      maxHeight: 256,
+    },
+    method: 'renderGui',
+    expectedArgs: [
+      'game.StarterGui.MainMenu',
+      { region: 'screen', maxWidth: 512, maxHeight: 256 },
+    ],
+  },
+  {
     name: 'focus_camera',
     args: {
       instancePath: 'game.Workspace.Block',

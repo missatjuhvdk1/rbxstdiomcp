@@ -6690,6 +6690,350 @@ handlers.renderObjectView = function(requestData)
 end
 
 -- ============================================
+-- GUI RENDERING SYSTEM
+-- ============================================
+
+-- render_gui: capture a 2D GUI to an image. ViewportFrame is 3D-only, so we
+-- clone the GUI into an off-screen ScreenGui in CoreGui, take a full-screen
+-- CaptureService screenshot, then crop.
+--
+-- region:
+--   "element" (default) → crop tight to the target's on-screen rect.
+--   "screen"            → return the whole viewport, so you can verify where
+--                         the element actually lands relative to the screen.
+--
+-- Placement is faithful: when the target lives under a ScreenGui we clone the
+-- WHOLE ScreenGui (preserving siblings, layout, and GUI inset) and locate the
+-- cloned target by its child-index path, instead of reparenting the element to
+-- (0,0). StarterGui elements report AbsolutePosition = 0 until rendered in their
+-- real context, so this is what makes screen-mode placement accurate.
+handlers.renderGui = function(requestData)
+	local CaptureService = game:GetService("CaptureService")
+	local AssetService = game:GetService("AssetService")
+	local CoreGui = game:GetService("CoreGui")
+
+	-- Walk up to the nearest ScreenGui ancestor (2D overlay LayerCollector).
+	local function findAncestorScreenGui(inst)
+		local node = inst.Parent
+		while node do
+			if node:IsA("ScreenGui") then
+				return node
+			end
+			node = node.Parent
+		end
+		return nil
+	end
+
+	-- Child-index path from ancestor down to descendant (1-based GetChildren idx).
+	local function indexPath(ancestor, descendant)
+		local path = {}
+		local node = descendant
+		while node and node ~= ancestor do
+			local parent = node.Parent
+			if not parent then
+				return nil
+			end
+			local idx = nil
+			local siblings = parent:GetChildren()
+			for i = 1, #siblings do
+				if siblings[i] == node then
+					idx = i
+					break
+				end
+			end
+			if not idx then
+				return nil
+			end
+			table.insert(path, 1, idx)
+			node = parent
+		end
+		if node ~= ancestor then
+			return nil
+		end
+		return path
+	end
+
+	-- Follow a child-index path from root (clone order matches the original).
+	local function followPath(root, path)
+		local node = root
+		for _, idx in ipairs(path) do
+			local children = node:GetChildren()
+			node = children[idx]
+			if not node then
+				return nil
+			end
+		end
+		return node
+	end
+
+	local success, result = pcall(function()
+		-- ──────────── parse params ────────────
+		local instancePath = requestData.instancePath
+		if not instancePath then
+			return { success = false, error = "instancePath is required" }
+		end
+
+		local maxWidth  = tonumber(requestData.maxWidth)
+		local maxHeight = tonumber(requestData.maxHeight)
+		local region = (requestData.region == "screen") and "screen" or "element"
+
+		-- ──────────── resolve target ────────────
+		local target = getInstanceByPath(instancePath)
+		if not target then
+			return { success = false, error = "Instance not found: " .. instancePath }
+		end
+
+		-- ──────────── build off-screen host ────────────
+		-- hostGui is whatever we parent into CoreGui; cropElements drive the
+		-- element-mode bounding box; placement records how we positioned things.
+		local hostGui
+		local cropElements = {}
+		local placement = "synthetic"
+
+		if target:IsA("GuiObject") then
+			local ancestorGui = findAncestorScreenGui(target)
+			local path = ancestorGui and indexPath(ancestorGui, target) or nil
+
+			if ancestorGui and path then
+				-- Faithful: clone the whole ScreenGui so siblings/layout/inset
+				-- are intact, then find the cloned target via its index path.
+				local clonedGui = ancestorGui:Clone()
+				clonedGui.Name = "MCPRenderGui"
+				clonedGui.Enabled = true
+				clonedGui.DisplayOrder = 2147483647
+				local clonedTarget = followPath(clonedGui, path)
+				if not clonedTarget then
+					clonedGui:Destroy()
+					return {
+						success = false,
+						error = "Failed to locate cloned target inside ScreenGui clone",
+					}
+				end
+				clonedTarget.Visible = true
+				hostGui = clonedGui
+				table.insert(cropElements, clonedTarget)
+				placement = "faithful"
+			else
+				-- No ScreenGui context (e.g. element parked in ReplicatedStorage):
+				-- drop a synthetic host and park the clone at the origin.
+				hostGui = Instance.new("ScreenGui")
+				hostGui.Name = "MCPRenderGui"
+				hostGui.IgnoreGuiInset = true
+				hostGui.ResetOnSpawn = false
+				hostGui.DisplayOrder = 2147483647
+				hostGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+
+				local cloned = target:Clone()
+				cloned.Visible = true
+				cloned.AnchorPoint = Vector2.new(0, 0)
+				cloned.Position = UDim2.fromOffset(0, 0)
+				cloned.Parent = hostGui
+				table.insert(cropElements, cloned)
+			end
+		elseif target:IsA("ScreenGui") then
+			-- Faithful: render the whole ScreenGui as it would appear.
+			hostGui = target:Clone()
+			hostGui.Name = "MCPRenderGui"
+			hostGui.Enabled = true
+			hostGui.DisplayOrder = 2147483647
+			placement = "faithful"
+			for _, child in ipairs(hostGui:GetChildren()) do
+				if child:IsA("GuiObject") then
+					child.Visible = true
+					table.insert(cropElements, child)
+				end
+			end
+			if #cropElements == 0 then
+				hostGui:Destroy()
+				return {
+					success = false,
+					error = "GUI has no GuiObject children to render: " .. instancePath,
+				}
+			end
+		elseif target:IsA("LayerCollector") then
+			-- SurfaceGui / BillboardGui render in 3D, not as a 2D overlay, so we
+			-- can't place them faithfully — copy their children into a synthetic
+			-- ScreenGui host instead.
+			hostGui = Instance.new("ScreenGui")
+			hostGui.Name = "MCPRenderGui"
+			hostGui.IgnoreGuiInset = true
+			hostGui.ResetOnSpawn = false
+			hostGui.DisplayOrder = 2147483647
+			hostGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+			for _, child in ipairs(target:GetChildren()) do
+				if child:IsA("GuiObject") then
+					local cloned = child:Clone()
+					cloned.Visible = true
+					cloned.Parent = hostGui
+					table.insert(cropElements, cloned)
+				end
+			end
+			if #cropElements == 0 then
+				hostGui:Destroy()
+				return {
+					success = false,
+					error = "GUI has no GuiObject children to render: " .. instancePath,
+				}
+			end
+		else
+			return {
+				success = false,
+				error = "render_gui target must be a GuiObject or a ScreenGui/SurfaceGui/BillboardGui, got "
+					.. target.ClassName,
+			}
+		end
+
+		hostGui.Parent = CoreGui
+
+		-- Let layout / AbsolutePosition settle.
+		RunService.Heartbeat:Wait()
+		RunService.Heartbeat:Wait()
+
+		-- ──────────── union bounding box (screen px) ────────────
+		local minX, minY = math.huge, math.huge
+		local maxX, maxY = -math.huge, -math.huge
+		for _, el in ipairs(cropElements) do
+			local pos = el.AbsolutePosition
+			local size = el.AbsoluteSize
+			minX = math.min(minX, pos.X)
+			minY = math.min(minY, pos.Y)
+			maxX = math.max(maxX, pos.X + size.X)
+			maxY = math.max(maxY, pos.Y + size.Y)
+		end
+
+		-- ──────────── capture ────────────
+		local captureComplete = Instance.new("BindableEvent")
+		local captureResult, captureError = nil, nil
+
+		local pcOk, pcErr = pcall(function()
+			CaptureService:CaptureScreenshot(function(contentId)
+				if contentId then
+					captureResult = contentId
+				else
+					captureError = "CaptureScreenshot returned nil"
+				end
+				captureComplete:Fire()
+			end)
+		end)
+
+		if not pcOk then
+			hostGui:Destroy()
+			return { success = false, error = "CaptureScreenshot threw: " .. tostring(pcErr) }
+		end
+
+		local timeoutThread = task.delay(8, function()
+			if not captureResult and not captureError then
+				captureError = "Capture timed out (8s)"
+				captureComplete:Fire()
+			end
+		end)
+		captureComplete.Event:Wait()
+		task.cancel(timeoutThread)
+		captureComplete:Destroy()
+
+		hostGui:Destroy()
+
+		if captureError then
+			return { success = false, error = "Failed to capture screen: " .. captureError }
+		end
+
+		-- ──────────── crop ────────────
+		local sourceImage = AssetService:CreateEditableImageAsync(Content.fromUri(tostring(captureResult)))
+		local sourceSize = sourceImage.Size
+
+		local cropX, cropY, cropW, cropH
+		if region == "screen" then
+			-- Whole viewport: keep the element in its real on-screen context.
+			cropX, cropY = 0, 0
+			cropW, cropH = sourceSize.X, sourceSize.Y
+		else
+			-- Tight crop to the element's on-screen rect.
+			local rx = math.max(math.floor(minX), 0)
+			local ry = math.max(math.floor(minY), 0)
+			local rw = math.max(math.ceil(maxX - rx), 1)
+			local rh = math.max(math.ceil(maxY - ry), 1)
+			cropX = math.clamp(rx, 0, math.max(sourceSize.X - 1, 0))
+			cropY = math.clamp(ry, 0, math.max(sourceSize.Y - 1, 0))
+			cropW = math.clamp(rw, 1, sourceSize.X - cropX)
+			cropH = math.clamp(rh, 1, sourceSize.Y - cropY)
+		end
+
+		local croppedImage = AssetService:CreateEditableImage({ Size = Vector2.new(cropW, cropH) })
+		croppedImage:DrawImageTransformed(
+			Vector2.new(cropW / 2, cropH / 2),
+			Vector2.new(1, 1),
+			0,
+			sourceImage,
+			{
+				CombineType = Enum.ImageCombineType.Overwrite,
+				PivotPoint = Vector2.new(cropX + cropW / 2, cropY + cropH / 2),
+			}
+		)
+		sourceImage:Destroy()
+
+		-- ──────────── optional downscale (aspect preserved) ────────────
+		local outW, outH = cropW, cropH
+		local outputImage = croppedImage
+		if (maxWidth and cropW > maxWidth) or (maxHeight and cropH > maxHeight) then
+			local scaleW = maxWidth and (maxWidth / cropW) or math.huge
+			local scaleH = maxHeight and (maxHeight / cropH) or math.huge
+			local scale = math.min(scaleW, scaleH)
+			outW = math.max(math.floor(cropW * scale), 1)
+			outH = math.max(math.floor(cropH * scale), 1)
+			outputImage = AssetService:CreateEditableImage({ Size = Vector2.new(outW, outH) })
+			outputImage:DrawImageTransformed(
+				Vector2.new(outW / 2, outH / 2),
+				Vector2.new(scale, scale),
+				0,
+				croppedImage,
+				{
+					CombineType = Enum.ImageCombineType.Overwrite,
+					PivotPoint = Vector2.new(cropW / 2, cropH / 2),
+				}
+			)
+			croppedImage:Destroy()
+		end
+
+		local rgbaBuffer = outputImage:ReadPixelsBuffer(Vector2.new(0, 0), outputImage.Size)
+		local rgbaString = buffer.tostring(rgbaBuffer)
+		local base64Data = base64encode(rgbaString)
+		outputImage:Destroy()
+
+		return {
+			success = true,
+			base64 = base64Data,
+			width = outW,
+			height = outH,
+			format = "RGBA",
+			encoding = "base64",
+			guiInfo = {
+				objectName       = target.Name,
+				objectClass      = target.ClassName,
+				renderedElements = #cropElements,
+				region           = region,
+				placement        = placement,
+				rect = { x = cropX, y = cropY, width = cropW, height = cropH },
+				sourceWidth  = sourceSize.X,
+				sourceHeight = sourceSize.Y,
+			},
+			message = string.format(
+				"Rendered GUI %s at %dx%d (region=%s, placement=%s, from %dx%d screen)",
+				target.Name, outW, outH, region, placement, sourceSize.X, sourceSize.Y
+			),
+		}
+	end)
+
+	if success then
+		return result
+	else
+		return {
+			success = false,
+			error = "Failed to render GUI: " .. tostring(result),
+		}
+	end
+end
+
+-- ============================================
 -- CAMERA CONTROL SYSTEM
 -- ============================================
 
@@ -6859,6 +7203,8 @@ endpointHandlers = {
 	["/api/capture-screenshot"] = handlers.captureScreenshot,
 	-- ViewportFrame rendering
 	["/api/render-object-view"] = handlers.renderObjectView,
+	-- 2D GUI rendering
+	["/api/render-gui"] = handlers.renderGui,
 	-- Camera control
 	["/api/focus-camera"] = handlers.focusCamera,
 }

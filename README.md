@@ -132,7 +132,7 @@ graph TB
 ```
 
 ### Key Components:
-- MCP Server (Node.js/TypeScript) - Exposes 43 tools via stdio
+- MCP Server (Node.js/TypeScript) - Exposes 46 tools via stdio
 - HTTP Bridge - Request/response queue on localhost:3002
 - Studio Plugin (Luau) - Polls server and executes API calls
 - Smart Caching - Efficient data transfer

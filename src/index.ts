@@ -26,7 +26,7 @@ import {
 import { createHttpServer } from './http-server.js';
 import { RobloxStudioTools } from './tools/index.js';
 import { BridgeService } from './bridge-service.js';
-import { allTools, toolsByName } from './tools/registry.js';
+import { allTools, toolsByName, applyNudge } from './tools/registry.js';
 
 class RobloxStudioMCPServer {
   private server: Server;
@@ -71,7 +71,9 @@ class RobloxStudioMCPServer {
       }
 
       try {
-        return (await tool.handler(args ?? {}, { tools: this.tools })) as any;
+        const result = await tool.handler(args ?? {}, { tools: this.tools });
+        // Append the tool's just-in-time steering (no-op if it has none).
+        return applyNudge(result, tool.nudge) as any;
       } catch (error) {
         throw new McpError(
           ErrorCode.InternalError,

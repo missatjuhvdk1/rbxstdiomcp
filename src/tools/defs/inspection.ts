@@ -49,7 +49,8 @@ export const inspectionTools: ToolDef[] = [
 
   {
     name: 'get_class_info',
-    description: 'Get available properties/methods for Roblox classes',
+    description:
+      'Get available properties/methods for a Roblox class via live Studio reflection (what this engine build actually exposes). For canonical docs with descriptions and deprecation notes, use get_roblox_api_reference instead.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -105,24 +106,11 @@ export const inspectionTools: ToolDef[] = [
   {
     name: 'grep',
     description:
-      "Powerful grep over the Roblox instance tree — like Claude Code's Grep tool, but for the explorer instead of the filesystem.\n\n" +
-      'Walks descendants of `path` (default `game`), filters by `glob` (instance Name pattern) and `type` (ClassName / IsA), then searches script `Source` for `pattern`. ' +
-      'Use this as the FIRST move when the user mentions a script/instance you have not seen yet — much faster than browsing `get_project_structure` manually.\n\n' +
-      'Mapping to filesystem grep:\n' +
-      '  • path        → directory to search (instance subtree root)\n' +
-      '  • glob        → filename filter (Luau pattern matched against Instance.Name)\n' +
-      '  • type        → file-type filter (ClassName or `IsA` group, e.g. "LuaSourceContainer" matches all script kinds)\n' +
-      '  • pattern     → contents pattern (matched against script Source line-by-line, or whole-source if `multiline`)\n' +
-      '  • -i / -A / -B / -C / output_mode / head_limit / multiline → identical semantics to Claude Code Grep\n\n' +
-      'Returns one of three shapes depending on `output_mode`:\n' +
-      '  • "files_with_matches" (default): list of instance paths with hits — cheap, perfect for narrowing\n' +
-      '  • "content": matching lines with line numbers and optional context\n' +
-      '  • "count": per-instance match counts\n\n' +
-      "Tips:\n" +
-      "  • To find instances by Name only (no source search), pass `pattern: \".*\"` plus `glob: \"MyScript\"`.\n" +
-      "  • To search non-script instances by Name, pass `type: [\"Part\", \"Model\"]` etc. — Source is only read for `LuaSourceContainer` descendants.\n" +
-      "  • The default `type` is `[\"LuaSourceContainer\"]` (Script / LocalScript / ModuleScript) so common queries stay fast.\n" +
-      "  • Pattern is a Luau string pattern (similar to Lua patterns, NOT PCRE). Use `%.` to match a literal dot, `%(` for `(`, etc.",
+      "Powerful grep over the Roblox instance tree — like Claude Code's Grep, but for the explorer instead of the filesystem. " +
+      'Walks descendants of `path` (default `game`), filters by `glob` (Name pattern) and `type` (ClassName / IsA), then searches script `Source` for `pattern`. ' +
+      'Use this FIRST when the user mentions a script/instance you have not seen — much faster than browsing get_project_structure.\n\n' +
+      '`output_mode` controls the shape: "files_with_matches" (default) = instance paths with hits; "content" = matching lines with numbers + optional context (-A/-B/-C); "count" = per-instance counts. -i, head_limit, and multiline behave like Claude Code Grep.\n\n' +
+      'Notes: `pattern` is a Luau string pattern (NOT PCRE — use `%.` for a literal dot). Default `type` is ["LuaSourceContainer"] (all script kinds); Source is only read for those, so to search non-script instances by Name pass a `type` like ["Part"] plus `glob`, and for a Name-only search pass `pattern: ".*"` with a `glob`.',
     inputSchema: {
       type: 'object',
       properties: {

@@ -46,3 +46,26 @@ if (Object.keys(toolsByName).length !== allTools.length) {
   }
   throw new Error(`Duplicate tool name(s) in registry: ${dupes.join(', ')}`);
 }
+
+/**
+ * Append a tool's optional `nudge` to its result as an extra text content
+ * block. Pure + defensive: only touches MCP-shaped results that carry a
+ * `content` array, and is a no-op when there's no nudge. Returns the original
+ * result untouched in every other case so it can be applied unconditionally
+ * in the dispatch layer.
+ */
+export function applyNudge(result: unknown, nudge?: string): unknown {
+  if (!nudge) return result;
+  if (
+    result &&
+    typeof result === 'object' &&
+    Array.isArray((result as { content?: unknown }).content)
+  ) {
+    const r = result as { content: unknown[] };
+    return {
+      ...r,
+      content: [...r.content, { type: 'text', text: nudge }],
+    };
+  }
+  return result;
+}

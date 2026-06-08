@@ -27,6 +27,7 @@ import { createHttpServer } from './http-server.js';
 import { RobloxStudioTools } from './tools/index.js';
 import { BridgeService } from './bridge-service.js';
 import { allTools, toolsByName, applyNudge } from './tools/registry.js';
+import { SERVER_INSTRUCTIONS } from './instructions.js';
 
 class RobloxStudioMCPServer {
   private server: Server;
@@ -43,6 +44,10 @@ class RobloxStudioMCPServer {
         capabilities: {
           tools: {},
         },
+        // Always-on operating manual (mental model + cross-tool workflow);
+        // returned in the initialize response and usually folded into the
+        // client's system prompt. See src/instructions.ts.
+        instructions: SERVER_INSTRUCTIONS,
       },
     );
 

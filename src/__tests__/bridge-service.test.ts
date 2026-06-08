@@ -1,4 +1,5 @@
 import { BridgeService } from '../bridge-service';
+import { observeRejection } from './helpers';
 
 describe('BridgeService', () => {
   let bridgeService: BridgeService;
@@ -17,7 +18,7 @@ describe('BridgeService', () => {
       const endpoint = '/api/test';
       const data = { test: 'data' };
       
-      const requestPromise = bridgeService.sendRequest(endpoint, data);
+      bridgeService.sendRequest(endpoint, data);
       
       // Check that request is pending
       const pendingRequest = bridgeService.getPendingRequest();
@@ -60,11 +61,12 @@ describe('BridgeService', () => {
       const data = { test: 'data' };
       
       const requestPromise = bridgeService.sendRequest(endpoint, data);
+      const rejection = observeRejection(requestPromise);
       
       // Fast-forward time by 31 seconds
       jest.advanceTimersByTime(31000);
       
-      await expect(requestPromise).rejects.toThrow('Request timeout');
+      await expect(rejection).resolves.toThrow('Request timeout');
     });
   });
 
@@ -76,6 +78,7 @@ describe('BridgeService', () => {
         bridgeService.sendRequest('/api/test2', {}),
         bridgeService.sendRequest('/api/test3', {})
       ];
+      const rejections = promises.map(observeRejection);
       
       // Fast-forward time by 31 seconds
       jest.advanceTimersByTime(31000);
@@ -84,8 +87,8 @@ describe('BridgeService', () => {
       bridgeService.cleanupOldRequests();
       
       // All requests should be rejected
-      for (const promise of promises) {
-        await expect(promise).rejects.toThrow('Request timeout');
+      for (const rejection of rejections) {
+        await expect(rejection).resolves.toThrow('Request timeout');
       }
       
       // No pending requests should remain
@@ -99,13 +102,14 @@ describe('BridgeService', () => {
         bridgeService.sendRequest('/api/test2', {}),
         bridgeService.sendRequest('/api/test3', {})
       ];
+      const rejections = promises.map(observeRejection);
       
       // Clear all requests
       bridgeService.clearAllPendingRequests();
       
       // All requests should be rejected with connection closed error
-      for (const promise of promises) {
-        await expect(promise).rejects.toThrow('Connection closed');
+      for (const rejection of rejections) {
+        await expect(rejection).resolves.toThrow('Connection closed');
       }
       
       // No pending requests should remain
@@ -114,30 +118,36 @@ describe('BridgeService', () => {
   });
 
   describe('Request Priority', () => {
-    test('should return oldest request first', async () => {
+    test('should return the oldest pending request without consuming it', async () => {
       // Create requests with small delays
-      bridgeService.sendRequest('/api/test1', { order: 1 });
-      
-      // Small delay to ensure different timestamps
-      await new Promise(resolve => setTimeout(resolve, 10));
-      
-      bridgeService.sendRequest('/api/test2', { order: 2 });
-      
-      await new Promise(resolve => setTimeout(resolve, 10));
-      
-      bridgeService.sendRequest('/api/test3', { order: 3 });
+      jest.setSystemTime(1000);
+      const first = bridgeService.sendRequest('/api/test1', { order: 1 });
+      jest.setSystemTime(1010);
+      const second = bridgeService.sendRequest('/api/test2', { order: 2 });
+      jest.setSystemTime(1020);
+      const third = bridgeService.sendRequest('/api/test3', { order: 3 });
       
       // Should get the first (oldest) request
       const firstRequest = bridgeService.getPendingRequest();
       expect(firstRequest?.request.data.order).toBe(1);
+
+      // Polling peeks; the same request remains pending until resolved.
+      expect(bridgeService.getPendingRequest()?.request.data.order).toBe(1);
+      bridgeService.resolveRequest(firstRequest!.requestId, { ok: 1 });
       
       // Should get the second request next
       const secondRequest = bridgeService.getPendingRequest();
       expect(secondRequest?.request.data.order).toBe(2);
+      bridgeService.resolveRequest(secondRequest!.requestId, { ok: 2 });
       
       // Should get the third request last
       const thirdRequest = bridgeService.getPendingRequest();
       expect(thirdRequest?.request.data.order).toBe(3);
+      bridgeService.resolveRequest(thirdRequest!.requestId, { ok: 3 });
+
+      await expect(first).resolves.toEqual({ ok: 1 });
+      await expect(second).resolves.toEqual({ ok: 2 });
+      await expect(third).resolves.toEqual({ ok: 3 });
     });
   });
 });

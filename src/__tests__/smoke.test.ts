@@ -2,6 +2,7 @@ import { BridgeService } from '../bridge-service.js';
 import { createHttpServer } from '../http-server.js';
 import { RobloxStudioTools } from '../tools/index.js';
 import request from 'supertest';
+import { observeRejection } from './helpers.js';
 
 describe('Smoke Tests - Connection Fixes', () => {
   test('BridgeService should be instantiable', () => {
@@ -29,6 +30,8 @@ describe('Smoke Tests - Connection Fixes', () => {
     // Don't wait for these promises - they'll be rejected
     const promise1 = bridge.sendRequest('/test1', {});
     const promise2 = bridge.sendRequest('/test2', {});
+    const rejection1 = observeRejection(promise1);
+    const rejection2 = observeRejection(promise2);
     
     // Should have pending requests
     expect(bridge.getPendingRequest()).toBeTruthy();
@@ -40,8 +43,8 @@ describe('Smoke Tests - Connection Fixes', () => {
     expect(bridge.getPendingRequest()).toBeNull();
     
     // Promises should reject
-    await expect(promise1).rejects.toThrow('Connection closed');
-    await expect(promise2).rejects.toThrow('Connection closed');
+    await expect(rejection1).resolves.toThrow('Connection closed');
+    await expect(rejection2).resolves.toThrow('Connection closed');
   });
 
   test('Disconnect endpoint should clear pending requests', async () => {
@@ -51,6 +54,7 @@ describe('Smoke Tests - Connection Fixes', () => {
 
     // Add a pending request (don't await it)
     const pendingPromise = bridge.sendRequest('/test', { data: 'test' });
+    const rejection = observeRejection(pendingPromise);
     
     // Disconnect should clear it
     await request(app)
@@ -58,7 +62,7 @@ describe('Smoke Tests - Connection Fixes', () => {
       .expect(200);
     
     // Request should be rejected
-    await expect(pendingPromise).rejects.toThrow('Connection closed');
+    await expect(rejection).resolves.toThrow('Connection closed');
   });
 
   test('Connection states should update correctly', async () => {

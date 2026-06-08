@@ -3,6 +3,7 @@ import { createHttpServer } from '../http-server';
 import { RobloxStudioTools } from '../tools/index';
 import { BridgeService } from '../bridge-service';
 import { Application } from 'express';
+import { observeRejection } from './helpers';
 
 describe('Integration Tests', () => {
   let app: Application & any;
@@ -113,6 +114,7 @@ describe('Integration Tests', () => {
 
       // Send request
       const mcpRequestPromise = bridge.sendRequest('/api/failing-endpoint', {});
+      const rejection = observeRejection(mcpRequestPromise);
 
       // Poll for request
       const pollResponse = await request(app).get('/poll').expect(200);
@@ -128,7 +130,7 @@ describe('Integration Tests', () => {
         .expect(200);
 
       // Should reject with the error
-      await expect(mcpRequestPromise).rejects.toEqual('Operation failed: Invalid input');
+      await expect(rejection).resolves.toBe('Operation failed: Invalid input');
     });
   });
 
@@ -141,6 +143,8 @@ describe('Integration Tests', () => {
       // Create some pending requests
       const request1 = bridge.sendRequest('/api/test1', {});
       const request2 = bridge.sendRequest('/api/test2', {});
+      const rejection1 = observeRejection(request1);
+      const rejection2 = observeRejection(request2);
 
       // Verify requests are pending
       let poll = await request(app).get('/poll').expect(200);
@@ -150,8 +154,8 @@ describe('Integration Tests', () => {
       await request(app).post('/disconnect').expect(200);
 
       // Requests should be rejected
-      await expect(request1).rejects.toThrow('Connection closed');
-      await expect(request2).rejects.toThrow('Connection closed');
+      await expect(rejection1).resolves.toThrow('Connection closed');
+      await expect(rejection2).resolves.toThrow('Connection closed');
 
       // Reconnect
       await request(app).post('/ready').expect(200);
@@ -209,6 +213,7 @@ describe('Integration Tests', () => {
 
       // Send request but don't respond
       const timeoutPromise = bridge.sendRequest('/api/slow-endpoint', {});
+      const rejection = observeRejection(timeoutPromise);
 
       // Plugin polls for it
       await request(app).get('/poll').expect(200);
@@ -217,7 +222,7 @@ describe('Integration Tests', () => {
       jest.advanceTimersByTime(31000);
 
       // Request should timeout
-      await expect(timeoutPromise).rejects.toThrow('Request timeout');
+      await expect(rejection).resolves.toThrow('Request timeout');
 
       jest.useRealTimers();
     });

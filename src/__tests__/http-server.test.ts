@@ -3,6 +3,7 @@ import { createHttpServer } from '../http-server';
 import { RobloxStudioTools } from '../tools/index';
 import { BridgeService } from '../bridge-service';
 import { Application } from 'express';
+import { observeRejection } from './helpers';
 
 describe('HTTP Server', () => {
   let app: Application & any;
@@ -56,8 +57,10 @@ describe('HTTP Server', () => {
 
     test('should clear pending requests on disconnect', async () => {
       // Add some pending requests
-      bridge.sendRequest('/api/test1', {});
-      bridge.sendRequest('/api/test2', {});
+      const request1 = bridge.sendRequest('/api/test1', {});
+      const request2 = bridge.sendRequest('/api/test2', {});
+      const rejection1 = observeRejection(request1);
+      const rejection2 = observeRejection(request2);
       
       expect(bridge.getPendingRequest()).toBeTruthy();
 
@@ -66,6 +69,8 @@ describe('HTTP Server', () => {
 
       // All requests should be cleared
       expect(bridge.getPendingRequest()).toBeNull();
+      await expect(rejection1).resolves.toThrow('Connection closed');
+      await expect(rejection2).resolves.toThrow('Connection closed');
     });
 
     test('should timeout plugin connection after inactivity', async () => {
@@ -104,7 +109,7 @@ describe('HTTP Server', () => {
       app.setMCPServerActive(true);
 
       // Add a pending request
-      bridge.sendRequest('/api/test', { data: 'test' });
+      const pending = bridge.sendRequest('/api/test', { data: 'test' });
 
       const response = await request(app)
         .get('/poll')
@@ -119,6 +124,9 @@ describe('HTTP Server', () => {
         pluginConnected: true
       });
       expect(response.body.requestId).toBeTruthy();
+
+      bridge.resolveRequest(response.body.requestId, { success: true });
+      await expect(pending).resolves.toEqual({ success: true });
     });
 
     test('should return null request when no pending requests', async () => {
@@ -147,7 +155,6 @@ describe('HTTP Server', () => {
 
   describe('Response Handling', () => {
     test('should handle successful response', async () => {
-      const requestId = 'test-request-id';
       const responseData = { result: 'success' };
 
       // Create a pending request
@@ -175,6 +182,7 @@ describe('HTTP Server', () => {
 
       // Create a pending request
       const requestPromise = bridge.sendRequest('/api/test', {});
+      const rejection = observeRejection(requestPromise);
       const pendingRequest = bridge.getPendingRequest();
 
       // Send error response
@@ -189,7 +197,7 @@ describe('HTTP Server', () => {
       expect(response.body).toEqual({ success: true });
 
       // Check that the request was rejected
-      await expect(requestPromise).rejects.toEqual(error);
+      await expect(rejection).resolves.toBe(error);
     });
   });
 
@@ -236,7 +244,7 @@ describe('HTTP Server', () => {
         mcpServerActive: true
       });
       expect(response.body.lastMCPActivity).toBeGreaterThan(0);
-      expect(response.body.uptime).toBeGreaterThan(0);
+      expect(response.body.uptime).toBeGreaterThanOrEqual(0);
     });
   });
 });

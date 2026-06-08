@@ -5,6 +5,7 @@ interface PendingRequest {
   endpoint: string;
   data: any;
   timestamp: number;
+  timeoutHandle: ReturnType<typeof setTimeout>;
   resolve: (value: any) => void;
   reject: (error: any) => void;
 }
@@ -135,24 +136,24 @@ export class BridgeService {
     const requestId = uuidv4();
 
     return new Promise((resolve, reject) => {
-      const request: PendingRequest = {
-        id: requestId,
-        endpoint,
-        data,
-        timestamp: Date.now(),
-        resolve,
-        reject
-      };
-
-      this.pendingRequests.set(requestId, request);
-
-      // Set timeout
-      setTimeout(() => {
+      const timeoutHandle = setTimeout(() => {
         if (this.pendingRequests.has(requestId)) {
           this.pendingRequests.delete(requestId);
           reject(new Error('Request timeout'));
         }
       }, this.requestTimeout);
+
+      const request: PendingRequest = {
+        id: requestId,
+        endpoint,
+        data,
+        timestamp: Date.now(),
+        timeoutHandle,
+        resolve,
+        reject
+      };
+
+      this.pendingRequests.set(requestId, request);
     });
   }
 
@@ -183,6 +184,7 @@ export class BridgeService {
     const request = this.pendingRequests.get(requestId);
     if (request) {
       this.pendingRequests.delete(requestId);
+      clearTimeout(request.timeoutHandle);
       request.resolve(response);
     }
   }
@@ -191,6 +193,7 @@ export class BridgeService {
     const request = this.pendingRequests.get(requestId);
     if (request) {
       this.pendingRequests.delete(requestId);
+      clearTimeout(request.timeoutHandle);
       request.reject(error);
     }
   }
@@ -201,6 +204,7 @@ export class BridgeService {
     for (const [id, request] of this.pendingRequests.entries()) {
       if (now - request.timestamp > this.requestTimeout) {
         this.pendingRequests.delete(id);
+        clearTimeout(request.timeoutHandle);
         request.reject(new Error('Request timeout'));
       }
     }
@@ -209,6 +213,7 @@ export class BridgeService {
   // Force cleanup all pending requests (used on disconnect)
   clearAllPendingRequests() {
     for (const [, request] of this.pendingRequests.entries()) {
+      clearTimeout(request.timeoutHandle);
       request.reject(new Error('Connection closed'));
     }
     this.pendingRequests.clear();

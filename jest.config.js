@@ -32,6 +32,7 @@ export default {
     'src/**/*.ts',
     '!src/**/*.d.ts',
     '!src/index.ts', // Exclude main entry point
+    '!src/**/__tests__/**',
   ],
   coverageDirectory: 'coverage',
   coverageReporters: ['text', 'lcov', 'html'],

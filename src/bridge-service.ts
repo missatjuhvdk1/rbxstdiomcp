@@ -1,4 +1,4 @@
-import { v4 as uuidv4 } from 'uuid';
+import { randomUUID } from 'node:crypto';
 
 interface PendingRequest {
   id: string;
@@ -133,7 +133,7 @@ export class BridgeService {
   testSession: TestSessionState | null = null;
 
   async sendRequest(endpoint: string, data: any): Promise<any> {
-    const requestId = uuidv4();
+    const requestId = randomUUID();
 
     return new Promise((resolve, reject) => {
       const timeoutHandle = setTimeout(() => {
@@ -237,7 +237,7 @@ export class BridgeService {
       this.markTestSessionEnded('superseded');
     }
 
-    const sessionId = uuidv4();
+    const sessionId = randomUUID();
     this.testSession = {
       sessionId,
       status: 'active',

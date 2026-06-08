@@ -1,7 +1,7 @@
 import { StudioHttpClient } from './studio-client.js';
 import { BridgeService } from '../bridge-service.js';
 import * as zlib from 'zlib';
-import { v4 as uuidv4 } from 'uuid';
+import { randomUUID } from 'node:crypto';
 import { ensureDocsCache } from '../docs/fetcher.js';
 import {
   listDocs,
@@ -1416,7 +1416,7 @@ export class RobloxStudioTools {
     // Use the bridge's enqueue first because if it returns false we want
     // to skip allocating a watcher promise. But we need the replyId baked
     // into the enqueued args, so generate it up front.
-    const replyId = uuidv4();
+    const replyId = randomUUID();
     evalArgs.replyId = replyId;
 
     // Register the watchdog slot BEFORE enqueueing. We always use 'server'

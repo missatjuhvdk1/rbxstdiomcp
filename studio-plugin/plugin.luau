@@ -6971,15 +6971,30 @@ handlers.renderGui = function(requestData)
 		)
 		sourceImage:Destroy()
 
-		-- ──────────── optional downscale (aspect preserved) ────────────
-		local outW, outH = cropW, cropH
+		-- ──────────── downscale (aspect preserved, no upscale) ────────────
+		-- Two independent reasons to shrink, folded into ONE resize pass:
+		--   1. Caller's optional maxWidth/maxHeight clamp.
+		--   2. The HTTP-bridge raw-pixel cap (MAX_RAW_PIXEL_BYTES) — mirrors
+		--      captureScreenshot. region="screen" on a hi-DPI display can blow
+		--      past the cap, so this guard is what keeps the POST safe.
+		local scaleW = maxWidth and (maxWidth / cropW) or 1
+		local scaleH = maxHeight and (maxHeight / cropH) or 1
+		local scale = math.min(scaleW, scaleH, 1)
+		local outW = math.max(math.floor(cropW * scale), 1)
+		local outH = math.max(math.floor(cropH * scale), 1)
+
+		local autoShrunk = false
+		local requiredBytes = outW * outH * 4
+		if requiredBytes > MAX_RAW_PIXEL_BYTES then
+			local shrink = math.sqrt(MAX_RAW_PIXEL_BYTES / requiredBytes)
+			outW = math.max(math.floor(outW * shrink), 1)
+			outH = math.max(math.floor(outH * shrink), 1)
+			scale = scale * shrink
+			autoShrunk = true
+		end
+
 		local outputImage = croppedImage
-		if (maxWidth and cropW > maxWidth) or (maxHeight and cropH > maxHeight) then
-			local scaleW = maxWidth and (maxWidth / cropW) or math.huge
-			local scaleH = maxHeight and (maxHeight / cropH) or math.huge
-			local scale = math.min(scaleW, scaleH)
-			outW = math.max(math.floor(cropW * scale), 1)
-			outH = math.max(math.floor(cropH * scale), 1)
+		if (outW ~= cropW) or (outH ~= cropH) then
 			outputImage = AssetService:CreateEditableImage({ Size = Vector2.new(outW, outH) })
 			outputImage:DrawImageTransformed(
 				Vector2.new(outW / 2, outH / 2),
@@ -7012,6 +7027,7 @@ handlers.renderGui = function(requestData)
 				renderedElements = #cropElements,
 				region           = region,
 				placement        = placement,
+				autoShrunk       = autoShrunk,
 				rect = { x = cropX, y = cropY, width = cropW, height = cropH },
 				sourceWidth  = sourceSize.X,
 				sourceHeight = sourceSize.Y,

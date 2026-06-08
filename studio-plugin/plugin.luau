@@ -1953,10 +1953,12 @@ local mutationEndpoints = {
 	-- Script editing: modern recording API (migrated from legacy SetWaypoint)
 	["/api/edit-script"] = "Edit Script",
 	["/api/find-and-replace-in-scripts"] = "Find and Replace in Scripts",
-	-- Arbitrary Lua: wraps the WHOLE execution in one waypoint. Auto-rolls
-	-- back on error via FinishRecording(Cancel). Mutations from yielded /
+	-- Arbitrary Lua: wraps the WHOLE execution in one waypoint. On ERROR the
+	-- recording is cancelled (FinishRecording(Cancel)) so partial mutations
+	-- roll back. On SUCCESS the recording is always committed so writes
+	-- persist — including property-only mutations. Mutations from yielded /
 	-- task.spawn'd code that runs AFTER the handler returns are NOT captured
-	-- (documented limitation).
+	-- (documented limitation — keep mutations synchronous).
 	["/api/execute-lua"] = "Execute Lua",
 }
 
@@ -2057,14 +2059,30 @@ processRequest = function(request)
 				commitCHS = false
 				commitLog = false
 			elseif r and r._mutatesUnknown == true then
-				-- execute_lua: synchronous tree-size delta tells us if
-				-- user code added/removed instances. Property-only mutations
-				-- (e.g. just changing Position) won't be detected — that's an
-				-- accepted edge case; users wanting full tracking should use
-				-- the dedicated set_property tool.
-				local treeChanged = (#game:GetDescendants() ~= descCountBefore)
-				commitCHS = treeChanged
-				commitLog = treeChanged
+				-- execute_lua: arbitrary user code may mutate ANYTHING —
+				-- properties, attributes, tags, or the tree. On success we
+				-- must ALWAYS Commit.
+				--
+				-- CRITICAL: FinishRecording(recording, Cancel) does NOT merely
+				-- "skip the history entry" — it REVERTS every change made
+				-- inside the recording window. The previous implementation
+				-- cancelled whenever the descendant count was unchanged, which
+				-- silently rolled back EVERY property-only mutation — the #1
+				-- execute_lua use case (Position, CFrame, Motor6D C0/C1,
+				-- Anchored, attribute writes, etc.). To callers it looked like
+				-- "execute_lua reads work but writes never persist." That was
+				-- this bug, not a Studio limitation.
+				--
+				-- Commit always. A recording with no actual changes (a pure
+				-- read) is discarded by Studio and adds no waypoint, so this
+				-- does not pollute the undo stack.
+				--
+				-- The tree-size delta is now used ONLY to decide whether to
+				-- emit a readable get_history entry. Property-only mutations
+				-- still PERSIST; they just don't get a human-readable summary
+				-- (accepted limitation — use set_property for tracked history).
+				commitCHS = true
+				commitLog = (#game:GetDescendants() ~= descCountBefore)
 			else
 				-- Trusted mutator (create_object, set_property, etc.) →
 				-- always commit on handler success.
